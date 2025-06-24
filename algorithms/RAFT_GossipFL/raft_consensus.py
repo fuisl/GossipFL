@@ -608,3 +608,48 @@ class RaftConsensus:
             int: ID of the current leader, or None if unknown
         """
         return self.current_leader_id
+    
+    def get_topology_for_round(self, round_number):
+        """
+        Get the topology for a specific round from the committed log entries.
+        
+        Args:
+            round_number (int): The round number
+            
+        Returns:
+            numpy.ndarray or None: The topology matrix if found, None otherwise
+        """
+        with self.raft_node.state_lock:
+            # Search through committed log entries
+            for idx in range(self.raft_node.commit_index):
+                entry = self.raft_node.log[idx]
+                if entry.get('type') == 'topology':
+                    data = entry.get('data', {})
+                    if data.get('round') == round_number:
+                        # Return the topology matrix
+                        return data.get('matrix')
+        
+        return None
+    
+    def get_latest_bandwidth(self):
+        """
+        Get the latest bandwidth from the committed log entries.
+        
+        Returns:
+            dict or None: The bandwidth data if found, None otherwise
+        """
+        latest_timestamp = 0
+        latest_bandwidth = None
+        
+        with self.raft_node.state_lock:
+            # Search through committed log entries
+            for idx in range(self.raft_node.commit_index):
+                entry = self.raft_node.log[idx]
+                if entry.get('type') == 'bandwidth':
+                    data = entry.get('data', {})
+                    timestamp = data.get('timestamp', 0)
+                    if timestamp > latest_timestamp:
+                        latest_timestamp = timestamp
+                        latest_bandwidth = data
+        
+        return latest_bandwidth
