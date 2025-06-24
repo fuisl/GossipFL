@@ -10,6 +10,7 @@ class RaftState(Enum):
     """
     FOLLOWER = 0
     CANDIDATE = 1
+    # [FIXME]: Add a state for newly created node who has not been initialized by the Leader yet
     LEADER = 2
 
 
@@ -77,6 +78,9 @@ class RaftNode:
         Args:
             total_nodes (int): Total number of nodes in the network
         """
+        # [FIXME]: This is assuming that node IDs is continuous from 0 to total_nodes-1
+        # If we consider that node may decide to disconnect, causing a gap, then this part might break.
+        # Node IDs are being overwritten here.
         self.known_nodes = set(range(total_nodes))
         self.total_nodes = len(self.known_nodes)
         self.majority = self.total_nodes // 2 + 1
@@ -105,6 +109,8 @@ class RaftNode:
         with self.state_lock:
             if self.state == RaftState.LEADER:
                 return False  # Leaders don't start elections
+            
+            # [FIXME]: If this node is a newly created node, it should not start an election
                 
             # Increment term, vote for self
             self.current_term += 1
@@ -137,6 +143,8 @@ class RaftNode:
             tuple: (term, vote_granted)
         """
         with self.state_lock:
+            # [FIXME]: If this node is a newly created node, it should not participate in elections
+
             # If term > currentTerm, convert to follower
             if term > self.current_term:
                 self.become_follower(term)
@@ -229,6 +237,7 @@ class RaftNode:
             self.match_index = {node_id: 0 for node_id in self.known_nodes if node_id != self.node_id}
             
             # Notify state change
+            # Checking if on_state_change is not None
             if self.on_state_change:
                 self.on_state_change(RaftState.LEADER)
                 
@@ -247,6 +256,7 @@ class RaftNode:
             bool: True if candidate's log is at least as up-to-date
         """
         # Get this node's last log entry
+        # [FIXME]: This may break if we use log compaction
         my_last_log_index = len(self.log)
         my_last_log_term = self.log[my_last_log_index - 1]['term'] if my_last_log_index > 0 else 0
         
@@ -298,6 +308,7 @@ class RaftNode:
                 return self.current_term, False
             
             # Process entries
+            # Checking if entries is not None and not empty
             if entries:
                 # Handle conflicts
                 for i, entry in enumerate(entries):
@@ -361,7 +372,7 @@ class RaftNode:
             logging.info(f"Node {self.node_id}: Applying coordinator change from log entry {entry['index']}")
             self._apply_coordinator_change(command)
         elif command_type == 'batched_updates':
-            # Apply batched updates
+            # Apply batched updates            
             logging.info(f"Node {self.node_id}: Applying batched updates from log entry {entry['index']}")
             for update in command.get('updates', []):
                 # Create a new command entry for each update in the batch
@@ -417,12 +428,12 @@ class RaftNode:
             self.topology_manager.apply_match_changes(changes, base_version)
         else:
             # Store changes for later application
-            if not hasattr(self, 'pending_topology_changes'):
+            if not hasattr(self, 'pending_topology_changes'):                
                 self.pending_topology_changes = []
             self.pending_topology_changes.append((base_version, changes))
             
         logging.info(f"Node {self.node_id}: Applied {len(changes)} topology changes from base version {base_version}")
-    
+
     def _apply_bandwidth_update(self, command):
         """
         Apply a full bandwidth matrix update command.
@@ -432,23 +443,16 @@ class RaftNode:
         """
         data = command.get('data', {})
         
-        # Extract bandwidth information
-        bandwidth_matrix = data.get('bandwidth_matrix')
-        bandwidth_type = data.get('bandwidth_type')
-        affected_nodes = data.get('affected_nodes')
-        
         if hasattr(self, 'bandwidth_manager') and self.bandwidth_manager is not None:
-            # Update the bandwidth manager with the new bandwidth matrix
-            self.bandwidth_manager.update_bandwidth(bandwidth_matrix, bandwidth_type)
+            # Call the bandwidth manager to apply the update
+            self.bandwidth_manager.apply_bandwidth_update(data)
+            logging.info(f"Node {self.node_id}: Applied bandwidth update via bandwidth manager")
         else:
             # Store the bandwidth information for later use
             if not hasattr(self, 'pending_bandwidth'):
-                self.pending_bandwidth = {}
-            self.pending_bandwidth['matrix'] = bandwidth_matrix
-            self.pending_bandwidth['type'] = bandwidth_type
-            self.pending_bandwidth['affected_nodes'] = affected_nodes
-            
-        logging.info(f"Node {self.node_id}: Applied bandwidth update affecting {len(affected_nodes) if affected_nodes else 'all'} nodes")
+                self.pending_bandwidth = []
+            self.pending_bandwidth.append(data)
+            logging.warning(f"Node {self.node_id}: No bandwidth manager available, storing update for later use")
     
     def _apply_bandwidth_delta(self, command):
         """
@@ -534,6 +538,7 @@ class RaftNode:
                 return -1
                 
             # Create and append the log entry
+            # [FIXME]: This breaks if we use log compaction
             index = len(self.log) + 1
             entry = {
                 'term': self.current_term,
