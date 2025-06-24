@@ -311,8 +311,7 @@ class RaftNode:
                         self.log = self.log[:idx - 1]
                         self.log.append(entry)
                     # Otherwise entry already exists
-            
-            # Update commit index
+              # Update commit index
             if leader_commit > self.commit_index:
                 self.commit_index = min(leader_commit, len(self.log))
                 self.apply_committed_entries()
@@ -325,7 +324,7 @@ class RaftNode:
             self.last_applied += 1
             entry = self.log[self.last_applied - 1]
             self.apply_log_entry(entry)
-    
+            
     def apply_log_entry(self, entry):
         """
         Apply a log entry to the state machine.
@@ -338,15 +337,334 @@ class RaftNode:
         command_type = command.get('type')
         
         if command_type == 'topology':
-            # Apply topology update
+            # Apply full topology update
             logging.info(f"Node {self.node_id}: Applying topology update from log entry {entry['index']}")
-            # Handle topology update logic here
+            self._apply_topology_update(command)
+        elif command_type == 'topology_delta':
+            # Apply incremental topology update
+            logging.info(f"Node {self.node_id}: Applying incremental topology update from log entry {entry['index']}")
+            self._apply_topology_delta(command)
+        elif command_type == 'bandwidth':
+            # Apply full bandwidth matrix update
+            logging.info(f"Node {self.node_id}: Applying bandwidth update from log entry {entry['index']}")
+            self._apply_bandwidth_update(command)
+        elif command_type == 'bandwidth_delta':
+            # Apply incremental bandwidth update
+            logging.info(f"Node {self.node_id}: Applying bandwidth delta from log entry {entry['index']}")
+            self._apply_bandwidth_delta(command)
         elif command_type == 'membership':
             # Apply membership change
             logging.info(f"Node {self.node_id}: Applying membership change from log entry {entry['index']}")
-            # Handle membership change logic here
+            self._apply_membership_change(command)
+        elif command_type == 'coordinator':
+            # Apply coordinator change
+            logging.info(f"Node {self.node_id}: Applying coordinator change from log entry {entry['index']}")
+            self._apply_coordinator_change(command)
+        elif command_type == 'batched_updates':
+            # Apply batched updates
+            logging.info(f"Node {self.node_id}: Applying batched updates from log entry {entry['index']}")
+            for update in command.get('updates', []):
+                # Create a new command entry for each update in the batch
+                self.apply_log_entry({'term': entry['term'], 'index': entry['index'], 'command': update})
+        elif command_type == 'no-op':
+            # No-op entry, just acknowledge
+            logging.debug(f"Node {self.node_id}: Processed no-op entry {entry['index']}")
         else:
             logging.warning(f"Node {self.node_id}: Unknown command type in log entry: {command_type}")
+    
+    def _apply_topology_update(self, command):
+        """
+        Apply a full topology update command.
+        
+        Args:
+            command (dict): The topology update command
+        """
+        data = command.get('data', {})
+        
+        # Extract topology information
+        match = data.get('match')
+        topology_matrix = data.get('topology_matrix')
+        round_num = data.get('round')
+        
+        if hasattr(self, 'topology_manager') and self.topology_manager is not None:
+            # Update the topology manager with the new topology
+            if match is not None:
+                self.topology_manager.update_match(match, round_num)
+            if topology_matrix is not None:
+                self.topology_manager.update_topology_matrix(topology_matrix)
+        else:
+            # Store the topology information for later use
+            if not hasattr(self, 'pending_topology'):
+                self.pending_topology = {}
+            self.pending_topology['match'] = match
+            self.pending_topology['topology_matrix'] = topology_matrix
+            self.pending_topology['round'] = round_num
+            
+        logging.info(f"Node {self.node_id}: Applied topology update for round {round_num}")
+    
+    def _apply_topology_delta(self, command):
+        """
+        Apply an incremental topology update command.
+        
+        Args:
+            command (dict): The topology delta command
+        """
+        base_version = command.get('base_version')
+        changes = command.get('changes', [])
+        
+        if hasattr(self, 'topology_manager') and self.topology_manager is not None:
+            # Apply changes to the topology manager
+            self.topology_manager.apply_match_changes(changes, base_version)
+        else:
+            # Store changes for later application
+            if not hasattr(self, 'pending_topology_changes'):
+                self.pending_topology_changes = []
+            self.pending_topology_changes.append((base_version, changes))
+            
+        logging.info(f"Node {self.node_id}: Applied {len(changes)} topology changes from base version {base_version}")
+    
+    def _apply_bandwidth_update(self, command):
+        """
+        Apply a full bandwidth matrix update command.
+        
+        Args:
+            command (dict): The bandwidth update command
+        """
+        data = command.get('data', {})
+        
+        # Extract bandwidth information
+        bandwidth_matrix = data.get('bandwidth_matrix')
+        bandwidth_type = data.get('bandwidth_type')
+        affected_nodes = data.get('affected_nodes')
+        
+        if hasattr(self, 'bandwidth_manager') and self.bandwidth_manager is not None:
+            # Update the bandwidth manager with the new bandwidth matrix
+            self.bandwidth_manager.update_bandwidth(bandwidth_matrix, bandwidth_type)
+        else:
+            # Store the bandwidth information for later use
+            if not hasattr(self, 'pending_bandwidth'):
+                self.pending_bandwidth = {}
+            self.pending_bandwidth['matrix'] = bandwidth_matrix
+            self.pending_bandwidth['type'] = bandwidth_type
+            self.pending_bandwidth['affected_nodes'] = affected_nodes
+            
+        logging.info(f"Node {self.node_id}: Applied bandwidth update affecting {len(affected_nodes) if affected_nodes else 'all'} nodes")
+    
+    def _apply_bandwidth_delta(self, command):
+        """
+        Apply an incremental bandwidth update command.
+        
+        Args:
+            command (dict): The bandwidth delta command
+        """
+        base_version = command.get('base_version')
+        changes = command.get('changes', {})
+        
+        if hasattr(self, 'bandwidth_manager') and self.bandwidth_manager is not None:
+            # Apply changes to the bandwidth manager
+            self.bandwidth_manager.apply_bandwidth_changes(changes, base_version)
+        else:
+            # Store changes for later application
+            if not hasattr(self, 'pending_bandwidth_changes'):
+                self.pending_bandwidth_changes = []
+            self.pending_bandwidth_changes.append((base_version, changes))
+            
+        logging.info(f"Node {self.node_id}: Applied {len(changes)} bandwidth changes from base version {base_version}")
+    
+    def _apply_membership_change(self, command):
+        """
+        Apply a membership change command.
+        
+        Args:
+            command (dict): The membership change command
+        """
+        action = command.get('action')
+        node_id = command.get('node_id')
+        current_nodes = command.get('current_nodes')
+        
+        if action == 'add':
+            # Add the node to known nodes if not already present
+            if node_id not in self.known_nodes:
+                self.known_nodes.add(node_id)
+                self.update_known_nodes(len(self.known_nodes))
+                logging.info(f"Node {self.node_id}: Added node {node_id} to known nodes")
+        elif action == 'remove':
+            # Remove the node from known nodes if present
+            if node_id in self.known_nodes:
+                self.known_nodes.remove(node_id)
+                self.update_known_nodes(len(self.known_nodes))
+                logging.info(f"Node {self.node_id}: Removed node {node_id} from known nodes")
+        
+        # If current_nodes is provided, use it to update known nodes
+        if current_nodes is not None:
+            self.known_nodes = set(current_nodes)
+            self.update_known_nodes(len(self.known_nodes))
+            logging.info(f"Node {self.node_id}: Updated known nodes to {current_nodes}")
+    
+    def _apply_coordinator_change(self, command):
+        """
+        Apply a coordinator change command.
+        
+        Args:
+            command (dict): The coordinator change command
+        """
+        coordinator_id = command.get('coordinator_id')
+        previous_coordinator_id = command.get('previous_coordinator_id')
+        round_num = command.get('round')
+        
+        # Update the coordinator information
+        if hasattr(self, 'current_coordinator_id'):
+            self.previous_coordinator_id = self.current_coordinator_id
+        self.current_coordinator_id = coordinator_id
+        
+        logging.info(f"Node {self.node_id}: Updated coordinator from {previous_coordinator_id} to {coordinator_id} at round {round_num}")
+    
+    def _apply_topology_update(self, command):
+        """
+        Apply a full topology update command.
+        
+        Args:
+            command (dict): The topology update command
+        """
+        data = command.get('data', {})
+        
+        # Extract topology information
+        match = data.get('match')
+        topology_matrix = data.get('topology_matrix')
+        round_num = data.get('round')
+        
+        if hasattr(self, 'topology_manager') and self.topology_manager is not None:
+            # Update the topology manager with the new topology
+            if match is not None:
+                self.topology_manager.update_match(match, round_num)
+            if topology_matrix is not None:
+                self.topology_manager.update_topology_matrix(topology_matrix)
+        else:
+            # Store the topology information for later use
+            if not hasattr(self, 'pending_topology'):
+                self.pending_topology = {}
+            self.pending_topology['match'] = match
+            self.pending_topology['topology_matrix'] = topology_matrix
+            self.pending_topology['round'] = round_num
+            
+        logging.info(f"Node {self.node_id}: Applied topology update for round {round_num}")
+    
+    def _apply_topology_delta(self, command):
+        """
+        Apply an incremental topology update command.
+        
+        Args:
+            command (dict): The topology delta command
+        """
+        base_version = command.get('base_version')
+        changes = command.get('changes', [])
+        
+        if hasattr(self, 'topology_manager') and self.topology_manager is not None:
+            # Apply changes to the topology manager
+            self.topology_manager.apply_match_changes(changes, base_version)
+        else:
+            # Store changes for later application
+            if not hasattr(self, 'pending_topology_changes'):
+                self.pending_topology_changes = []
+            self.pending_topology_changes.append((base_version, changes))
+            
+        logging.info(f"Node {self.node_id}: Applied {len(changes)} topology changes from base version {base_version}")
+    
+    def _apply_bandwidth_update(self, command):
+        """
+        Apply a full bandwidth matrix update command.
+        
+        Args:
+            command (dict): The bandwidth update command
+        """
+        data = command.get('data', {})
+        
+        # Extract bandwidth information
+        bandwidth_matrix = data.get('bandwidth_matrix')
+        bandwidth_type = data.get('bandwidth_type')
+        affected_nodes = data.get('affected_nodes')
+        
+        if hasattr(self, 'bandwidth_manager') and self.bandwidth_manager is not None:
+            # Update the bandwidth manager with the new bandwidth matrix
+            self.bandwidth_manager.update_bandwidth(bandwidth_matrix, bandwidth_type)
+        else:
+            # Store the bandwidth information for later use
+            if not hasattr(self, 'pending_bandwidth'):
+                self.pending_bandwidth = {}
+            self.pending_bandwidth['matrix'] = bandwidth_matrix
+            self.pending_bandwidth['type'] = bandwidth_type
+            self.pending_bandwidth['affected_nodes'] = affected_nodes
+            
+        logging.info(f"Node {self.node_id}: Applied bandwidth update affecting {len(affected_nodes) if affected_nodes else 'all'} nodes")
+    
+    def _apply_bandwidth_delta(self, command):
+        """
+        Apply an incremental bandwidth update command.
+        
+        Args:
+            command (dict): The bandwidth delta command
+        """
+        base_version = command.get('base_version')
+        changes = command.get('changes', {})
+        
+        if hasattr(self, 'bandwidth_manager') and self.bandwidth_manager is not None:
+            # Apply changes to the bandwidth manager
+            self.bandwidth_manager.apply_bandwidth_changes(changes, base_version)
+        else:
+            # Store changes for later application
+            if not hasattr(self, 'pending_bandwidth_changes'):
+                self.pending_bandwidth_changes = []
+            self.pending_bandwidth_changes.append((base_version, changes))
+            
+        logging.info(f"Node {self.node_id}: Applied {len(changes)} bandwidth changes from base version {base_version}")
+    
+    def _apply_membership_change(self, command):
+        """
+        Apply a membership change command.
+        
+        Args:
+            command (dict): The membership change command
+        """
+        action = command.get('action')
+        node_id = command.get('node_id')
+        current_nodes = command.get('current_nodes')
+        
+        if action == 'add':
+            # Add the node to known nodes if not already present
+            if node_id not in self.known_nodes:
+                self.known_nodes.add(node_id)
+                self.update_known_nodes(len(self.known_nodes))
+                logging.info(f"Node {self.node_id}: Added node {node_id} to known nodes")
+        elif action == 'remove':
+            # Remove the node from known nodes if present
+            if node_id in self.known_nodes:
+                self.known_nodes.remove(node_id)
+                self.update_known_nodes(len(self.known_nodes))
+                logging.info(f"Node {self.node_id}: Removed node {node_id} from known nodes")
+        
+        # If current_nodes is provided, use it to update known nodes
+        if current_nodes is not None:
+            self.known_nodes = set(current_nodes)
+            self.update_known_nodes(len(self.known_nodes))
+            logging.info(f"Node {self.node_id}: Updated known nodes to {current_nodes}")
+    
+    def _apply_coordinator_change(self, command):
+        """
+        Apply a coordinator change command.
+        
+        Args:
+            command (dict): The coordinator change command
+        """
+        coordinator_id = command.get('coordinator_id')
+        previous_coordinator_id = command.get('previous_coordinator_id')
+        round_num = command.get('round')
+        
+        # Update the coordinator information
+        if hasattr(self, 'current_coordinator_id'):
+            self.previous_coordinator_id = self.current_coordinator_id
+        self.current_coordinator_id = coordinator_id
+        
+        logging.info(f"Node {self.node_id}: Updated coordinator from {previous_coordinator_id} to {coordinator_id} at round {round_num}")
     
     def add_log_entry(self, command):
         """
