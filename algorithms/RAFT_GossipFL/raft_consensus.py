@@ -23,9 +23,25 @@ class RaftConsensus:
     This class coordinates the RAFT consensus operations, manages message
     exchange between nodes, and provides a high-level interface for the
     worker manager to interact with the RAFT consensus algorithm.
+    
+    It handles:
+    - Leader election and state management
+    - Log replication and consistency
+    - Topology updates consensus
+    - Bandwidth updates consensus
+    - Membership changes consensus
+    - Coordinator selection
+    
+    The consensus manager runs multiple threads to handle different aspects
+    of the RAFT protocol:
+    - Election timeout monitoring
+    - Heartbeat sending (leaders only)
+    - Log replication (leaders only)
+    
+    Each thread has error handling and can recover from failures.
     """
     
-    def __init__(self, raft_node, worker_manager, args):
+    def __init__(self, raft_node, worker_manager, args, bandwidth_manager=None, topology_manager=None):
         """
         Initialize the RAFT consensus manager.
         
@@ -33,10 +49,20 @@ class RaftConsensus:
             raft_node (RaftNode): The local RAFT node
             worker_manager: The worker manager that handles message passing
             args: Configuration parameters
+            bandwidth_manager: The bandwidth manager for handling bandwidth updates
+            topology_manager: The topology manager for handling topology updates
         """
         self.raft_node = raft_node
         self.worker_manager = worker_manager
         self.args = args
+        self.bandwidth_manager = bandwidth_manager
+        self.topology_manager = topology_manager
+        
+        # Set manager references in the RAFT node
+        if bandwidth_manager:
+            self.raft_node.bandwidth_manager = bandwidth_manager
+        if topology_manager:
+            self.raft_node.topology_manager = topology_manager
         
         # Set callback for state changes
         self.raft_node.on_state_change = self.handle_state_change
@@ -73,19 +99,36 @@ class RaftConsensus:
     
     def stop(self):
         """Stop all consensus operations."""
+        logging.info(f"Node {self.raft_node.node_id}: Stopping all consensus operations")
         with self.thread_lock:
             self.election_stop_event.set()
             self.heartbeat_stop_event.set()
             self.replication_stop_event.set()
             
+            threads_to_join = []
+            
             if self.heartbeat_thread and self.heartbeat_thread.is_alive():
-                self.heartbeat_thread.join(timeout=1.0)
+                threads_to_join.append((self.heartbeat_thread, "heartbeat"))
             
             if self.election_thread and self.election_thread.is_alive():
-                self.election_thread.join(timeout=1.0)
+                threads_to_join.append((self.election_thread, "election"))
             
             if self.replication_thread and self.replication_thread.is_alive():
-                self.replication_thread.join(timeout=1.0)
+                threads_to_join.append((self.replication_thread, "replication"))
+            
+            # Join all threads with timeout
+            for thread, name in threads_to_join:
+                thread.join(timeout=1.0)
+                if thread.is_alive():
+                    logging.warning(f"Node {self.raft_node.node_id}: {name} thread did not terminate gracefully")
+            
+            # Reset thread references
+            # [NOTE]: This might lose the reference to running threads.
+            self.heartbeat_thread = None
+            self.election_thread = None
+            self.replication_thread = None
+            
+            logging.info(f"Node {self.raft_node.node_id}: All consensus operations stopped")
     
     def handle_state_change(self, new_state):
         """
@@ -181,50 +224,83 @@ class RaftConsensus:
     
     def _election_thread_func(self):
         """Thread function to monitor election timeouts."""
-        while not self.election_stop_event.is_set():
-            # Leaders don't have election timeouts
-            if self.raft_node.state == RaftState.LEADER:
-                time.sleep(0.1)
-                continue
-            
-            # Check for election timeout
-            if self.raft_node.is_election_timeout():
-                logging.info(f"Node {self.raft_node.node_id}: Election timeout detected")
+        try:
+            while not self.election_stop_event.is_set():
+                # Leaders don't have election timeouts
+                if self.raft_node.state == RaftState.LEADER:
+                    time.sleep(0.1)
+                    continue
                 
-                # Start a new election
-                if self.raft_node.start_election():
-                    # Send vote requests to all other nodes
-                    self.request_votes_from_all()
-            
-            # Sleep for a short time before checking again
-            time.sleep(0.01)  # 10ms check interval
+                # Check for election timeout
+                if self.raft_node.is_election_timeout():
+                    logging.info(f"Node {self.raft_node.node_id}: Election timeout detected")
+                    
+                    # Start a new election
+                    if self.raft_node.start_election():
+                        # Send vote requests to all other nodes
+                        self.request_votes_from_all()
+                
+                # Sleep for a short time before checking again
+                time.sleep(0.01)  # 10ms check interval
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error in election thread: {str(e)}")
+            # Try to restart the thread if it fails
+            if not self.election_stop_event.is_set():
+                logging.info(f"Node {self.raft_node.node_id}: Restarting election thread")
+                # [FIXME]: This attempt to restart the thread, but since it is
+                # running inside the about to crash thread, all the check for if that
+                # thread is alive will pass, meaning the thread will not be restarted.
+                # Then the current running thread will crash.
+                self.start_election_thread()
     
     def _heartbeat_thread_func(self):
         """Thread function to send heartbeats (leaders only)."""
-        while not self.heartbeat_stop_event.is_set():
-            if self.raft_node.state != RaftState.LEADER:
-                break
-            
-            # Send heartbeats to all followers
-            self.send_heartbeats()
-            
-            # Sleep for heartbeat interval
-            time.sleep(self.raft_node.heartbeat_interval)
+        try:
+            while not self.heartbeat_stop_event.is_set():
+                if self.raft_node.state != RaftState.LEADER:
+                    break
+                
+                # Send heartbeats to all followers
+                self.send_heartbeats()
+                
+                # Sleep for heartbeat interval
+                time.sleep(self.raft_node.heartbeat_interval)
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error in heartbeat thread: {str(e)}")
+            # Try to restart the thread if it fails and we're still leader
+            if not self.heartbeat_stop_event.is_set() and self.raft_node.state == RaftState.LEADER:
+                logging.info(f"Node {self.raft_node.node_id}: Restarting heartbeat thread")
+                # [FIXME]: This attempt to restart the thread, but since it is
+                # running inside the about to crash thread, all the check for if that
+                # thread is alive will pass, meaning the thread will not be restarted.
+                # Then the current running thread will crash.
+                self.start_heartbeat_thread()
     
     def _replication_thread_func(self):
         """Thread function to replicate logs (leaders only)."""
-        while not self.replication_stop_event.is_set():
-            if self.raft_node.state != RaftState.LEADER:
-                break
-            
-            # Replicate any pending log entries
-            self.replicate_logs()
-            
-            # Update commit index based on match indices
-            self.raft_node.update_commit_index()
-            
-            # Sleep for a short time before checking again
-            time.sleep(0.05)  # 50ms check interval
+        try:
+            while not self.replication_stop_event.is_set():
+                if self.raft_node.state != RaftState.LEADER:
+                    break
+                
+                # Replicate any pending log entries
+                self.replicate_logs()
+                
+                # Update commit index based on match indices
+                self.raft_node.update_commit_index()
+                
+                # Sleep for a short time before checking again
+                time.sleep(0.05)  # 50ms check interval
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error in replication thread: {str(e)}")
+            # Try to restart the thread if it fails and we're still leader
+            if not self.replication_stop_event.is_set() and self.raft_node.state == RaftState.LEADER:
+                logging.info(f"Node {self.raft_node.node_id}: Restarting replication thread")
+                # [FIXME]: This attempt to restart the thread, but since it is
+                # running inside the about to crash thread, all the check for if that
+                # thread is alive will pass, meaning the thread will not be restarted.
+                # Then the current running thread will crash.
+                self.start_replication_thread()
     
     def request_votes_from_all(self):
         """Send vote requests to all other nodes."""
@@ -381,19 +457,24 @@ class RaftConsensus:
         Returns:
             tuple: (current_term, success)
         """
-        # Update current leader if this is a valid AppendEntries
-        if term >= self.raft_node.current_term:
-            self.current_leader_id = leader_id
-        
-        # Process the AppendEntries in the RAFT node
-        current_term, success = self.raft_node.append_entries(
-            leader_id, term, prev_log_index, prev_log_term, entries, leader_commit)
-        
-        # Send response back to the leader
-        self.worker_manager.send_append_response(
-            leader_id, current_term, success, prev_log_index + len(entries) if success else 0)
-        
-        return current_term, success
+        try:
+            # Update current leader if this is a valid AppendEntries
+            if term >= self.raft_node.current_term:
+                self.current_leader_id = leader_id
+                logging.debug(f"Node {self.raft_node.node_id}: Updated leader to {leader_id} for term {term}")
+            
+            # Process the AppendEntries in the RAFT node
+            current_term, success = self.raft_node.append_entries(
+                leader_id, term, prev_log_index, prev_log_term, entries, leader_commit)
+            
+            # Send response back to the leader
+            self.worker_manager.send_append_response(
+                leader_id, current_term, success, prev_log_index + len(entries) if success else 0)
+            
+            return current_term, success
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error handling append entries: {str(e)}")
+            return self.raft_node.current_term, False
     
     def handle_append_response(self, follower_id, term, success, match_index):
         """
@@ -438,15 +519,27 @@ class RaftConsensus:
             int: Index of the new log entry, or -1 if not leader
         """
         if self.raft_node.state != RaftState.LEADER:
+            logging.warning(f"Node {self.raft_node.node_id}: Cannot add topology update - not a leader")
             return -1
         
+        if not self.topology_manager:
+            logging.error(f"Node {self.raft_node.node_id}: Cannot add topology update - topology manager not set")
+            return -1
+        
+        # Create the command for the log
         command = {
             'type': 'topology',
             'data': topology_data,
             'timestamp': time.time()
         }
         
-        return self.raft_node.add_log_entry(command)
+        # Add to the log and get the index
+        log_index = self.raft_node.add_log_entry(command)
+        
+        if log_index > 0:
+            logging.info(f"Node {self.raft_node.node_id}: Added topology update to log at index {log_index}")
+        
+        return log_index
     
     def add_bandwidth_update(self, bandwidth_data):
         """
@@ -459,15 +552,27 @@ class RaftConsensus:
             int: Index of the new log entry, or -1 if not leader
         """
         if self.raft_node.state != RaftState.LEADER:
+            logging.warning(f"Node {self.raft_node.node_id}: Cannot add bandwidth update - not a leader")
             return -1
         
+        if not self.bandwidth_manager:
+            logging.error(f"Node {self.raft_node.node_id}: Cannot add bandwidth update - bandwidth manager not set")
+            return -1
+        
+        # Create the command for the log
         command = {
             'type': 'bandwidth',
             'data': bandwidth_data,
             'timestamp': time.time()
         }
         
-        return self.raft_node.add_log_entry(command)
+        # Add to the log and get the index
+        log_index = self.raft_node.add_log_entry(command)
+        
+        if log_index > 0:
+            logging.info(f"Node {self.raft_node.node_id}: Added bandwidth update to log at index {log_index}")
+        
+        return log_index
     
     def add_membership_change(self, action, node_id):
         """
@@ -481,20 +586,39 @@ class RaftConsensus:
             int: Index of the new log entry, or -1 if not leader
         """
         if self.raft_node.state != RaftState.LEADER:
+            logging.warning(f"Node {self.raft_node.node_id}: Cannot add membership change - not a leader")
             return -1
         
-        if action == 'add':
-            # First add the node to known nodes
-            self.raft_node.add_node(node_id)
+        if action not in ['add', 'remove']:
+            logging.error(f"Node {self.raft_node.node_id}: Invalid membership action: {action}")
+            return -1
         
-        command = {
-            'type': 'membership',
-            'action': action,
-            'node_id': node_id,
-            'timestamp': time.time()
-        }
-        
-        return self.raft_node.add_log_entry(command)
+        try:
+            if action == 'add':
+                # First add the node to known nodes
+                if not self.raft_node.add_node(node_id):
+                    logging.warning(f"Node {self.raft_node.node_id}: Failed to add node {node_id} to known nodes")
+                    return -1
+                logging.info(f"Node {self.raft_node.node_id}: Added node {node_id} to known nodes")
+            
+            # Create the command for the log
+            command = {
+                'type': 'membership',
+                'action': action,
+                'node_id': node_id,
+                'timestamp': time.time()
+            }
+            
+            # Add to the log and get the index
+            log_index = self.raft_node.add_log_entry(command)
+            
+            if log_index > 0:
+                logging.info(f"Node {self.raft_node.node_id}: Added membership change ({action} node {node_id}) to log at index {log_index}")
+            
+            return log_index
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error adding membership change: {str(e)}")
+            return -1
     
     def add_coordinator_update(self, coordinator_id):
         """
@@ -653,3 +777,29 @@ class RaftConsensus:
                         latest_bandwidth = data
         
         return latest_bandwidth
+    
+    def get_status(self):
+        """
+        Get the current status of the RAFT node.
+        
+        Returns:
+            dict: Status information including state, term, leader, etc.
+        """
+        with self.raft_node.state_lock:
+            status = {
+                'node_id': self.raft_node.node_id,
+                'state': self.raft_node.state.name,
+                'current_term': self.raft_node.current_term,
+                'voted_for': self.raft_node.voted_for,
+                'current_leader': self.current_leader_id,
+                'log_length': len(self.raft_node.log),
+                'commit_index': self.raft_node.commit_index,
+                'last_applied': self.raft_node.last_applied,
+                'known_nodes': list(self.raft_node.known_nodes),
+            }
+            
+            if self.raft_node.state == RaftState.LEADER:
+                status['next_indices'] = dict(self.raft_node.next_index)
+                status['match_indices'] = dict(self.raft_node.match_index)
+            
+            return status
