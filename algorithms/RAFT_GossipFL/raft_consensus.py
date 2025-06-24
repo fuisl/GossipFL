@@ -687,6 +687,10 @@ class RaftConsensus:
             self.raft_node.log,
             self.raft_node.commit_index
         )
+        # Also send the latest model parameters for faster start
+        if hasattr(self.worker_manager.worker, "model_trainer"):
+            params = self.worker_manager.worker.model_trainer.get_model_params()
+            self.worker_manager.send_model_params(new_node_id, params)
     
     def handle_state_snapshot(self, term, log, commit_index):
         """
@@ -703,6 +707,8 @@ class RaftConsensus:
         with self.raft_node.state_lock:
             # Update term if needed
             if term > self.raft_node.current_term:
+                self.raft_node.become_follower(term)
+            elif self.raft_node.state == RaftState.INITIAL:
                 self.raft_node.become_follower(term)
             
             # Replace log with snapshot

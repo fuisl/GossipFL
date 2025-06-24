@@ -81,6 +81,17 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         self.register_message_receive_handler(
             RaftMessage.MSG_TYPE_RAFT_STATE_SNAPSHOT,
             self.handle_state_snapshot)
+
+        # Initialization parameter exchange
+        self.register_message_receive_handler(
+            RaftMessage.MSG_TYPE_RAFT_STATE_REQUEST,
+            self.handle_state_request)
+        self.register_message_receive_handler(
+            RaftMessage.MSG_TYPE_RAFT_PARAM_REQUEST,
+            self.handle_param_request)
+        self.register_message_receive_handler(
+            RaftMessage.MSG_TYPE_RAFT_PARAM_RESPONSE,
+            self.handle_param_response)
     
     def run(self):
         """Run the worker manager with RAFT integration."""
@@ -201,9 +212,19 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         
         self.coordinator_id = self.raft_consensus.get_leader_id()
         logging.info(f"Initial consensus established, leader is {self.coordinator_id}")
-        
-        # In a real implementation, we might also want to wait for
-        # initial topology and bandwidth consensus
+
+        # If this node has not been initialized, request state and parameters
+        if self.raft_consensus.raft_node.state == RaftState.INITIAL and self.worker_index != self.coordinator_id:
+            self.send_state_request(self.coordinator_id)
+            self.send_param_request(self.coordinator_id)
+
+            # Wait until state is updated by the leader
+            for _ in range(50):
+                if self.raft_consensus.raft_node.state != RaftState.INITIAL:
+                    break
+                time.sleep(0.1)
+
+        # In a real implementation, we might also wait for initial topology/bandwidth
     
     # RAFT message handlers
     
@@ -293,6 +314,30 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         
         # Process the state snapshot
         self.raft_consensus.handle_state_snapshot(term, log, commit_index)
+
+    def handle_state_request(self, msg_params):
+        """Handle a snapshot request from a follower."""
+        sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
+        if self.raft_consensus.is_leader():
+            self.send_state_snapshot(
+                sender_id,
+                self.raft_consensus.raft_node.current_term,
+                self.raft_consensus.raft_node.log,
+                self.raft_consensus.raft_node.commit_index,
+            )
+
+    def handle_param_request(self, msg_params):
+        """Handle a model parameter request from a follower."""
+        sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
+        if self.raft_consensus.is_leader() and hasattr(self.worker, "model_trainer"):
+            params = self.worker.model_trainer.get_model_params()
+            self.send_model_params(sender_id, params)
+
+    def handle_param_response(self, msg_params):
+        """Receive model parameters from the leader."""
+        params = msg_params.get(RaftMessage.MSG_ARG_MODEL_PARAMS)
+        if params is not None and hasattr(self.worker, "model_trainer"):
+            self.worker.model_trainer.set_model_params(params)
     
     # RAFT message sending methods
     
@@ -381,7 +426,29 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         message.add_params(RaftMessage.MSG_ARG_TERM, term)
         message.add_params(RaftMessage.MSG_ARG_LOG, log)
         message.add_params(RaftMessage.MSG_ARG_COMMIT_INDEX, commit_index)
-        
+
+        self.send_message(message)
+
+    def send_state_request(self, receiver_id):
+        """Request the latest state snapshot from the leader."""
+        message = Message(
+            RaftMessage.MSG_TYPE_RAFT_STATE_REQUEST, self.get_sender_id(), receiver_id
+        )
+        self.send_message(message)
+
+    def send_param_request(self, receiver_id):
+        """Request model parameters from the leader."""
+        message = Message(
+            RaftMessage.MSG_TYPE_RAFT_PARAM_REQUEST, self.get_sender_id(), receiver_id
+        )
+        self.send_message(message)
+
+    def send_model_params(self, receiver_id, params):
+        """Send model parameters to a follower."""
+        message = Message(
+            RaftMessage.MSG_TYPE_RAFT_PARAM_RESPONSE, self.get_sender_id(), receiver_id
+        )
+        message.add_params(RaftMessage.MSG_ARG_MODEL_PARAMS, params)
         self.send_message(message)
     
     # Override key methods from DecentralizedWorkerManager

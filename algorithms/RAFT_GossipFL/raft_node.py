@@ -5,13 +5,12 @@ import threading
 from enum import Enum
 
 class RaftState(Enum):
-    """
-    Represents the possible states of a RAFT node.
-    """
-    FOLLOWER = 0
-    CANDIDATE = 1
-    # [FIXME]: Add a state for newly created node who has not been initialized by the Leader yet
-    LEADER = 2
+    """Represents the possible states of a RAFT node."""
+
+    INITIAL = 0
+    FOLLOWER = 1
+    CANDIDATE = 2
+    LEADER = 3
 
 
 class RaftNode:
@@ -34,7 +33,8 @@ class RaftNode:
         self.args = args
         
         # RAFT state
-        self.state = RaftState.FOLLOWER
+        # Newly started nodes are in INITIAL state until synchronized
+        self.state = RaftState.INITIAL
         self.current_term = 0
         self.voted_for = None
         
@@ -69,7 +69,9 @@ class RaftNode:
         self.known_nodes = set()
         self.update_known_nodes(args.client_num_in_total)
         
-        logging.info(f"RAFT Node {self.node_id} initialized in FOLLOWER state")
+        logging.info(
+            f"RAFT Node {self.node_id} initialized in {self.state.name} state"
+        )
     
     def update_known_nodes(self, total_nodes):
         """
@@ -109,8 +111,10 @@ class RaftNode:
         with self.state_lock:
             if self.state == RaftState.LEADER:
                 return False  # Leaders don't start elections
-            
-            # [FIXME]: If this node is a newly created node, it should not start an election
+
+            # Newly initialized nodes should not start elections until synchronized
+            if self.state == RaftState.INITIAL:
+                return False
                 
             # Increment term, vote for self
             self.current_term += 1
@@ -143,7 +147,9 @@ class RaftNode:
             tuple: (term, vote_granted)
         """
         with self.state_lock:
-            # [FIXME]: If this node is a newly created node, it should not participate in elections
+            # Do not participate in elections before initialization
+            if self.state == RaftState.INITIAL:
+                return self.current_term, False
 
             # If term > currentTerm, convert to follower
             if term > self.current_term:
@@ -284,6 +290,10 @@ class RaftNode:
             tuple: (term, success)
         """
         with self.state_lock:
+            # If the node is uninitialized, accept the leader and convert to follower
+            if self.state == RaftState.INITIAL:
+                self.become_follower(term)
+
             # If term < currentTerm, reject
             if term < self.current_term:
                 return self.current_term, False

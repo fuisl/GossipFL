@@ -9,6 +9,9 @@ class RaftMessage:
     MSG_TYPE_RAFT_APPEND_ENTRIES = 103
     MSG_TYPE_RAFT_APPEND_RESPONSE = 104
     MSG_TYPE_RAFT_STATE_SNAPSHOT = 105
+    MSG_TYPE_RAFT_STATE_REQUEST = 106
+    MSG_TYPE_RAFT_PARAM_REQUEST = 107
+    MSG_TYPE_RAFT_PARAM_RESPONSE = 108
     
     # Message arguments
     MSG_ARG_KEY_TYPE = "msg_type"
@@ -29,6 +32,9 @@ class RaftMessage:
     MSG_ARG_MATCH_INDEX = "match_index"
     MSG_ARG_LOG = "log"
     MSG_ARG_COMMIT_INDEX = "commit_index"
+
+    # Initialization / parameter exchange
+    MSG_ARG_MODEL_PARAMS = "model_params"
     
     # Entry types
     MSG_ARG_ENTRY_TYPE = "entry_type"
