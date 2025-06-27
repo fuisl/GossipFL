@@ -650,28 +650,114 @@ class RaftConsensus:
         """
         return self.current_leader_id
     
-    def handle_node_join_request(self, new_node_id):
+    def is_state_synchronized(self):
+        """
+        Check if the node's state is properly synchronized with the cluster.
+        
+        A node is considered synchronized if:
+        - It has a valid state (not INITIAL)
+        - It has received and applied some log entries
+        - Its commit index is reasonable compared to its log
+        
+        Returns:
+            bool: True if the node is synchronized, False otherwise
+        """
+        with self.raft_node.state_lock:
+            # Must not be in initial state
+            if self.raft_node.state == RaftState.INITIAL:
+                return False
+            
+            # Must have some committed entries (unless we're starting fresh)
+            if len(self.raft_node.log) > 0 and self.raft_node.commit_index == 0:
+                return False
+            
+            # If we have log entries, we should have applied them
+            if self.raft_node.commit_index > self.raft_node.last_applied + 5:
+                return False  # Too many unapplied entries
+            
+            return True
+    
+    def get_latest_committed_state(self):
+        """
+        Get the latest committed state from the RAFT log.
+        
+        This searches through committed log entries to find the most recent
+        state information including model parameters, topology, and bandwidth.
+        
+        Returns:
+            dict or None: The latest committed state, or None if no state found
+        """
+        with self.raft_node.state_lock:
+            if self.raft_node.commit_index == 0:
+                return None
+            
+            # Start with empty state
+            committed_state = {
+                'model_params': None,
+                'topology': None,
+                'bandwidth': None,
+                'round_idx': 0,
+                'raft_term': self.raft_node.current_term,
+                'raft_commit_index': self.raft_node.commit_index
+            }
+            
+            # Search through committed log entries from most recent to oldest
+            for idx in range(min(self.raft_node.commit_index, len(self.raft_node.log)) - 1, -1, -1):
+                entry = self.raft_node.log[idx]
+                entry_type = entry.get('type')
+                entry_data = entry.get('data', {})
+                
+                # Update state components as we find them
+                if entry_type == 'model_params' and committed_state['model_params'] is None:
+                    committed_state['model_params'] = entry_data.get('params')
+                    committed_state['round_idx'] = entry_data.get('round', committed_state['round_idx'])
+                
+                if entry_type == 'topology' and committed_state['topology'] is None:
+                    committed_state['topology'] = entry_data.get('matrix')
+                
+                if entry_type == 'bandwidth' and committed_state['bandwidth'] is None:
+                    committed_state['bandwidth'] = entry_data.get('matrix')
+                
+                # If we have all components, we can stop searching
+                if (committed_state['model_params'] is not None and
+                    committed_state['topology'] is not None and
+                    committed_state['bandwidth'] is not None):
+                    break
+            
+            return committed_state
+    
+    def handle_node_join_request(self, node_id):
         """
         Handle a request from a new node to join the cluster.
         
+        This method uses the RAFT protocol to ensure the joining node
+        gets a consistent view of the cluster state.
+        
         Args:
-            new_node_id (int): ID of the new node
+            node_id (int): ID of the node wanting to join
             
         Returns:
-            bool: True if the node was added, False otherwise
+            bool: True if the join was handled successfully, False otherwise
         """
-        # Only leaders can add nodes
-        if self.raft_node.state != RaftState.LEADER:
+        if not self.is_leader():
+            logging.info(f"Node {self.raft_node.node_id}: Not leader, cannot handle join request from {node_id}")
             return False
         
-        # Add the node to the cluster
-        success = self.raft_node.add_node(new_node_id)
+        logging.info(f"Node {self.raft_node.node_id}: Handling join request from node {node_id}")
         
-        if success:
-            # Send the current state to the new node
-            self.send_state_to_new_node(new_node_id)
+        # Add the node to our known nodes if not already present
+        if node_id not in self.raft_node.known_nodes:
+            self.raft_node.known_nodes.add(node_id)
+            
+            # Initialize next and match indices for the new node
+            self.raft_node.next_index[node_id] = len(self.raft_node.log) + 1
+            self.raft_node.match_index[node_id] = 0
+            
+            logging.info(f"Node {self.raft_node.node_id}: Added node {node_id} to cluster")
         
-        return success
+        # Send the current state to the joining node
+        # This will be handled by the worker manager's enhanced state snapshot method
+        return True
     
     def send_state_to_new_node(self, new_node_id):
         """
@@ -738,6 +824,15 @@ class RaftConsensus:
             int: ID of the current leader, or None if unknown
         """
         return self.current_leader_id
+    
+    def get_current_leader(self):
+        """
+        Alias for get_leader_id() for compatibility.
+        
+        Returns:
+            int: ID of the current leader, or None if unknown
+        """
+        return self.get_leader_id()
     
     def get_topology_for_round(self, round_number):
         """

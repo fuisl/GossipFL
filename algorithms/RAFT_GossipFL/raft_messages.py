@@ -12,6 +12,7 @@ class RaftMessage:
     MSG_TYPE_RAFT_STATE_REQUEST = 106
     MSG_TYPE_RAFT_PARAM_REQUEST = 107
     MSG_TYPE_RAFT_PARAM_RESPONSE = 108
+    MSG_TYPE_RAFT_LEADER_REDIRECT = 109
     
     # Message arguments
     MSG_ARG_KEY_TYPE = "msg_type"
@@ -35,6 +36,9 @@ class RaftMessage:
 
     # Initialization / parameter exchange
     MSG_ARG_MODEL_PARAMS = "model_params"
+    MSG_ARG_RAFT_METADATA = "raft_metadata"
+    MSG_ARG_STATE_PACKAGE = "state_package"
+    MSG_ARG_LEADER_ID = "leader_id"
     
     # Entry types
     MSG_ARG_ENTRY_TYPE = "entry_type"

@@ -2,6 +2,7 @@ import logging
 import threading
 import time
 import traceback
+import numpy as np
 
 from mpi4py import MPI
 from fedml_core.distributed.communication.message import Message
@@ -81,6 +82,11 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         self.register_message_receive_handler(
             RaftMessage.MSG_TYPE_RAFT_STATE_SNAPSHOT,
             self.handle_state_snapshot)
+
+        # Enhanced message handlers for improved node joining
+        self.register_message_receive_handler(
+            RaftMessage.MSG_TYPE_RAFT_LEADER_REDIRECT,
+            self.handle_leader_redirect)
 
         # Initialization parameter exchange
         self.register_message_receive_handler(
@@ -204,7 +210,11 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             raise e
     
     def wait_for_initial_consensus(self):
-        """Wait for initial RAFT consensus to be established."""
+        """
+        Wait for initial RAFT consensus to be established.
+        
+        Enhanced to use proper RAFT join protocol instead of manual state requests.
+        """
         # Wait until a leader is elected
         while self.raft_consensus.get_leader_id() is None:
             logging.debug(f"Node {self.worker_index} waiting for leader election")
@@ -213,18 +223,46 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         self.coordinator_id = self.raft_consensus.get_leader_id()
         logging.info(f"Initial consensus established, leader is {self.coordinator_id}")
 
-        # If this node has not been initialized, request state and parameters
-        if self.raft_consensus.raft_node.state == RaftState.INITIAL and self.worker_index != self.coordinator_id:
-            self.send_state_request(self.coordinator_id)
-            self.send_param_request(self.coordinator_id)
+        # If this node has not been initialized and is not the leader, join the cluster properly
+        if (self.raft_consensus.raft_node.state == RaftState.INITIAL and 
+            self.worker_index != self.coordinator_id):
+            
+            logging.info(f"Node {self.worker_index} joining cluster through leader {self.coordinator_id}")
+            
+            # Use the enhanced cluster join method
+            self.request_cluster_join(self.coordinator_id)
+            
+            # Wait for state synchronization to complete
+            max_wait_rounds = 100  # Allow more time for full synchronization
+            for wait_round in range(max_wait_rounds):
+                # Check if we've received and processed the state snapshot
+                if (self.raft_consensus.raft_node.state != RaftState.INITIAL and
+                    self.raft_consensus.raft_node.commit_index > 0):
+                    logging.info(f"Node {self.worker_index} successfully synchronized "
+                               f"(state: {self.raft_consensus.raft_node.state}, "
+                               f"commit_index: {self.raft_consensus.raft_node.commit_index})")
+                    break
+                time.sleep(0.1)
+            else:
+                logging.warning(f"Node {self.worker_index} state synchronization may be incomplete")
 
-            # Wait until state is updated by the leader
+        # Ensure topology and bandwidth are also synchronized
+        # These should be updated through the state snapshot, but verify
+        if self.topology_manager.get_topology() is None:
+            logging.info("Topology not yet available, waiting...")
             for _ in range(50):
-                if self.raft_consensus.raft_node.state != RaftState.INITIAL:
+                if self.topology_manager.get_topology() is not None:
+                    break
+                time.sleep(0.1)
+                
+        if self.bandwidth_manager.get_bandwidth() is None:
+            logging.info("Bandwidth not yet available, waiting...")
+            for _ in range(50):
+                if self.bandwidth_manager.get_bandwidth() is not None:
                     break
                 time.sleep(0.1)
 
-        # In a real implementation, we might also wait for initial topology/bandwidth
+        logging.info(f"Node {self.worker_index} is ready to start training")
     
     # RAFT message handlers
     
@@ -302,6 +340,8 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         """
         Handle a RAFT StateSnapshot message.
         
+        Enhanced to process comprehensive state packages for proper node joining.
+        
         Args:
             msg_params (dict): Message parameters
         """
@@ -309,35 +349,120 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         term = msg_params.get(RaftMessage.MSG_ARG_TERM)
         log = msg_params.get(RaftMessage.MSG_ARG_LOG)
         commit_index = msg_params.get(RaftMessage.MSG_ARG_COMMIT_INDEX)
+        state_package = msg_params.get(RaftMessage.MSG_ARG_STATE_PACKAGE)
         
-        logging.debug(f"Received StateSnapshot from {sender_id}, term={term}, log_size={len(log) if log else 0}")
+        logging.debug(f"Received StateSnapshot from {sender_id}, term={term}, "
+                     f"log_size={len(log) if log else 0}, commit_index={commit_index}")
         
-        # Process the state snapshot
+        # First, process the basic RAFT state snapshot
         self.raft_consensus.handle_state_snapshot(term, log, commit_index)
+        
+        # If there's a comprehensive state package, initialize from it
+        if state_package is not None:
+            logging.info(f"Processing comprehensive state package from {sender_id}")
+            success = self.initialize_from_state_snapshot(state_package)
+            if success:
+                logging.info(f"Successfully joined cluster via state snapshot from {sender_id}")
+            else:
+                logging.error(f"Failed to process state package from {sender_id}")
+
+    def handle_leader_redirect(self, msg_params):
+        """
+        Handle a leader redirect message.
+        
+        Args:
+            msg_params (dict): Message parameters
+        """
+        sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
+        leader_id = msg_params.get(RaftMessage.MSG_ARG_LEADER_ID)
+        
+        logging.info(f"Received leader redirect from {sender_id}, leader is {leader_id}")
+        
+        # Update our knowledge of the current leader and request state from them
+        if leader_id is not None and leader_id != self.worker_index:
+            self.coordinator_id = leader_id
+            self.send_state_request(leader_id)
 
     def handle_state_request(self, msg_params):
-        """Handle a snapshot request from a follower."""
+        """
+        Handle a state request from a follower.
+        
+        This method is enhanced to ensure proper RAFT-based state synchronization
+        for new nodes joining the cluster.
+        """
         sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
-        if self.raft_consensus.is_leader():
-            self.send_state_snapshot(
-                sender_id,
-                self.raft_consensus.raft_node.current_term,
-                self.raft_consensus.raft_node.log,
-                self.raft_consensus.raft_node.commit_index,
-            )
+        
+        if not self.raft_consensus.is_leader():
+            # If we're not the leader, redirect to the current leader
+            leader_id = self.raft_consensus.get_leader_id()
+            if leader_id is not None:
+                logging.info(f"Redirecting state request from {sender_id} to leader {leader_id}")
+                self.send_leader_redirect(sender_id, leader_id)
+            else:
+                logging.warning(f"No leader available for state request from {sender_id}")
+            return
+        
+        # As the leader, send comprehensive state snapshot
+        logging.info(f"Sending RAFT-synchronized state snapshot to node {sender_id}")
+        self.send_comprehensive_state_snapshot(
+            sender_id,
+            self.raft_consensus.raft_node.current_term,
+            self.raft_consensus.raft_node.log,
+            self.raft_consensus.raft_node.commit_index,
+        )
 
     def handle_param_request(self, msg_params):
-        """Handle a model parameter request from a follower."""
+        """
+        Handle a model parameter request from a follower.
+        
+        Enhanced to ensure parameter consistency with RAFT state.
+        """
         sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
-        if self.raft_consensus.is_leader() and hasattr(self.worker, "model_trainer"):
+        
+        if not self.raft_consensus.is_leader():
+            # Redirect to leader for consistent parameter state
+            leader_id = self.raft_consensus.get_leader_id()
+            if leader_id is not None:
+                logging.info(f"Redirecting param request from {sender_id} to leader {leader_id}")
+                self.send_leader_redirect(sender_id, leader_id)
+            return
+        
+        # Send parameters with RAFT consistency metadata
+        if hasattr(self.worker, "model_trainer"):
             params = self.worker.model_trainer.get_model_params()
-            self.send_model_params(sender_id, params)
+            # Include RAFT state metadata for consistency checking
+            raft_metadata = {
+                'term': self.raft_consensus.raft_node.current_term,
+                'commit_index': self.raft_consensus.raft_node.commit_index,
+                'leader_id': self.worker_index
+            }
+            self.send_model_params_with_metadata(sender_id, params, raft_metadata)
 
     def handle_param_response(self, msg_params):
-        """Receive model parameters from the leader."""
+        """
+        Receive model parameters from the leader.
+        
+        Enhanced to validate RAFT consistency before applying parameters.
+        """
         params = msg_params.get(RaftMessage.MSG_ARG_MODEL_PARAMS)
+        raft_metadata = msg_params.get(RaftMessage.MSG_ARG_RAFT_METADATA, {})
+        
         if params is not None and hasattr(self.worker, "model_trainer"):
-            self.worker.model_trainer.set_model_params(params)
+            # Validate RAFT consistency before applying parameters
+            sender_term = raft_metadata.get('term', 0)
+            sender_commit_index = raft_metadata.get('commit_index', 0)
+            
+            if self.validate_raft_consistency(sender_term, sender_commit_index):
+                self.worker.model_trainer.set_model_params(params)
+                logging.info(f"Applied model parameters from leader "
+                           f"(term: {sender_term}, commit_index: {sender_commit_index})")
+            else:
+                logging.warning(f"Rejected model parameters due to RAFT inconsistency "
+                              f"(term: {sender_term}, commit_index: {sender_commit_index})")
+                # Request fresh state from current leader
+                leader_id = self.raft_consensus.get_leader_id()
+                if leader_id is not None:
+                    self.send_state_request(leader_id)
     
     # RAFT message sending methods
     
@@ -451,47 +576,206 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         message.add_params(RaftMessage.MSG_ARG_MODEL_PARAMS, params)
         self.send_message(message)
     
-    # Override key methods from DecentralizedWorkerManager
+    # Enhanced RAFT state synchronization methods
     
-    def test_and_send_to_coordinator(self, iteration, epoch):
+    def send_comprehensive_state_snapshot(self, receiver_id, term, log, commit_index):
         """
-        Test the model and send results to the coordinator.
+        Send a comprehensive state snapshot including all necessary data for a new node.
         
-        Override to use the RAFT leader as coordinator.
+        This ensures that joining nodes get the complete, consistent state including:
+        - RAFT log and term information
+        - Model parameters
+        - Topology configuration  
+        - Bandwidth configuration
+        - Current training round information
         
         Args:
-            iteration (int): Current iteration
-            epoch (int): Current epoch
+            receiver_id (int): ID of the receiver
+            term (int): Current RAFT term
+            log (list): Complete RAFT log
+            commit_index (int): Leader's commit index
         """
-        # Similar to original implementation, but use RAFT leader as coordinator
-        coordinator_id = self.raft_consensus.get_leader_id()
-        if coordinator_id is None:
-            logging.warning("No leader elected yet, using default coordinator (0)")
-            coordinator_id = 0
+        # Get current model parameters if available
+        model_params = None
+        if hasattr(self.worker, "model_trainer"):
+            model_params = self.worker.model_trainer.get_model_params()
         
-        if (iteration == self.worker.num_iterations - 1) and \
-           (self.epoch % self.args.frequency_of_the_test == 0 or self.epoch == self.args.epochs - 1):
-            # If at the end of an epoch and testing is needed
-            self.worker.test(self.epoch, self.test_tracker, self.metrics)
+        # Get latest topology and bandwidth from their respective managers
+        topology = self.topology_manager.get_topology()
+        bandwidth = self.bandwidth_manager.get_bandwidth()
+        
+        # Package comprehensive state
+        state_package = {
+            'raft_term': term,
+            'raft_log': log,
+            'raft_commit_index': commit_index,
+            'model_params': model_params,
+            'topology': topology.tolist() if topology is not None else None,
+            'bandwidth': bandwidth.tolist() if bandwidth is not None else None,
+            'current_round': getattr(self, 'epoch', 0),
+            'leader_id': self.worker_index,
+            'timestamp': time.time()
+        }
+        
+        message = Message(RaftMessage.MSG_TYPE_RAFT_STATE_SNAPSHOT, self.get_sender_id(), receiver_id)
+        message.add_params(RaftMessage.MSG_ARG_TERM, term)
+        message.add_params(RaftMessage.MSG_ARG_LOG, log)
+        message.add_params(RaftMessage.MSG_ARG_COMMIT_INDEX, commit_index)
+        message.add_params(RaftMessage.MSG_ARG_STATE_PACKAGE, state_package)
+
+        self.send_message(message)
+        logging.info(f"Sent comprehensive state snapshot to node {receiver_id} "
+                    f"(term: {term}, commit_index: {commit_index})")
+
+    def send_leader_redirect(self, receiver_id, leader_id):
+        """
+        Send a redirect message to inform a node about the current leader.
+        
+        Args:
+            receiver_id (int): ID of the node to redirect
+            leader_id (int): ID of the current leader
+        """
+        message = Message(RaftMessage.MSG_TYPE_RAFT_LEADER_REDIRECT, self.get_sender_id(), receiver_id)
+        message.add_params(RaftMessage.MSG_ARG_LEADER_ID, leader_id)
+        self.send_message(message)
+
+    def send_model_params_with_metadata(self, receiver_id, params, raft_metadata):
+        """
+        Send model parameters with RAFT consistency metadata.
+        
+        Args:
+            receiver_id (int): ID of the receiver
+            params: Model parameters
+            raft_metadata (dict): RAFT state metadata for consistency validation
+        """
+        message = Message(RaftMessage.MSG_TYPE_RAFT_PARAM_RESPONSE, self.get_sender_id(), receiver_id)
+        message.add_params(RaftMessage.MSG_ARG_MODEL_PARAMS, params)
+        message.add_params(RaftMessage.MSG_ARG_RAFT_METADATA, raft_metadata)
+        self.send_message(message)
+
+    def validate_raft_consistency(self, sender_term, sender_commit_index):
+        """
+        Validate RAFT consistency before applying received state.
+        
+        Args:
+            sender_term (int): Term from the sender
+            sender_commit_index (int): Commit index from the sender
             
-            train_metric_info, test_metric_info = get_metric_info(
-                self.train_tracker, self.test_tracker, time_stamp=self.epoch, if_reset=True,
-                metrics=self.metrics)
+        Returns:
+            bool: True if the state is consistent and should be applied
+        """
+        current_term = self.raft_consensus.raft_node.current_term
+        current_commit_index = self.raft_consensus.raft_node.commit_index
+        
+        # Accept if sender has higher or equal term and commit index
+        if sender_term >= current_term and sender_commit_index >= current_commit_index:
+            return True
+        
+        # If terms are equal, accept if commit index is not too far behind
+        if sender_term == current_term and abs(sender_commit_index - current_commit_index) <= 5:
+            return True
             
-            if self.worker_index == coordinator_id:
-                with get_lock(self.total_metric_lock):
-                    self.flag_client_finish_dict[self.worker_index] = True
-                    self.total_test_tracker.update_metrics(test_metric_info, test_metric_info['n_samples'])
-                    self.total_train_tracker.update_metrics(train_metric_info, train_metric_info['n_samples'])
-                    self.check_worker_finish_and_notify()
-            else:
-                self.send_notify_to_coordinator(coordinator_id, train_metric_info, test_metric_info)
+        return False
+
+    def initialize_from_state_snapshot(self, state_package):
+        """
+        Initialize node state from a comprehensive state snapshot.
+        
+        This method is called when a node receives a complete state package
+        and needs to synchronize its state with the cluster.
+        
+        Args:
+            state_package (dict): Complete state information from leader
+        """
+        try:
+            # Update RAFT state first
+            raft_term = state_package.get('raft_term', 0)
+            raft_log = state_package.get('raft_log', [])
+            raft_commit_index = state_package.get('raft_commit_index', 0)
+            
+            # Apply RAFT state through consensus manager
+            self.raft_consensus.handle_state_snapshot(raft_term, raft_log, raft_commit_index)
+            
+            # Update model parameters if available
+            model_params = state_package.get('model_params')
+            if model_params is not None and hasattr(self.worker, "model_trainer"):
+                self.worker.model_trainer.set_model_params(model_params)
+                logging.info("Applied model parameters from state snapshot")
+            
+            # Update topology if available
+            topology_data = state_package.get('topology')
+            if topology_data is not None:
+                topology = np.array(topology_data)
+                self.topology_manager.apply_topology_update({'topology': topology})
+                logging.info("Applied topology from state snapshot")
+            
+            # Update bandwidth if available
+            bandwidth_data = state_package.get('bandwidth')
+            if bandwidth_data is not None:
+                bandwidth = np.array(bandwidth_data)
+                self.bandwidth_manager.apply_bandwidth_update({'matrix': bandwidth_data})
+                logging.info("Applied bandwidth from state snapshot")
+            
+            # Update training round information
+            current_round = state_package.get('current_round', 0)
+            if hasattr(self, 'epoch'):
+                self.epoch = current_round
+                logging.info(f"Synchronized to training round {current_round}")
+            
+            logging.info(f"Successfully initialized from state snapshot "
+                        f"(term: {raft_term}, commit_index: {raft_commit_index})")
+            
+            return True
+            
+        except Exception as e:
+            logging.error(f"Failed to initialize from state snapshot: {str(e)}")
+            return False
+
+    def request_cluster_join(self, leader_id=None):
+        """
+        Request to join the cluster using proper RAFT protocol.
+        
+        This method should be called by new nodes that want to join the cluster.
+        It follows the RAFT join protocol to ensure proper state synchronization.
+        
+        Args:
+            leader_id (int, optional): ID of the known leader. If None, will discover.
+        """
+        if leader_id is None:
+            # Try to discover the leader
+            leader_id = self.raft_consensus.get_leader_id()
+        
+        if leader_id is None:
+            # If no leader is known, request state from all known nodes
+            logging.info("No leader known, requesting state from all peers")
+            for peer_id in range(self.worker_num):
+                if peer_id != self.worker_index:
+                    self.send_state_request(peer_id)
         else:
-            # If not testing, just reset trackers and notify
-            self.reset_train_test_tracker(self.train_tracker, self.test_tracker)
-            if self.worker_index == coordinator_id:
-                with get_lock(self.total_metric_lock):
-                    self.flag_client_finish_dict[self.worker_index] = True
-                    self.check_worker_finish_and_notify()
+            # Request comprehensive state from the leader
+            logging.info(f"Requesting cluster join from leader {leader_id}")
+            self.send_state_request(leader_id)
+            
+    # Override parent initialization method to ensure proper joining
+    def run(self):
+        """
+        Enhanced run method that ensures proper cluster joining for new nodes.
+        """
+        # If this is a new node joining an existing cluster, request state first
+        if hasattr(self.args, 'join_existing_cluster') and self.args.join_existing_cluster:
+            logging.info("Joining existing cluster - requesting state synchronization")
+            self.request_cluster_join()
+            
+            # Wait for state synchronization before starting training
+            max_wait_time = 30  # seconds
+            wait_start = time.time()
+            while not self.raft_consensus.is_state_synchronized() and (time.time() - wait_start) < max_wait_time:
+                time.sleep(1)
+            
+            if not self.raft_consensus.is_state_synchronized():
+                logging.warning("Failed to synchronize state within timeout - proceeding anyway")
             else:
-                self.send_notify_to_coordinator(coordinator_id)
+                logging.info("Successfully synchronized with existing cluster")
+        
+        # Continue with parent run method
+        super().run()
