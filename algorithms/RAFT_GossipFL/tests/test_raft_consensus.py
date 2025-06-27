@@ -26,9 +26,10 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
 from unittest.mock import Mock
 
-# Add current directory to Python path for imports
+# Add parent directory to Python path for imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, current_dir)
+parent_dir = os.path.dirname(current_dir)
+sys.path.insert(0, parent_dir)
 
 # Import the RAFT implementation
 from raft_node import RaftNode, RaftState

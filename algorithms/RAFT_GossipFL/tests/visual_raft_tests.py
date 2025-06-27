@@ -12,9 +12,10 @@ import time
 import threading
 from unittest.mock import Mock
 
-# Add current directory to path
+# Add parent directory to path
 current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, current_dir)
+parent_dir = os.path.dirname(current_dir)
+sys.path.insert(0, parent_dir)
 
 from raft_node import RaftNode, RaftState
 from raft_visualizer import RaftVisualizer

@@ -27,10 +27,13 @@ def setup_path():
     """Setup the Python path to import RAFT modules."""
     # Get the directory containing this script
     script_dir = Path(__file__).parent
+    parent_dir = script_dir.parent
     
-    # Add the current directory to Python path
+    # Add the current directory and parent directory to Python path
     if str(script_dir) not in sys.path:
         sys.path.insert(0, str(script_dir))
+    if str(parent_dir) not in sys.path:
+        sys.path.insert(0, str(parent_dir))
 
 
 def import_test_module(module_name: str):
@@ -108,10 +111,11 @@ def check_raft_implementation():
     ]
     
     script_dir = Path(__file__).parent
+    parent_dir = script_dir.parent
     missing_files = []
     
     for file_name in required_files:
-        file_path = script_dir / file_name
+        file_path = parent_dir / file_name
         if not file_path.exists():
             missing_files.append(file_name)
         else:

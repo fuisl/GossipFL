@@ -21,6 +21,7 @@ python run_raft_tests.py --test consensus   # Full consensus simulation
 ## What Was Tested ✅
 
 ### 1. Core RAFT Node Operations
+
 - **Node Initialization**: INITIAL → FOLLOWER → CANDIDATE → LEADER states
 - **Election Process**: Term increment, self-voting, vote collection
 - **Vote Handling**: Vote request/response processing, majority calculation
@@ -28,6 +29,7 @@ python run_raft_tests.py --test consensus   # Full consensus simulation
 - **Commit/Apply**: Log entry commitment and state machine application
 
 ### 2. Message Passing Protocol
+
 ```
 Vote Request Flow:
 [MSG 001] 0 → 1: VOTE_REQUEST (term: 1, candidate_id: 0, last_log: 0/0)
@@ -43,6 +45,7 @@ Heartbeat Flow:
 ```
 
 ### 3. Full Consensus Scenarios
+
 - **Leader Election**: Multiple candidates, majority voting, split votes
 - **Log Replication**: Entry propagation to followers, commit advancement
 - **Network Partitions**: Split-brain prevention, majority cluster operation
@@ -52,6 +55,7 @@ Heartbeat Flow:
 ## Key RAFT Properties Verified ✅
 
 ### Safety Properties
+
 - ✅ **Election Safety**: At most one leader per term
 - ✅ **Leader Append-Only**: Leaders never overwrite/delete log entries  
 - ✅ **Log Matching**: Identical entries at same index across nodes
@@ -59,12 +63,14 @@ Heartbeat Flow:
 - ✅ **State Machine Safety**: Same command sequence applied on all nodes
 
 ### Liveness Properties  
+
 - ✅ **Leader Election**: Eventually elects leader in stable network
 - ✅ **Progress**: Committed entries eventually get applied
 
 ## Test Results Summary
 
 **Simple Tests**: All 8 individual node operation tests passed
+
 ```
 ✓ Node initialization test passed
 ✓ Election start test passed  
@@ -77,6 +83,7 @@ Heartbeat Flow:
 ```
 
 **Message Demo**: Complete message flow demonstration successful
+
 ```
 ✓ Leader Election Process (2 messages)
 ✓ Log Replication Process (4 messages)  
@@ -86,6 +93,7 @@ Total: 12 messages exchanged
 ```
 
 **Consensus Tests**: Full distributed algorithm simulation
+
 ```
 ✓ 5-node cluster setup
 ✓ Leader election with majority (Node 2 elected)
@@ -97,6 +105,7 @@ Total: 12 messages exchanged
 ## Understanding Your RAFT Implementation
 
 ### Node States
+
 ```python
 INITIAL   → Node starting up, not participating in elections
 FOLLOWER  → Following current leader, responds to RPCs
@@ -105,6 +114,7 @@ LEADER    → Handling client requests, replicating logs
 ```
 
 ### Message Types
+
 ```python
 VOTE_REQUEST      → Candidate requests vote from others
 VOTE_RESPONSE     → Response to vote request
@@ -113,6 +123,7 @@ APPEND_RESPONSE   → Response to append entries
 ```
 
 ### Key Operations
+
 ```python
 # Start election
 node.start_election()  # FOLLOWER → CANDIDATE, increment term, vote self
@@ -130,16 +141,19 @@ term, success = follower.append_entries(leader_id, term, prev_log..., entries)
 ## Next Steps for Further Testing
 
 ### 1. Performance Testing
+
 - Measure election timeout under different network conditions
 - Test log replication throughput with large entries
 - Benchmark commit latency with varying cluster sizes
 
 ### 2. Failure Scenarios  
+
 - Network partitions with different split configurations
 - Cascading node failures and recovery patterns
 - Message reordering and duplicate delivery
 
 ### 3. Production Considerations
+
 - Persistent log storage (currently in-memory)
 - Log compaction and snapshotting
 - Dynamic membership changes
@@ -150,6 +164,7 @@ term, success = follower.append_entries(leader_id, term, prev_log..., entries)
 ✅ **Your RAFT implementation is working correctly!**
 
 The core consensus algorithm follows the RAFT paper specification and handles:
+
 - Leader election with proper majority voting
 - Log replication with consistency guarantees  
 - Network failures and partitions
