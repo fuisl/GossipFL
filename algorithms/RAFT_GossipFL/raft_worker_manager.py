@@ -10,8 +10,8 @@ from fedml_core.distributed.communication.message import Message
 from algorithms.SAPS_FL.decentralized_worker_manager import DecentralizedWorkerManager
 from utils.context import raise_error_without_process, get_lock
 from utils.tracker import get_metric_info
-from .raft_node import RaftState
-from .raft_messages import RaftMessage
+from raft_node import RaftState
+from raft_messages import RaftMessage
 
 
 class RaftWorkerManager(DecentralizedWorkerManager):

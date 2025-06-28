@@ -274,6 +274,19 @@ class RaftNode:
         else:
             return False
     
+    def get_last_log_info(self):
+        """
+        Get information about the last log entry.
+        
+        Returns:
+            tuple: (last_log_index, last_log_term)
+        """
+        last_log_index = len(self.log)
+        last_log_term = 0
+        if last_log_index > 0:
+            last_log_term = self.log[last_log_index - 1]['term']
+        return last_log_index, last_log_term
+    
     def append_entries(self, leader_id, term, prev_log_index, prev_log_term, entries, leader_commit):
         """
         Handle AppendEntries RPC from leader.

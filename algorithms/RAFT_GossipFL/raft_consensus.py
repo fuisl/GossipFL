@@ -3,7 +3,7 @@ import threading
 import time
 from enum import Enum
 
-from .raft_node import RaftState
+from raft_node import RaftState
 
 
 class ConsensusType(Enum):
