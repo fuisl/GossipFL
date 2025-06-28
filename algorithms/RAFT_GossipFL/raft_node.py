@@ -412,7 +412,7 @@ class RaftNode:
             if match is not None:
                 self.topology_manager.update_match(match, round_num)
             if topology_matrix is not None:
-                self.topology_manager.update_topology_matrix(topology_matrix)
+                self.topology_manager.update_topology_matrix(topology_matrix, round_num)
         else:
             # Store the topology information for later use
             if not hasattr(self, 'pending_topology'):

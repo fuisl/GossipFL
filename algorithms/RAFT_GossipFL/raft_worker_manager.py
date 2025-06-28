@@ -723,10 +723,8 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             if topology_data is not None:
                 topology = np.array(topology_data)
                 round_num = state_package.get('current_round', 0)
-                self.topology_manager.apply_topology_update({
-                    'round': round_num,
-                    'matrix': topology
-                })
+                # Update topology manager directly using the provided matrix
+                self.topology_manager.update_topology_matrix(topology, round_num)
                 logging.info("Applied topology from state snapshot")
             
             # Update bandwidth if available

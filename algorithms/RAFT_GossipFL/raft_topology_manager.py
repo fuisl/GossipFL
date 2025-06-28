@@ -25,6 +25,7 @@ class RaftTopologyManager(SAPSTopologyManager):
         self.raft_consensus = raft_consensus
         self.latest_topology_round = -1
         self.topology_cache = {}  # Cache for topologies by round number
+        self.match = None  # Store the gossip match list
         
         logging.info(f"RaftTopologyManager initialized")
     
@@ -156,3 +157,73 @@ class RaftTopologyManager(SAPSTopologyManager):
             logging.info(f"Applied topology update for round {round_number}")
         
         return True
+
+    def update_match(self, match, round_number=None):
+        """Update the stored match list and rebuild the topology matrix."""
+        if match is None:
+            return
+
+        self.match = list(match)
+
+        self.topology = np.zeros([self.n, self.n])
+        for i in range(self.n):
+            self.topology[i][i] = 1 / 2
+            partner = self.match[i]
+            if partner is not None and 0 <= partner < self.n:
+                self.topology[i][partner] = 1 / 2
+
+        if round_number is not None:
+            self.topology_cache[round_number] = self.topology.copy()
+            if round_number > self.latest_topology_round:
+                self.latest_topology_round = round_number
+
+    def update_topology_matrix(self, topology_matrix, round_number=None):
+        """Replace the current topology matrix and update caches."""
+        if topology_matrix is None:
+            return
+
+        topology_matrix = np.array(topology_matrix)
+        self.topology = topology_matrix
+
+        # Derive match list from the topology matrix
+        match = []
+        for i in range(self.n):
+            neighbors = np.where(topology_matrix[i] > 0)[0]
+            neighbors = [j for j in neighbors if j != i]
+            match.append(neighbors[0] if neighbors else i)
+        self.match = match
+
+        if round_number is not None:
+            self.topology_cache[round_number] = topology_matrix
+            if round_number > self.latest_topology_round:
+                self.latest_topology_round = round_number
+
+    def apply_match_changes(self, changes, base_version=None):
+        """Apply incremental changes to the match list and topology."""
+        if changes is None:
+            return
+
+        if self.match is None:
+            # Initialize with identity if no previous match
+            self.match = [i for i in range(self.n)]
+
+        for node_idx, new_match in changes:
+            if 0 <= node_idx < self.n:
+                self.match[node_idx] = new_match
+
+        # Rebuild topology matrix from updated match
+        self.topology = np.zeros([self.n, self.n])
+        for i in range(self.n):
+            self.topology[i][i] = 1 / 2
+            partner = self.match[i]
+            if partner is not None and 0 <= partner < self.n:
+                self.topology[i][partner] = 1 / 2
+
+        if base_version is not None:
+            self.topology_cache[base_version] = self.topology.copy()
+            if base_version > self.latest_topology_round:
+                self.latest_topology_round = base_version
+
+    def get_topology(self):
+        """Return the current topology matrix."""
+        return self.topology
