@@ -69,6 +69,7 @@ RAFT-specific parameters:
 3. **Replication Thread**: Replicates log entries to followers (leader only).
 4. **Training Thread**: Handles local training and model exchange.
 5. **Coordinator Thread**: Manages round coordination (leader only).
+6. **Supervisor Thread**: Monitors worker threads and restarts them if they fail.
 
 ### Log Entry Types
 
