@@ -70,15 +70,22 @@ class RaftConsensus:
         # Heartbeat thread for leaders
         self.heartbeat_thread = None
         self.heartbeat_stop_event = threading.Event()
-        
+        self.heartbeat_failed_event = threading.Event()
+
         # Election thread for all nodes
         self.election_thread = None
         self.election_stop_event = threading.Event()
-        
+        self.election_failed_event = threading.Event()
+
         # Log replication thread for leaders
         self.replication_thread = None
         self.replication_stop_event = threading.Event()
-        
+        self.replication_failed_event = threading.Event()
+
+        # Supervisor thread to monitor worker threads
+        self.supervisor_thread = None
+        self.supervisor_stop_event = threading.Event()
+
         # Lock to protect thread operations
         self.thread_lock = threading.RLock()
         
@@ -90,7 +97,16 @@ class RaftConsensus:
         
         # Initialize election timeout checking
         self.start_election_thread()
-        
+
+        # Start supervisor thread to monitor other threads
+        self.supervisor_stop_event.clear()
+        self.supervisor_thread = threading.Thread(
+            target=self._supervisor_thread_func,
+            name=f"raft-supervisor-{self.raft_node.node_id}",
+            daemon=True
+        )
+        self.supervisor_thread.start()
+
         logging.info(f"RAFT Consensus initialized for node {raft_node.node_id}")
     
     def start(self):
@@ -101,12 +117,16 @@ class RaftConsensus:
         """Stop all consensus operations."""
         logging.info(f"Node {self.raft_node.node_id}: Stopping all consensus operations")
         with self.thread_lock:
+            self.supervisor_stop_event.set()
             self.election_stop_event.set()
             self.heartbeat_stop_event.set()
             self.replication_stop_event.set()
             
             threads_to_join = []
             
+            if self.supervisor_thread and self.supervisor_thread.is_alive():
+                threads_to_join.append((self.supervisor_thread, "supervisor"))
+
             if self.heartbeat_thread and self.heartbeat_thread.is_alive():
                 threads_to_join.append((self.heartbeat_thread, "heartbeat"))
             
@@ -127,6 +147,7 @@ class RaftConsensus:
             self.heartbeat_thread = None
             self.election_thread = None
             self.replication_thread = None
+            self.supervisor_thread = None
             
             logging.info(f"Node {self.raft_node.node_id}: All consensus operations stopped")
     
@@ -155,8 +176,9 @@ class RaftConsensus:
         with self.thread_lock:
             if self.election_thread and self.election_thread.is_alive():
                 return
-            
+
             self.election_stop_event.clear()
+            self.election_failed_event.clear()
             self.election_thread = threading.Thread(
                 target=self._election_thread_func,
                 name=f"raft-election-{self.raft_node.node_id}",
@@ -179,8 +201,9 @@ class RaftConsensus:
         with self.thread_lock:
             if self.heartbeat_thread and self.heartbeat_thread.is_alive():
                 return
-            
+
             self.heartbeat_stop_event.clear()
+            self.heartbeat_failed_event.clear()
             self.heartbeat_thread = threading.Thread(
                 target=self._heartbeat_thread_func,
                 name=f"raft-heartbeat-{self.raft_node.node_id}",
@@ -203,8 +226,9 @@ class RaftConsensus:
         with self.thread_lock:
             if self.replication_thread and self.replication_thread.is_alive():
                 return
-            
+
             self.replication_stop_event.clear()
+            self.replication_failed_event.clear()
             self.replication_thread = threading.Thread(
                 target=self._replication_thread_func,
                 name=f"raft-replication-{self.raft_node.node_id}",
@@ -244,14 +268,8 @@ class RaftConsensus:
                 time.sleep(0.01)  # 10ms check interval
         except Exception as e:
             logging.error(f"Node {self.raft_node.node_id}: Error in election thread: {str(e)}")
-            # Try to restart the thread if it fails
             if not self.election_stop_event.is_set():
-                logging.info(f"Node {self.raft_node.node_id}: Restarting election thread")
-                # [FIXME]: This attempt to restart the thread, but since it is
-                # running inside the about to crash thread, all the check for if that
-                # thread is alive will pass, meaning the thread will not be restarted.
-                # Then the current running thread will crash.
-                self.start_election_thread()
+                self.election_failed_event.set()
     
     def _heartbeat_thread_func(self):
         """Thread function to send heartbeats (leaders only)."""
@@ -267,14 +285,8 @@ class RaftConsensus:
                 time.sleep(self.raft_node.heartbeat_interval)
         except Exception as e:
             logging.error(f"Node {self.raft_node.node_id}: Error in heartbeat thread: {str(e)}")
-            # Try to restart the thread if it fails and we're still leader
             if not self.heartbeat_stop_event.is_set() and self.raft_node.state == RaftState.LEADER:
-                logging.info(f"Node {self.raft_node.node_id}: Restarting heartbeat thread")
-                # [FIXME]: This attempt to restart the thread, but since it is
-                # running inside the about to crash thread, all the check for if that
-                # thread is alive will pass, meaning the thread will not be restarted.
-                # Then the current running thread will crash.
-                self.start_heartbeat_thread()
+                self.heartbeat_failed_event.set()
     
     def _replication_thread_func(self):
         """Thread function to replicate logs (leaders only)."""
@@ -293,14 +305,36 @@ class RaftConsensus:
                 time.sleep(0.05)  # 50ms check interval
         except Exception as e:
             logging.error(f"Node {self.raft_node.node_id}: Error in replication thread: {str(e)}")
-            # Try to restart the thread if it fails and we're still leader
             if not self.replication_stop_event.is_set() and self.raft_node.state == RaftState.LEADER:
-                logging.info(f"Node {self.raft_node.node_id}: Restarting replication thread")
-                # [FIXME]: This attempt to restart the thread, but since it is
-                # running inside the about to crash thread, all the check for if that
-                # thread is alive will pass, meaning the thread will not be restarted.
-                # Then the current running thread will crash.
-                self.start_replication_thread()
+                self.replication_failed_event.set()
+
+    def _supervisor_thread_func(self):
+        """Monitor worker threads and restart them on failure."""
+        try:
+            while not self.supervisor_stop_event.is_set():
+                if not self.election_stop_event.is_set():
+                    if (self.election_failed_event.is_set() or
+                        not (self.election_thread and self.election_thread.is_alive())):
+                        self.election_failed_event.clear()
+                        self.start_election_thread()
+
+                if (not self.heartbeat_stop_event.is_set() and
+                        self.raft_node.state == RaftState.LEADER):
+                    if (self.heartbeat_failed_event.is_set() or
+                        not (self.heartbeat_thread and self.heartbeat_thread.is_alive())):
+                        self.heartbeat_failed_event.clear()
+                        self.start_heartbeat_thread()
+
+                if (not self.replication_stop_event.is_set() and
+                        self.raft_node.state == RaftState.LEADER):
+                    if (self.replication_failed_event.is_set() or
+                        not (self.replication_thread and self.replication_thread.is_alive())):
+                        self.replication_failed_event.clear()
+                        self.start_replication_thread()
+
+                time.sleep(0.1)
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Supervisor thread error: {str(e)}")
     
     def request_votes_from_all(self):
         """Send vote requests to all other nodes."""
