@@ -170,7 +170,9 @@ class DecentralizedWorkerManager(BaseDecentralizedWorkerManager):
 
                 # update worker's dataset and data loaderw
                 with raise_error_without_process():
-                    self.worker.train_local.sampler.set_epoch(epoch)
+                    # Fix: Check if sampler has set_epoch method before calling
+                    if hasattr(self.worker.train_local.sampler, 'set_epoch'):
+                        self.worker.train_local.sampler.set_epoch(epoch)
                 # self.worker.update_dataset()
                 self.epoch_init()
 

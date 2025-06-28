@@ -85,10 +85,10 @@ class BaseDecentralizedWorker(object):
 
     def get_train_batch_data(self):
         try:
-            train_batch_data = self.train_local_iter.next()
+            train_batch_data = next(self.train_local_iter)
         except:
             self.train_local_iter = iter(self.train_local)
-            train_batch_data = self.train_local_iter.next()
+            train_batch_data = next(self.train_local_iter)
         return train_batch_data
 
 
