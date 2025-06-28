@@ -101,24 +101,40 @@ class RaftWorkerManager(DecentralizedWorkerManager):
     
     def run(self):
         """Run the worker manager with RAFT integration."""
-        # Start the RAFT consensus
+
+        # Start RAFT consensus services
         self.raft_consensus.start()
-        
+
+        # If joining an existing cluster, request state synchronization first
+        if getattr(self.args, "join_existing_cluster", False):
+            logging.info("Joining existing cluster - requesting state synchronization")
+            self.request_cluster_join()
+
+            # Wait for synchronization to complete (best effort)
+            max_wait_time = 30
+            wait_start = time.time()
+            while not self.raft_consensus.is_state_synchronized() and (
+                time.time() - wait_start
+            ) < max_wait_time:
+                time.sleep(1)
+
+            if not self.raft_consensus.is_state_synchronized():
+                logging.warning(
+                    "Failed to synchronize state within timeout - proceeding anyway"
+                )
+            else:
+                logging.info("Successfully synchronized with existing cluster")
+
         # Start the training thread
         self.training_thread.start()
-        
-        # Wait for initial consensus to be established
-        logging.info(f"Node {self.worker_index} waiting for initial consensus")
-        # In a real implementation, we might want to add a timeout here
-        # self.consensus_established_event.wait(timeout=30.0)
-        
+
+        # Wait for all peers to be ready
         logging.debug("Wait for the barrier!")
-        comm = MPI.COMM_WORLD
-        comm.Barrier()
+        MPI.COMM_WORLD.Barrier()
         time.sleep(1)
         logging.debug("MPI exit barrier!")
-        
-        # Run the worker
+
+        # Hand off to the parent run loop
         super().run()
     
     def handle_leadership_change(self, leader_id):
@@ -764,26 +780,3 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             logging.info(f"Requesting cluster join from leader {leader_id}")
             self.send_state_request(leader_id)
             
-    # Override parent initialization method to ensure proper joining
-    def run(self):
-        """
-        Enhanced run method that ensures proper cluster joining for new nodes.
-        """
-        # If this is a new node joining an existing cluster, request state first
-        if hasattr(self.args, 'join_existing_cluster') and self.args.join_existing_cluster:
-            logging.info("Joining existing cluster - requesting state synchronization")
-            self.request_cluster_join()
-            
-            # Wait for state synchronization before starting training
-            max_wait_time = 30  # seconds
-            wait_start = time.time()
-            while not self.raft_consensus.is_state_synchronized() and (time.time() - wait_start) < max_wait_time:
-                time.sleep(1)
-            
-            if not self.raft_consensus.is_state_synchronized():
-                logging.warning("Failed to synchronize state within timeout - proceeding anyway")
-            else:
-                logging.info("Successfully synchronized with existing cluster")
-        
-        # Continue with parent run method
-        super().run()
