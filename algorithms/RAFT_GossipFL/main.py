@@ -14,9 +14,8 @@ from algorithms.RAFT_GossipFL.raft_topology_manager import RaftTopologyManager
 from algorithms.RAFT_GossipFL.raft_bandwidth_manager import RaftBandwidthManager
 from algorithms.RAFT_GossipFL.raft_worker_manager import RaftWorkerManager
 
-from utils.timer import Timer
 from utils.metrics import Metrics
-from utils.timer_with_cuda import Timer
+from utils.timer_with_cuda import Timer as CUDATimer
 
 def add_args(parser):
     """
@@ -55,9 +54,9 @@ def init_processes(args, rank, size):
     
     # Initialize topology and bandwidth managers
     if args.timing:
-        timer = Timer()
+        timer = CUDATimer()
     else:
-        timer = Timer()
+        timer = CUDATimer()
     
     # Create the metrics object
     metrics = Metrics([])
