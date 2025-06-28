@@ -706,14 +706,22 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             topology_data = state_package.get('topology')
             if topology_data is not None:
                 topology = np.array(topology_data)
-                self.topology_manager.apply_topology_update({'topology': topology})
+                round_num = state_package.get('current_round', 0)
+                self.topology_manager.apply_topology_update({
+                    'round': round_num,
+                    'matrix': topology
+                })
                 logging.info("Applied topology from state snapshot")
             
             # Update bandwidth if available
             bandwidth_data = state_package.get('bandwidth')
             if bandwidth_data is not None:
                 bandwidth = np.array(bandwidth_data)
-                self.bandwidth_manager.apply_bandwidth_update({'matrix': bandwidth_data})
+                ts = state_package.get('timestamp', 0)
+                self.bandwidth_manager.apply_bandwidth_update({
+                    'timestamp': ts,
+                    'matrix': bandwidth
+                })
                 logging.info("Applied bandwidth from state snapshot")
             
             # Update training round information
