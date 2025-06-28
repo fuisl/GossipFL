@@ -82,10 +82,11 @@ if __name__ == "__main__":
         cfg.setup(args)
 
         cfg.rank = process_id
-        if cfg.algorithm in ['FedAvg', 'AFedAvg', 'PSGD', 'APSGD', 'Local_PSGD', 
+        if cfg.algorithm in ['FedAvg', 'AFedAvg', 'PSGD', 'APSGD', 'Local_PSGD',
                              'FedSGD']:
             cfg.client_index = process_id - 1
-        elif cfg.algorithm in ['DPSGD', 'DCD_PSGD', 'CHOCO_SGD', 'SAPS_FL']:
+        elif cfg.algorithm in ['DPSGD', 'DCD_PSGD', 'CHOCO_SGD', 'SAPS_FL',
+                               'RAFT_GossipFL']:
             cfg.client_index = process_id
         else:
             raise NotImplementedError
@@ -217,6 +218,9 @@ if __name__ == "__main__":
                                 model, train_data_num, train_data_global, test_data_global,
                                 train_data_local_num_dict, train_data_local_dict, test_data_local_dict, cfg,
                                 model_trainer)
+        elif cfg.algorithm == 'RAFT_GossipFL':
+            from algorithms.RAFT_GossipFL.main import run_raft_gossipfl
+            run_raft_gossipfl(cfg)
         else:
             raise NotImplementedError
 
