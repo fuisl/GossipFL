@@ -16,7 +16,6 @@ from algorithms.RAFT_GossipFL.raft_worker_manager import RaftWorkerManager
 
 from utils.timer import Timer
 from utils.metrics import Metrics
-from utils.timer_with_cuda import Timer
 
 def add_args(parser):
     """
