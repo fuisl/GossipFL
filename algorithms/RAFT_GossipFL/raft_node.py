@@ -77,20 +77,46 @@ class RaftNode:
             f"RAFT Node {self.node_id} initialized in {self.state.name} state"
         )
     
-    def update_known_nodes(self, total_nodes):
+    def update_known_nodes(self, total_nodes=None, node_ids=None):
         """
         Update the set of known nodes.
         
         Args:
-            total_nodes (int): Total number of nodes in the network
+            total_nodes (int, optional): Total number of nodes in the network
+            node_ids (list, optional): Explicit list of node IDs to use
         """
-        # [FIXME]: This is assuming that node IDs is continuous from 0 to total_nodes-1
-        # If we consider that node may decide to disconnect, causing a gap, then this part might break.
-        # Node IDs are being overwritten here.
-        self.known_nodes = set(range(total_nodes))
-        self.total_nodes = len(self.known_nodes)
-        self.majority = self.total_nodes // 2 + 1
-        logging.info(f"Node {self.node_id}: Known nodes updated, total={self.total_nodes}, majority={self.majority}")
+        with self.state_lock:
+            # Update the known_nodes set based on provided information
+            if node_ids is not None:
+                # Use explicitly provided node IDs
+                self.known_nodes = set(node_ids)
+            elif total_nodes is not None and not self.known_nodes:
+                # Only use range if we don't have any nodes yet and no explicit IDs provided
+                # This maintains backward compatibility with existing code
+                self.known_nodes = set(range(total_nodes))
+                logging.debug(f"Node {self.node_id}: Initializing with sequential IDs (0-{total_nodes-1})")
+            # Otherwise, keep the existing known_nodes
+                
+            # Update node count and majority threshold
+            self.total_nodes = len(self.known_nodes)
+            self.majority = self.total_nodes // 2 + 1
+            
+            # Update leader state if we're the leader
+            if self.state == RaftState.LEADER:
+                # Update next_index and match_index for any new nodes
+                for node_id in self.known_nodes:
+                    if node_id != self.node_id and node_id not in self.next_index:
+                        self.next_index[node_id] = len(self.log) + 1
+                        self.match_index[node_id] = 0
+                
+                # Remove any nodes that are no longer in the cluster
+                for node_id in list(self.next_index.keys()):
+                    if node_id not in self.known_nodes:
+                        del self.next_index[node_id]
+                        if node_id in self.match_index:
+                            del self.match_index[node_id]
+            
+            logging.info(f"Node {self.node_id}: Known nodes updated, total={self.total_nodes}, majority={self.majority}, nodes={sorted(self.known_nodes)}")
     
     def reset_election_timeout(self):
         """Reset the election timeout with a random value."""
