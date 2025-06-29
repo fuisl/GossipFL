@@ -470,11 +470,14 @@ class RaftConsensus:
     def _send_snapshot(self, node_id):
         """Send a snapshot of the current state to the given follower."""
         try:
-            self.worker_manager.send_state_snapshot(
+            self.worker_manager.send_install_snapshot(
                 node_id,
                 self.raft_node.current_term,
+                self.raft_node.last_snapshot_index,
+                self.raft_node.last_snapshot_term,
+                0,
                 self.raft_node.log,
-                self.raft_node.commit_index,
+                True,
             )
             logging.debug(
                 f"Node {self.raft_node.node_id}: Sent snapshot to follower {node_id}"

@@ -118,6 +118,9 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         self.register_message_receive_handler(
             RaftMessage.MSG_TYPE_RAFT_STATE_SNAPSHOT,
             self.handle_state_snapshot)
+        self.register_message_receive_handler(
+            RaftMessage.MSG_TYPE_RAFT_INSTALL_SNAPSHOT,
+            self.handle_install_snapshot)
 
         # Enhanced message handlers for improved node joining
         self.register_message_receive_handler(
@@ -608,6 +611,24 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             else:
                 logging.error(f"Failed to process state package from {sender_id}")
 
+    def handle_install_snapshot(self, msg_params):
+        """Handle an InstallSnapshot message from the leader."""
+        sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
+        term = msg_params.get(RaftMessage.MSG_ARG_TERM)
+        last_idx = msg_params.get(RaftMessage.MSG_ARG_LAST_INCLUDED_INDEX)
+        last_term = msg_params.get(RaftMessage.MSG_ARG_LAST_INCLUDED_TERM)
+        offset = msg_params.get(RaftMessage.MSG_ARG_OFFSET)
+        data = msg_params.get(RaftMessage.MSG_ARG_DATA)
+        done = msg_params.get(RaftMessage.MSG_ARG_DONE)
+
+        logging.debug(
+            f"Received InstallSnapshot from {sender_id}, term={term}, index={last_idx}, offset={offset}"
+        )
+
+        self.raft_consensus.handle_install_snapshot(
+            sender_id, term, last_idx, last_term, offset, data, done
+        )
+
     def handle_leader_redirect(self, msg_params):
         """
         Handle a leader redirect message.
@@ -798,7 +819,36 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         message.add_params(RaftMessage.MSG_ARG_MATCH_INDEX, match_index)
         
         self.send_message(message)
-    
+
+    def send_install_snapshot(
+        self,
+        receiver_id,
+        term,
+        last_included_index,
+        last_included_term,
+        offset,
+        data,
+        done,
+    ):
+        """Send a RAFT InstallSnapshot message."""
+        message = Message(
+            RaftMessage.MSG_TYPE_RAFT_INSTALL_SNAPSHOT,
+            self.get_sender_id(),
+            receiver_id,
+        )
+        message.add_params(RaftMessage.MSG_ARG_TERM, term)
+        message.add_params(
+            RaftMessage.MSG_ARG_LAST_INCLUDED_INDEX, last_included_index
+        )
+        message.add_params(
+            RaftMessage.MSG_ARG_LAST_INCLUDED_TERM, last_included_term
+        )
+        message.add_params(RaftMessage.MSG_ARG_OFFSET, offset)
+        message.add_params(RaftMessage.MSG_ARG_DATA, data)
+        message.add_params(RaftMessage.MSG_ARG_DONE, done)
+
+        self.send_message(message)
+
     def send_state_snapshot(self, receiver_id, term, log, commit_index):
         """
         Send a RAFT StateSnapshot message.
