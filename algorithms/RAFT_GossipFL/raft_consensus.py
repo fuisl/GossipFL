@@ -618,13 +618,15 @@ class RaftConsensus:
         
         return log_index
     
-    def add_membership_change(self, action, node_id):
+    def add_membership_change(self, action, node_id, round_num=0, reason="unspecified"):
         """
         Add a membership change to the log (leaders only).
         
         Args:
             action (str): 'add' or 'remove'
             node_id (int): ID of the node to add/remove
+            round_num (int, optional): Current training round number
+            reason (str, optional): Reason for the membership change
             
         Returns:
             int: Index of the new log entry, or -1 if not leader
@@ -638,28 +640,20 @@ class RaftConsensus:
             return -1
         
         try:
+            # Use the new raft_node methods with round_num and reason
             if action == 'add':
-                # First add the node to known nodes
-                if not self.raft_node.add_node(node_id):
+                if not self.raft_node.add_node(node_id, round_num):
                     logging.warning(f"Node {self.raft_node.node_id}: Failed to add node {node_id} to known nodes")
                     return -1
-                logging.info(f"Node {self.raft_node.node_id}: Added node {node_id} to known nodes")
+                # Success is logged inside add_node
+                return 1  # Indicate success (actual log index is handled within add_node)
+            elif action == 'remove':
+                if not self.raft_node.remove_node(node_id, round_num, reason):
+                    logging.warning(f"Node {self.raft_node.node_id}: Failed to remove node {node_id} from known nodes")
+                    return -1
+                # Success is logged inside remove_node
+                return 1  # Indicate success (actual log index is handled within remove_node)
             
-            # Create the command for the log
-            command = {
-                'type': 'membership',
-                'action': action,
-                'node_id': node_id,
-                'timestamp': time.time()
-            }
-            
-            # Add to the log and get the index
-            log_index = self.raft_node.add_log_entry(command)
-            
-            if log_index > 0:
-                logging.info(f"Node {self.raft_node.node_id}: Added membership change ({action} node {node_id}) to log at index {log_index}")
-            
-            return log_index
         except Exception as e:
             logging.error(f"Node {self.raft_node.node_id}: Error adding membership change: {str(e)}")
             return -1

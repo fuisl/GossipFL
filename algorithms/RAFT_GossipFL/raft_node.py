@@ -1163,77 +1163,137 @@ class RaftNode:
                     return self.last_snapshot_index, self.last_snapshot_term
         return last_log_index, last_log_term
     
-    def add_node(self, new_node_id):
+    def add_node(self, new_node_id, round_num=0):
         """
         Add a new node to the cluster (leaders only).
         
         Args:
             new_node_id (int): ID of the new node
+            round_num (int, optional): Current training round number
             
         Returns:
             bool: True if successful, False otherwise
         """
         with self.state_lock:
-            if self.state != RaftState.LEADER:
+            try:
+                if self.state != RaftState.LEADER:
+                    logging.warning(f"Node {self.node_id}: Cannot add node {new_node_id} - not a leader")
+                    return False
+                    
+                if new_node_id in self.known_nodes:
+                    logging.debug(f"Leader {self.node_id}: Node {new_node_id} already in cluster, no action needed")
+                    return True  # Node already known
+                
+                # Make a copy of current nodes for the log entry (for consistency)
+                current_nodes = set(self.known_nodes)
+                current_nodes.add(new_node_id)
+                
+                # Initialize leader state for the new node (before applying changes)
+                # This allows us to start sending AppendEntries to the new node right away
+                last_log_index = self.first_log_index + len(self.log) - 1 if len(self.log) > 0 else 0
+                self.next_index[new_node_id] = last_log_index + 1
+                self.match_index[new_node_id] = 0
+                
+                # Add a log entry for the membership change
+                # We include current_nodes to ensure all nodes have the same view
+                log_index = self.add_log_entry({
+                    'type': 'membership',
+                    'action': 'add',
+                    'node_id': new_node_id,
+                    'current_nodes': list(current_nodes),  # Convert set to list for JSON serialization
+                    'round': round_num
+                })
+                
+                if log_index == -1:
+                    logging.error(f"Leader {self.node_id}: Failed to add log entry for node addition")
+                    # Clean up our premature leader state updates
+                    if new_node_id in self.next_index:
+                        del self.next_index[new_node_id]
+                    if new_node_id in self.match_index:
+                        del self.match_index[new_node_id]
+                    return False
+                
+                # Only update known_nodes after successful log entry creation
+                # The actual change will be applied when the entry is committed
+                self.known_nodes.add(new_node_id)
+                self.update_known_nodes(len(self.known_nodes))
+                
+                logging.info(f"Leader {self.node_id}: Added new node {new_node_id} to cluster at round {round_num}")
+                return True
+                
+            except Exception as e:
+                logging.error(f"Leader {self.node_id}: Error adding node {new_node_id}: {e}", exc_info=True)
+                # Clean up if we failed after initializing leader state
+                if new_node_id in self.next_index:
+                    del self.next_index[new_node_id]
+                if new_node_id in self.match_index:
+                    del self.match_index[new_node_id]
                 return False
-                
-            if new_node_id in self.known_nodes:
-                return True  # Node already known
-                
-            # Add node to known nodes
-            self.known_nodes.add(new_node_id)
-            self.update_known_nodes(len(self.known_nodes))
-            
-            # Initialize leader state for the new node
-            self.next_index[new_node_id] = len(self.log) + 1
-            self.match_index[new_node_id] = 0
-            
-            # Add a log entry for the membership change
-            self.add_log_entry({
-                'type': 'membership',
-                'action': 'add',
-                'node_id': new_node_id
-            })
-            
-            logging.info(f"Leader {self.node_id}: Added new node {new_node_id} to cluster")
-            return True
     
-    def remove_node(self, node_id):
+    def remove_node(self, node_id, round_num=0, reason="unspecified"):
         """
         Remove a node from the cluster (leaders only).
         
         Args:
             node_id (int): ID of the node to remove
+            round_num (int, optional): Current training round number
+            reason (str, optional): Reason for node removal (e.g., "timeout", "failure", "voluntary")
             
         Returns:
             bool: True if successful, False otherwise
         """
         with self.state_lock:
-            if self.state != RaftState.LEADER:
+            try:
+                if self.state != RaftState.LEADER:
+                    logging.warning(f"Node {self.node_id}: Cannot remove node {node_id} - not a leader")
+                    return False
+                    
+                if node_id not in self.known_nodes:
+                    logging.debug(f"Leader {self.node_id}: Node {node_id} not in cluster, no action needed")
+                    return True  # Node already removed
+                
+                # Make a copy of current nodes for the log entry (for consistency)
+                current_nodes = set(self.known_nodes)
+                current_nodes.remove(node_id)
+                
+                # Add a log entry for the membership change first
+                # We include current_nodes to ensure all nodes have the same view
+                log_index = self.add_log_entry({
+                    'type': 'membership',
+                    'action': 'remove',
+                    'node_id': node_id,
+                    'current_nodes': list(current_nodes),  # Convert set to list for JSON serialization
+                    'round': round_num,
+                    'reason': reason
+                })
+                
+                if log_index == -1:
+                    logging.error(f"Leader {self.node_id}: Failed to add log entry for node removal")
+                    return False
+                
+                # Only update state after successful log entry creation
+                # The actual change will be applied when the entry is committed
+                self.known_nodes.remove(node_id)
+                self.update_known_nodes(len(self.known_nodes))
+                
+                # Clean up leader state for the removed node
+                if node_id in self.next_index:
+                    del self.next_index[node_id]
+                if node_id in self.match_index:
+                    del self.match_index[node_id]
+                
+                # If we're removing the coordinator, we may need to select a new one
+                if hasattr(self, 'current_coordinator_id') and self.current_coordinator_id == node_id:
+                    logging.warning(f"Leader {self.node_id}: Removed node {node_id} was the coordinator, will need new coordinator")
+                    # The actual coordinator change would typically be handled elsewhere
+                    # but we note it here for visibility
+                
+                logging.info(f"Leader {self.node_id}: Removed node {node_id} from cluster at round {round_num} (reason: {reason})")
+                return True
+                
+            except Exception as e:
+                logging.error(f"Leader {self.node_id}: Error removing node {node_id}: {e}", exc_info=True)
                 return False
-                
-            if node_id not in self.known_nodes:
-                return True  # Node already removed
-                
-            # Remove node from known nodes
-            self.known_nodes.remove(node_id)
-            self.update_known_nodes(len(self.known_nodes))
-            
-            # Remove from leader state
-            if node_id in self.next_index:
-                del self.next_index[node_id]
-            if node_id in self.match_index:
-                del self.match_index[node_id]
-            
-            # Add a log entry for the membership change
-            self.add_log_entry({
-                'type': 'membership',
-                'action': 'remove',
-                'node_id': node_id
-            })
-            
-            logging.info(f"Leader {self.node_id}: Removed node {node_id} from cluster")
-            return True
     
     def update_commit_index(self):
         """
