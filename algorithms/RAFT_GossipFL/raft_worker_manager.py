@@ -950,3 +950,18 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             if self.is_coordinator:
                 self.propose_topology_update(force_regenerate=True)
 
+    def refresh_gossip_info(self):
+        """Refresh local gossip information from the topology manager."""
+        self.neighbors_info = self.topology_manager.topology
+        self.gossip_info = self.topology_manager.topology[self.worker_index]
+
+    def lr_schedule(self, epoch, iteration, round_idx, num_iterations, warmup_epochs):
+        """Delegate learning rate scheduling to the parent implementation."""
+        super().lr_schedule(epoch, iteration, round_idx, num_iterations, warmup_epochs)
+
+    def send_notify_to_coordinator(self, receive_id=None, train_metric_info=None, test_metric_info=None):
+        """Send a notification to the current RAFT leader."""
+        if receive_id is None:
+            receive_id = self.coordinator_id if self.coordinator_id is not None else 0
+        super().send_notify_to_coordinator(receive_id, train_metric_info, test_metric_info)
+
