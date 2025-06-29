@@ -892,16 +892,34 @@ class RaftNode:
         base_version = command.get('base_version')
         changes = command.get('changes', [])
         
+        # Check if the base version is in a compacted part of the log
+        if base_version < self.last_snapshot_index:
+            logging.warning(f"Node {self.node_id}: Cannot apply topology delta with base_version {base_version} - " +
+                          f"version predates last snapshot at index {self.last_snapshot_index}")
+            
+            # Request a full topology update instead
+            if hasattr(self, 'request_topology_update') and callable(self.request_topology_update):
+                logging.info(f"Node {self.node_id}: Requesting full topology update due to compaction")
+                self.request_topology_update()
+            return
+        
         if hasattr(self, 'topology_manager') and self.topology_manager is not None:
             # Apply changes to the topology manager
-            self.topology_manager.apply_match_changes(changes, base_version)
+            try:
+                self.topology_manager.apply_match_changes(changes, base_version)
+                logging.info(f"Node {self.node_id}: Applied {len(changes)} topology changes from base version {base_version}")
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error applying topology delta: {e}")
+                # If error occurs, it might be due to missing base version - request full update
+                if hasattr(self, 'request_topology_update') and callable(self.request_topology_update):
+                    logging.info(f"Node {self.node_id}: Requesting full topology update due to error")
+                    self.request_topology_update()
         else:
             # Store changes for later application
             if not hasattr(self, 'pending_topology_changes'):                
                 self.pending_topology_changes = []
             self.pending_topology_changes.append((base_version, changes))
-            
-        logging.info(f"Node {self.node_id}: Applied {len(changes)} topology changes from base version {base_version}")
+            logging.debug(f"Node {self.node_id}: Stored {len(changes)} topology changes for later application")
 
     def _apply_bandwidth_update(self, command):
         """
@@ -933,16 +951,34 @@ class RaftNode:
         base_version = command.get('base_version')
         changes = command.get('changes', {})
         
+        # Check if the base version is in a compacted part of the log
+        if base_version < self.last_snapshot_index:
+            logging.warning(f"Node {self.node_id}: Cannot apply bandwidth delta with base_version {base_version} - " +
+                          f"version predates last snapshot at index {self.last_snapshot_index}")
+            
+            # Request a full bandwidth update instead
+            if hasattr(self, 'request_bandwidth_update') and callable(self.request_bandwidth_update):
+                logging.info(f"Node {self.node_id}: Requesting full bandwidth update due to compaction")
+                self.request_bandwidth_update()
+            return
+        
         if hasattr(self, 'bandwidth_manager') and self.bandwidth_manager is not None:
             # Apply changes to the bandwidth manager
-            self.bandwidth_manager.apply_bandwidth_changes(changes, base_version)
+            try:
+                self.bandwidth_manager.apply_bandwidth_changes(changes, base_version)
+                logging.info(f"Node {self.node_id}: Applied {len(changes)} bandwidth changes from base version {base_version}")
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error applying bandwidth delta: {e}")
+                # If error occurs, it might be due to missing base version - request full update
+                if hasattr(self, 'request_bandwidth_update') and callable(self.request_bandwidth_update):
+                    logging.info(f"Node {self.node_id}: Requesting full bandwidth update due to error")
+                    self.request_bandwidth_update()
         else:
             # Store changes for later application
             if not hasattr(self, 'pending_bandwidth_changes'):
                 self.pending_bandwidth_changes = []
             self.pending_bandwidth_changes.append((base_version, changes))
-            
-        logging.info(f"Node {self.node_id}: Applied {len(changes)} bandwidth changes from base version {base_version}")
+            logging.debug(f"Node {self.node_id}: Stored {len(changes)} bandwidth changes for later application")
     
     def _apply_membership_change(self, command):
         """
@@ -1166,3 +1202,41 @@ class RaftNode:
     def get_current_timestamp(self):
         """Get the current timestamp."""
         return time.time()
+        
+    def request_topology_update(self):
+        """
+        Request a full topology update from the leader.
+        
+        This method is called when an incremental update cannot be applied,
+        typically due to log compaction removing the base version.
+        """
+        if not hasattr(self, 'consensus_manager') or self.consensus_manager is None:
+            logging.warning(f"Node {self.node_id}: Cannot request topology update - no consensus manager available")
+            return
+            
+        try:
+            logging.info(f"Node {self.node_id}: Requesting full topology update from leader")
+            # The actual implementation depends on the consensus manager interface
+            # This could involve sending a message to the leader or triggering an update protocol
+            self.consensus_manager.request_full_topology_update()
+        except Exception as e:
+            logging.error(f"Node {self.node_id}: Error requesting topology update: {e}")
+            
+    def request_bandwidth_update(self):
+        """
+        Request a full bandwidth update from the leader.
+        
+        This method is called when an incremental update cannot be applied,
+        typically due to log compaction removing the base version.
+        """
+        if not hasattr(self, 'consensus_manager') or self.consensus_manager is None:
+            logging.warning(f"Node {self.node_id}: Cannot request bandwidth update - no consensus manager available")
+            return
+            
+        try:
+            logging.info(f"Node {self.node_id}: Requesting full bandwidth update from leader")
+            # The actual implementation depends on the consensus manager interface
+            # This could involve sending a message to the leader or triggering an update protocol
+            self.consensus_manager.request_full_bandwidth_update()
+        except Exception as e:
+            logging.error(f"Node {self.node_id}: Error requesting bandwidth update: {e}")
