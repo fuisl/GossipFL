@@ -263,7 +263,9 @@ class RaftConsensus:
                 
                 # Check for election timeout (critical RAFT timing)
                 if self.raft_node.is_election_timeout():
-                    logging.info(f"Node {self.raft_node.node_id}: Election timeout detected, starting election")
+                    logging.info(
+                        f"Node {self.raft_node.node_id}: Election timeout detected, starting PreVote"
+                    )
                     
                     try:
                         # Start a new election (RAFT Algorithm Step)
@@ -304,8 +306,8 @@ class RaftConsensus:
                     logging.error(f"Node {self.raft_node.node_id}: Error sending heartbeats: {e}")
                 
                 # Sleep for heartbeat interval (as specified in RAFT paper)
-                heartbeat_interval = self.raft_node.heartbeat_interval / 1000.0  # Convert ms to seconds
-                time.sleep(heartbeat_interval)
+                # heartbeat_interval is already in seconds
+                time.sleep(self.raft_node.heartbeat_interval)
                 
         except Exception as e:
             logging.error(f"Node {self.raft_node.node_id}: Fatal error in heartbeat thread: {e}")
@@ -368,6 +370,22 @@ class RaftConsensus:
                 )
             except Exception as e:
                 logging.error(f"Node {self.raft_node.node_id}: Error sending vote request to {node_id}: {e}")
+
+    def broadcast_prevote_request(self, candidate_id, term, last_log_index, last_log_term):
+        """Send PreVote requests to all other nodes."""
+        for node_id in self.raft_node.known_nodes:
+            if node_id == self.raft_node.node_id:
+                continue
+
+            try:
+                self.worker_manager.send_prevote_request(
+                    node_id,
+                    term,
+                    last_log_index,
+                    last_log_term,
+                )
+            except Exception as e:
+                logging.error(f"Node {self.raft_node.node_id}: Error sending prevote request to {node_id}: {e}")
     
     def send_heartbeats(self):
         """Send heartbeat messages to all followers."""
@@ -379,11 +397,18 @@ class RaftConsensus:
                 continue  # Skip self
             
             try:
-                # Send append entries (heartbeat) to follower
-                prev_log_index = self.raft_node.next_index.get(node_id, 1) - 1
-                prev_log_term = 0
-                if prev_log_index > 0 and prev_log_index <= len(self.raft_node.log):
-                    prev_log_term = self.raft_node.log[prev_log_index - 1].get('term', 0)
+                prev_log_index = self.raft_node.next_index.get(
+                    node_id, self.raft_node.first_log_index + len(self.raft_node.log)
+                ) - 1
+
+                if prev_log_index == self.raft_node.last_snapshot_index:
+                    prev_log_term = self.raft_node.last_snapshot_term
+                elif prev_log_index >= self.raft_node.first_log_index:
+                    prev_log_term = self.raft_node.log[
+                        prev_log_index - self.raft_node.first_log_index
+                    ]["term"]
+                else:
+                    prev_log_term = 0
                 
                 self.worker_manager.send_append_entries(
                     node_id,
@@ -406,28 +431,72 @@ class RaftConsensus:
                 continue  # Skip self
             
             try:
-                next_index = self.raft_node.next_index.get(node_id, len(self.raft_node.log) + 1)
-                
-                # If there are new entries to send
-                if next_index <= len(self.raft_node.log):
-                    prev_log_index = next_index - 1
+                next_index = self.raft_node.next_index.get(
+                    node_id, self.raft_node.first_log_index + len(self.raft_node.log)
+                )
+
+                if next_index <= self.raft_node.last_snapshot_index:
+                    # follower is too far behind, send snapshot
+                    self._send_snapshot(node_id)
+                    continue
+
+                array_idx = next_index - self.raft_node.first_log_index
+                entries_to_send = self.raft_node.log[array_idx:]
+
+                prev_log_index = next_index - 1
+                if prev_log_index == self.raft_node.last_snapshot_index:
+                    prev_log_term = self.raft_node.last_snapshot_term
+                elif prev_log_index >= self.raft_node.first_log_index:
+                    prev_log_term = self.raft_node.log[
+                        prev_log_index - self.raft_node.first_log_index
+                    ]["term"]
+                else:
                     prev_log_term = 0
-                    if prev_log_index > 0:
-                        prev_log_term = self.raft_node.log[prev_log_index - 1].get('term', 0)
-                    
-                    # Get entries to send
-                    entries_to_send = self.raft_node.log[next_index - 1:]
-                    
-                    self.worker_manager.send_append_entries(
-                        node_id,
-                        self.raft_node.current_term,
-                        prev_log_index,
-                        prev_log_term,
-                        entries_to_send,
-                        self.raft_node.commit_index
-                    )
+
+                self.worker_manager.send_append_entries(
+                    node_id,
+                    self.raft_node.current_term,
+                    prev_log_index,
+                    prev_log_term,
+                    entries_to_send,
+                    self.raft_node.commit_index,
+                )
             except Exception as e:
                 logging.error(f"Node {self.raft_node.node_id}: Error replicating logs to {node_id}: {e}")
+
+    def _send_snapshot(self, node_id):
+        """Send a snapshot to a follower that is too far behind."""
+        try:
+            snapshot_data = self.raft_node.get_snapshot()
+            offset = 0
+            chunk_size = 1024 * 64  # 64KB chunks
+            while offset < len(snapshot_data):
+                chunk = snapshot_data[offset : offset + chunk_size]
+                done = offset + chunk_size >= len(snapshot_data)
+                self.worker_manager.send_install_snapshot(
+                    node_id,
+                    self.raft_node.current_term,
+                    self.raft_node.last_snapshot_index,
+                    self.raft_node.last_snapshot_term,
+                    offset,
+                    chunk,
+                    done,
+                )
+                offset += chunk_size
+        except Exception as e:
+            logging.error(
+                f"Node {self.raft_node.node_id}: Error sending snapshot to {node_id}: {e}"
+            )
+
+    def handle_prevote_request(self, candidate_id, term, last_log_index, last_log_term):
+        """Process a PreVote request from another node."""
+        current_term, prevote_granted = self.raft_node.receive_prevote_request(
+            candidate_id, term, last_log_index, last_log_term
+        )
+
+        self.worker_manager.send_prevote_response(
+            candidate_id, current_term, prevote_granted
+        )
     
     def handle_vote_request(self, candidate_id, term, last_log_index, last_log_term):
         """
@@ -472,9 +541,20 @@ class RaftConsensus:
             # Notify leadership change
             if self.on_leadership_change:
                 self.on_leadership_change(self.raft_node.node_id)
-            
+
             # Add a no-op entry to the log
             self.add_no_op_entry()
+
+    def handle_prevote_response(self, voter_id, term, prevote_granted):
+        """Handle a PreVote response message."""
+        should_start_election = self.raft_node.receive_prevote_response(
+            voter_id, term, prevote_granted
+        )
+
+        if should_start_election:
+            transitioned = self.raft_node.start_election()
+            if transitioned and self.raft_node.state == RaftState.CANDIDATE:
+                self.request_votes_from_all()
     
     def add_no_op_entry(self):
         """Add a no-op entry to the log to commit previous entries."""
@@ -519,6 +599,22 @@ class RaftConsensus:
         except Exception as e:
             logging.error(f"Node {self.raft_node.node_id}: Error handling append entries: {str(e)}")
             return self.raft_node.current_term, False
+
+    def handle_install_snapshot(
+        self, leader_id, term, last_incl_idx, last_incl_term, offset, data, done
+    ):
+        """Process an InstallSnapshot RPC from the leader."""
+        try:
+            self.raft_node.install_snapshot_chunk(
+                last_incl_idx, last_incl_term, offset, data, done
+            )
+            self.worker_manager.send_install_snapshot_response(
+                leader_id, self.raft_node.current_term
+            )
+        except Exception as e:
+            logging.error(
+                f"Node {self.raft_node.node_id}: Error handling install snapshot from {leader_id}: {e}"
+            )
     
     def handle_append_response(self, follower_id, term, success, match_index):
         """
@@ -640,19 +736,12 @@ class RaftConsensus:
             return -1
         
         try:
-            # Use the new raft_node methods with round_num and reason
             if action == 'add':
-                if not self.raft_node.add_node(node_id, round_num):
-                    logging.warning(f"Node {self.raft_node.node_id}: Failed to add node {node_id} to known nodes")
-                    return -1
-                # Success is logged inside add_node
-                return 1  # Indicate success (actual log index is handled within add_node)
+                idx = self.raft_node.add_node(node_id, round_num)
+                return idx
             elif action == 'remove':
-                if not self.raft_node.remove_node(node_id, round_num, reason):
-                    logging.warning(f"Node {self.raft_node.node_id}: Failed to remove node {node_id} from known nodes")
-                    return -1
-                # Success is logged inside remove_node
-                return 1  # Indicate success (actual log index is handled within remove_node)
+                idx = self.raft_node.remove_node(node_id, round_num, reason)
+                return idx
             
         except Exception as e:
             logging.error(f"Node {self.raft_node.node_id}: Error adding membership change: {str(e)}")
@@ -855,18 +944,7 @@ class RaftConsensus:
         
         logging.info(f"Node {self.raft_node.node_id}: Handling join request from node {node_id}")
         
-        # Add the node to our known nodes if not already present
-        if node_id not in self.raft_node.known_nodes:
-            self.raft_node.known_nodes.add(node_id)
-            
-            # Initialize next and match indices for the new node
-            self.raft_node.next_index[node_id] = len(self.raft_node.log) + 1
-            self.raft_node.match_index[node_id] = 0
-            
-            logging.info(f"Node {self.raft_node.node_id}: Added node {node_id} to cluster")
-        
-        # Send the current state to the joining node
-        # This will be handled by the worker manager's enhanced state snapshot method
+        self.send_state_to_new_node(node_id)
         return True
     
     def send_state_to_new_node(self, new_node_id):
