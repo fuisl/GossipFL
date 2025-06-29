@@ -586,15 +586,8 @@ class RaftNode:
         """
         with self.state_lock:
             try:
-                # Get this node's last log entry details
-                my_last_log_index = len(self.log)
-                
-                # Handle empty log case
-                if my_last_log_index == 0:
-                    my_last_log_term = 0
-                    logging.debug(f"Node {self.node_id}: Log is empty, considering any non-empty log more up-to-date")
-                else:
-                    my_last_log_term = self.log[my_last_log_index - 1]['term']
+                # Get this node's last log entry details (accounting for compaction)
+                my_last_log_index, my_last_log_term = self.get_last_log_info()
                 
                 # Implement the RAFT log comparison logic:
                 # 1. Compare terms of the last log entries
@@ -685,17 +678,20 @@ class RaftNode:
                 
                 # --- Step 2: Log consistency check ---
                 
+                # Convert prev_log_index (absolute) to array index considering first_log_index
+                array_idx = prev_log_index - self.first_log_index
+
                 # Check if our log has the entry at prev_log_index with term prev_log_term
                 # Special case: prev_log_index = 0 means we're starting from the beginning
                 if prev_log_index == 0:
                     log_ok = True
                     reason = "starting from beginning of log"
-                elif prev_log_index > len(self.log):
+                elif array_idx >= len(self.log) or array_idx < 0:
                     log_ok = False
-                    reason = f"prev_log_index ({prev_log_index}) > log length ({len(self.log)})"
-                elif self.log[prev_log_index - 1]['term'] != prev_log_term:
+                    reason = f"prev_log_index ({prev_log_index}) outside log range (first_log_index={self.first_log_index}, log length={len(self.log)})"
+                elif self.log[array_idx]['term'] != prev_log_term:
                     log_ok = False
-                    reason = f"term mismatch at prev_log_index: expected {prev_log_term}, found {self.log[prev_log_index - 1]['term']}"
+                    reason = f"term mismatch at prev_log_index: expected {prev_log_term}, found {self.log[array_idx]['term']}"
                 else:
                     log_ok = True
                     reason = "log consistency check passed"
@@ -720,15 +716,16 @@ class RaftNode:
                     for i, entry in enumerate(entries):
                         # Calculate the absolute index for this entry
                         idx = prev_log_index + i + 1
-                        
+                        array_idx = idx - self.first_log_index
+
                         # Case 1: This entry goes beyond our log, so append it
-                        if idx > len(self.log):
+                        if array_idx >= len(self.log):
                             self.log.append(entry)
                             log_modified = True
                             appended += 1
                         # Case 2: This entry conflicts with our log, truncate and append
-                        elif self.log[idx - 1]['term'] != entry['term']:
-                            self.log = self.log[:idx - 1]  # Truncate log
+                        elif array_idx < 0 or self.log[array_idx]['term'] != entry['term']:
+                            self.log = self.log[:array_idx]  # Truncate log up to this point
                             self.log.append(entry)
                             log_modified = True
                             truncated = True
