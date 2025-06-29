@@ -8,7 +8,7 @@ from mpi4py import MPI
 from fedml_core.distributed.communication.message import Message
 
 from algorithms.SAPS_FL.decentralized_worker_manager import DecentralizedWorkerManager
-from utils.context import raise_error_without_process, get_lock
+from utils.context import raise_error_without_process, get_lock, raise_MPI_error
 from utils.tracker import get_metric_info
 from .raft_node import RaftState
 from .raft_messages import RaftMessage
@@ -45,15 +45,24 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         self.raft_consensus = raft_consensus
         self.bandwidth_manager = bandwidth_manager
         
-        # Register for leadership changes
+        # Register for leadership changes and state updates
         self.raft_consensus.on_leadership_change = self.handle_leadership_change
+        self.raft_consensus.on_state_commit = self.handle_raft_state_commit
         
-        # State variables
+        # State variables for RAFT-SAPS_FL integration
         self.is_coordinator = False
         self.coordinator_id = None
+        self.current_topology = None
+        self.current_bandwidth = None
+        self.raft_round_state = None  # Track RAFT-managed round state
         
         # Thread synchronization
         self.consensus_established_event = threading.Event()
+        self.topology_ready_event = threading.Event()
+        self.round_start_authorized = threading.Event()
+        
+        # Override SAPS_FL coordinator detection
+        self._override_saps_coordinator_logic()
         
         logging.info(f"RaftWorkerManager initialized for node {rank}")
     
@@ -177,7 +186,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
     
     def run_sync(self):
         """Run the training process synchronously with RAFT consensus."""
-        try:
+        with raise_MPI_error():
             # For the first iteration, wait for RAFT to establish leadership and initial topology
             self.wait_for_initial_consensus()
             
@@ -194,7 +203,9 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                 
                 # Update worker's dataset and data loader
                 with raise_error_without_process():
-                    self.worker.train_local.sampler.set_epoch(epoch)
+                    # Fix: Check if sampler has set_epoch method before calling
+                    if hasattr(self.worker.train_local.sampler, 'set_epoch'):
+                        self.worker.train_local.sampler.set_epoch(epoch)
                 
                 self.epoch_init()
                 
@@ -205,25 +216,89 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                     self.start_epoch_event.wait()
                     logging.debug("Begin iteration")
                     
-                    # Rest of the training loop from DecentralizedWorkerManager
-                    # This is the same as in the original SAPS_FL implementation
-                    # ...
+                    # Get model params
+                    from utils.data_utils import get_data
+                    from utils.tensor_buffer import TensorBuffer
+                    params, _ = get_data(
+                        self.worker.param_groups, self.worker.param_names, is_get_grad=False
+                    )
+                    flatten_params = TensorBuffer(params)
+
+                    # compress
+                    sync_buffer = {
+                        "original_shapes": self.worker.shapes,
+                        "flatten_params": flatten_params,
+                    }
+                    self.compressor.compress(sync_buffer)
+                    self.selected_shapes = sync_buffer["selected_shapes"]
+
+                    # begin to send model
+                    logging.debug("Begin send and receive")
+                    logging.debug(self.topology_manager.topology)
+                    for neighbor_idx in self.topology_manager.get_out_neighbor_idx_list(self.worker_index):
+                        if self.compression in ["randomk", "topk"]:
+                            self.send_sparse_params_to_neighbors(neighbor_idx, 
+                                sync_buffer["flatten_selected_values"].buffer.cpu(),
+                                sync_buffer["flatten_selected_indices"].buffer.cpu(),
+                                self.worker.get_dataset_len())
+                        elif self.compression == "quantize":
+                            self.send_quant_params_to_neighbors(neighbor_idx,
+                                sync_buffer["flatten_quantized_values"].buffer.cpu(),
+                                self.worker.get_dataset_len())
+                        elif self.compression == "sign":
+                            self.send_sign_params_to_neighbors(neighbor_idx,
+                                sync_buffer["flatten_sign_values"].buffer.cpu(),
+                                self.worker.get_dataset_len())
+                        else:
+                            # For no compression, send the full parameters
+                            self.send_result_to_neighbors(neighbor_idx,
+                                sync_buffer["flatten_params"].buffer.cpu(),
+                                self.worker.get_dataset_len())
                     
-                    # But topology is now obtained through RAFT
+                    # wait for receiving all
+                    self.sync_receive_all_event.wait()
+                    self.worker.aggregate(self.compressor, self.selected_shapes, self.gossip_info)
+
+                    # Get weighted hat params and apply the local gradient.
+                    self.neighbor_transfer_lock.acquire()
+
+                    # add the sparsed part
+                    self.compressor.uncompress_direct(
+                        sync_buffer, self.worker.neighbor_hat_params["memory"],
+                        self.selected_shapes, self.worker.shapes)
+                    sync_buffer["flatten_params"].unpack(params)
+
+                    if self.neighbor_transfer_lock.locked():
+                        self.neighbor_transfer_lock.release()
+
+                    # Handle communication failures
+                    import numpy as np
+                    if self.args.Failure_chance is not None and np.random.rand(1) < self.args.Failure_chance:
+                        logging.info("Communication Failure happens on worker: {}, Failure_chance: {}".format(
+                            self.worker_index, self.args.Failure_chance))
+                    else:
+                        self.lr_schedule(self.epoch, self.iteration, self.global_round_idx,
+                                        self.worker.num_iterations, self.args.warmup_epochs)
+                        # update x_half to x_{t+1} by SGD
+                        loss, output, target \
+                            = self.worker.train_one_step(self.epoch, self.iteration,
+                                                            self.train_tracker, self.metrics)
+
+                    self.start_epoch_event.clear()
+                    self.sync_receive_all_event.clear()
+
+                    """
+                        Before send msg to coordinator,
+                        generate topology firstly through RAFT consensus.
+                    """
                     self.topology_manager.generate_topology(t=self.global_round_idx)
                     self.worker.refresh_gossip_info()
                     self.refresh_gossip_info()
-                    
+                    # reset the neighbor_hat_params for storing new values
+                    self.worker.init_neighbor_hat_params()
+
                     # Report to coordinator using the RAFT leader
                     self.test_and_send_to_coordinator(iteration, epoch)
-                    
-                    self.start_epoch_event.clear()
-                    self.sync_receive_all_event.clear()
-                
-        except Exception as e:
-            logging.error(f"Error in run_sync: {e}")
-            logging.error(traceback.format_exc())
-            raise e
     
     def wait_for_initial_consensus(self):
         """
@@ -777,4 +852,101 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             # Request comprehensive state from the leader
             logging.info(f"Requesting cluster join from leader {leader_id}")
             self.send_state_request(leader_id)
+
+    def _override_saps_coordinator_logic(self):
+        """
+        Override SAPS_FL's hardcoded coordinator logic to use RAFT leader election.
+        """
+        # Patch the parent class's run method to use RAFT leadership
+        original_run = super().run
+        
+        def raft_enabled_run():
+            # Start RAFT consensus first
+            self.raft_consensus.start()
             
+            # Wait for leadership establishment instead of hardcoded coordinator
+            self.wait_for_initial_consensus()
+            
+            # Start training thread
+            self.training_thread.start()
+            
+            # MPI barrier for synchronization
+            logging.debug("Wait for the barrier!")
+            MPI.COMM_WORLD.Barrier()
+            time.sleep(1)
+            logging.debug("MPI exit barrier!")
+            
+            # If this node is the RAFT leader, start coordinator duties
+            if self.is_coordinator:
+                logging.debug("RAFT LEADER notify clients to start!")
+                self.coodinator_thread.start()
+                self.notify_clients()
+            
+            # Continue with normal message loop
+            super(DecentralizedWorkerManager, self).run()
+        
+        # Replace the run method
+        self.run = raft_enabled_run
+    
+    def handle_raft_state_commit(self, log_entry):
+        """
+        Handle committed log entries from RAFT.
+        
+        Args:
+            log_entry: The committed log entry containing state updates
+        """
+        if log_entry.get('type') == 'topology_update':
+            topology_data = log_entry.get('topology')
+            bandwidth_data = log_entry.get('bandwidth')
+            round_num = log_entry.get('round')
+            
+            logging.info(f"Applying RAFT topology update for round {round_num}")
+            
+            # Update topology manager with RAFT-committed topology
+            self.topology_manager.topology = topology_data
+            self.topology_manager.bandwidth = bandwidth_data
+            self.current_topology = topology_data
+            self.current_bandwidth = bandwidth_data
+            
+            # Signal that topology is ready
+            self.topology_ready_event.set()
+            
+        elif log_entry.get('type') == 'round_start':
+            round_num = log_entry.get('round')
+            
+            logging.info(f"RAFT authorized round {round_num} start")
+            self.raft_round_state = log_entry
+            self.round_start_authorized.set()
+            
+        elif log_entry.get('type') == 'member_change':
+            # Handle dynamic membership changes
+            new_members = log_entry.get('members')
+            logging.info(f"RAFT membership change: {new_members}")
+            self.handle_membership_change(new_members)
+    
+    def handle_membership_change(self, new_members):
+        """
+        Handle dynamic changes in cluster membership.
+        
+        Args:
+            new_members: List of active member IDs
+        """
+        # Update worker number and related state
+        old_worker_number = self.size
+        new_worker_number = len(new_members)
+        
+        if old_worker_number != new_worker_number:
+            logging.info(f"Cluster size changed from {old_worker_number} to {new_worker_number}")
+            
+            # Update size
+            self.size = new_worker_number
+            self.worker_number = new_worker_number
+            
+            # Notify topology manager of membership change
+            if hasattr(self.topology_manager, 'update_membership'):
+                self.topology_manager.update_membership(new_members)
+            
+            # Regenerate topology if we're the leader
+            if self.is_coordinator:
+                self.propose_topology_update(force_regenerate=True)
+
