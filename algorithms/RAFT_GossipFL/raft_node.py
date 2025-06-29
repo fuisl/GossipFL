@@ -143,8 +143,40 @@ class RaftNode:
                 logging.error(f"Node {self.node_id}: Error updating heartbeat time: {e}")
     
     def is_election_timeout(self):
-        """Check if election timeout has occurred."""
-        return time.time() - self.last_heartbeat_time > self.election_timeout
+        """
+        Check if election timeout has occurred.
+        
+        This method determines whether enough time has passed since the last
+        heartbeat to trigger an election. This is a key part of leader detection
+        in the RAFT algorithm.
+        
+        Returns:
+            bool: True if timeout has occurred, False otherwise
+        """
+        with self.state_lock:
+            try:
+                # Leaders don't check for election timeouts
+                if self.state == RaftState.LEADER:
+                    return False
+                
+                # Nodes in INITIAL state don't participate in elections
+                if self.state == RaftState.INITIAL:
+                    return False
+                
+                # Calculate time since last heartbeat
+                elapsed = time.time() - self.last_heartbeat_time
+                is_timeout = elapsed > self.election_timeout
+                
+                # Log timeout events for debugging
+                if is_timeout:
+                    logging.debug(f"Node {self.node_id}: Election timeout detected after {elapsed*1000:.2f}ms " +
+                                 f"(timeout was {self.election_timeout*1000:.2f}ms)")
+                
+                return is_timeout
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error checking election timeout: {e}")
+                # Return False on error to avoid unnecessary elections
+                return False
     
     def start_election(self):
         """
