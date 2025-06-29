@@ -368,20 +368,54 @@ class RaftNode:
             term (int): The new current term
         """
         with self.state_lock:
-            old_state = self.state
-            self.state = RaftState.FOLLOWER
-            self.current_term = term
-            self.voted_for = None
-            
-            # Reset election timeout
-            self.reset_election_timeout()
-            self.update_heartbeat()
-            
-            # Only notify if state actually changed
-            if old_state != RaftState.FOLLOWER and self.on_state_change:
-                self.on_state_change(RaftState.FOLLOWER)
+            try:
+                old_state = self.state
                 
-            logging.info(f"Node {self.node_id}: Became FOLLOWER for term {term}")
+                # Store transition information for logging
+                from_state = old_state.name
+                
+                # Set the state to FOLLOWER
+                self.state = RaftState.FOLLOWER
+                
+                # Update term if it's higher than our current term
+                if term > self.current_term:
+                    self.current_term = term
+                    # According to RAFT, voted_for should be reset when term changes
+                    self.voted_for = None
+                elif term == self.current_term:
+                    # When term is the same, we keep voted_for as is
+                    pass
+                else:
+                    # This should not happen, but just in case
+                    logging.warning(f"Node {self.node_id}: Becoming follower with term {term} lower than current term {self.current_term}")
+                
+                # Reset election state
+                if old_state == RaftState.CANDIDATE:
+                    self.votes_received = set()  # Clear received votes when stepping down from candidate
+                
+                # Reset election timeout to ensure randomized election timing
+                self.reset_election_timeout()
+                self.update_heartbeat()
+                
+                # Clear leader state if transitioning from leader
+                if old_state == RaftState.LEADER:
+                    # No need to clear next_index and match_index completely,
+                    # but any operations on them should check if still leader
+                    logging.info(f"Node {self.node_id}: Stepping down from leader for term {self.current_term}")
+                
+                # Notify state change if state actually changed and callback is set
+                if old_state != RaftState.FOLLOWER and self.on_state_change:
+                    self.on_state_change(RaftState.FOLLOWER)
+                
+                if old_state != RaftState.FOLLOWER:
+                    logging.info(f"Node {self.node_id}: State changed from {from_state} to FOLLOWER for term {term}")
+                else:
+                    logging.debug(f"Node {self.node_id}: Updated follower state for term {term}")
+                    
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error transitioning to follower state: {e}")
+                # Ensure we're in a safe state even if there's an error
+                self.state = RaftState.FOLLOWER
     
     def become_leader(self):
         """Transition to LEADER state."""
