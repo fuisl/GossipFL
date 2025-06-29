@@ -219,8 +219,11 @@ if __name__ == "__main__":
                                 train_data_local_num_dict, train_data_local_dict, test_data_local_dict, cfg,
                                 model_trainer)
         elif cfg.algorithm == 'RAFT_GossipFL':
-            from algorithms.RAFT_GossipFL.main import run_raft_gossipfl
-            run_raft_gossipfl(cfg)
+            from algorithms.RAFT_GossipFL.RAFT_GossipFL_API import FedML_init, FedML_RAFT_GossipFL
+            FedML_RAFT_GossipFL(process_id, worker_number, device, comm,
+                               model, train_data_num, train_data_global, test_data_global,
+                               train_data_local_num_dict, train_data_local_dict, test_data_local_dict, cfg,
+                               model_trainer)
         else:
             raise NotImplementedError
 

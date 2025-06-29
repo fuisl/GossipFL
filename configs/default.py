@@ -175,6 +175,15 @@ _C.bandwidth_type = 'random' # 'random' 'real'
 _C.B_thres = 3.0
 _C.T_thres = 3
 
+# RAFT GossipFL
+_C.min_election_timeout = 150  # Minimum election timeout in milliseconds
+_C.max_election_timeout = 300  # Maximum election timeout in milliseconds  
+_C.heartbeat_interval = 50     # Heartbeat interval in milliseconds
+_C.join_existing_cluster = False  # Join existing cluster instead of starting new
+_C.known_leader_id = None      # ID of known leader when joining existing cluster
+_C.raft_log_compaction_threshold = 1000  # Log entries before compaction
+_C.raft_snapshot_interval = 100  # Interval between state snapshots
+
 
 
 # torch_ddp
