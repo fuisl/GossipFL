@@ -86,6 +86,9 @@ class RaftConsensus:
         # Current leader ID (None if unknown)
         self.current_leader_id = None
         
+        # Current coordinator ID (None if unknown)
+        self.current_coordinator_id = None
+        
         # Thread state tracking
         self.is_running = False
         
@@ -690,6 +693,78 @@ class RaftConsensus:
             int: ID of the current coordinator (same as leader)
         """
         return self.current_leader_id
+    
+    def on_membership_change(self, new_nodes, round_num=0):
+        """
+        Handle notification of membership changes from the RAFT node.
+        
+        This method is called when the RAFT node applies a membership change
+        log entry. It notifies the worker manager about the change.
+        
+        Args:
+            new_nodes (set): The updated set of known nodes
+            round_num (int): The current training round number
+        """
+        try:
+            if self.worker_manager is not None:
+                # Notify the worker manager about the membership change
+                self.worker_manager.on_membership_change(new_nodes, round_num)
+                logging.debug(f"Node {self.raft_node.node_id}: Worker manager notified of membership change")
+            else:
+                logging.warning(f"Node {self.raft_node.node_id}: No worker manager available to notify about membership change")
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error in on_membership_change: {e}", exc_info=True)
+    
+    def on_coordinator_change(self, new_coordinator, old_coordinator=None, round_num=0, reason='unspecified'):
+        """
+        Handle notification of coordinator changes from the RAFT node.
+        
+        This method is called when the RAFT node applies a coordinator change
+        log entry. It notifies the worker manager about the change.
+        
+        Args:
+            new_coordinator (int): The ID of the new coordinator
+            old_coordinator (int): The ID of the previous coordinator
+            round_num (int): The current training round number
+            reason (str): The reason for the coordinator change
+        """
+        try:
+            if self.worker_manager is not None:
+                # Update our internal tracking of current coordinator
+                self.current_coordinator_id = new_coordinator
+                
+                # Notify the worker manager about the coordinator change
+                self.worker_manager.on_coordinator_change(
+                    new_coordinator=new_coordinator,
+                    old_coordinator=old_coordinator,
+                    round_num=round_num,
+                    reason=reason
+                )
+                logging.debug(f"Node {self.raft_node.node_id}: Worker manager notified of coordinator change to {new_coordinator}")
+            else:
+                logging.warning(f"Node {self.raft_node.node_id}: No worker manager available to notify about coordinator change")
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error in on_coordinator_change: {e}", exc_info=True)
+    
+    def on_become_coordinator(self, round_num=0):
+        """
+        Handle notification that this node has become the coordinator.
+        
+        This method is called when this node is elected as the new coordinator.
+        It triggers the training process in the worker manager.
+        
+        Args:
+            round_num (int): The current training round number
+        """
+        try:
+            if self.worker_manager is not None:
+                # Trigger training process in the worker manager
+                self.worker_manager.on_become_coordinator(round_num)
+                logging.info(f"Node {self.raft_node.node_id}: Triggered training process as new coordinator for round {round_num}")
+            else:
+                logging.warning(f"Node {self.raft_node.node_id}: No worker manager available to trigger training process")
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error in on_become_coordinator: {e}", exc_info=True)
     
     def is_state_synchronized(self):
         """

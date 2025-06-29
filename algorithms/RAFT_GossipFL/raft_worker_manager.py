@@ -61,6 +61,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         self.consensus_established_event = threading.Event()
         self.topology_ready_event = threading.Event()
         self.round_start_authorized = threading.Event()
+        self.round_start_event = threading.Event()  # Used to trigger next training round
         
         # Override SAPS_FL coordinator detection
         self._override_saps_coordinator_logic()
@@ -201,6 +202,102 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             
             # Signal that consensus is established
             self.consensus_established_event.set()
+    
+    def on_membership_change(self, new_nodes, round_num=0):
+        """
+        Handle notification of membership changes from the consensus manager.
+        
+        Args:
+            new_nodes (set): The updated set of known nodes
+            round_num (int): The current training round number
+        """
+        with raise_MPI_error():
+            try:
+                old_nodes = self.topology_manager.get_neighbor_list() if hasattr(self, 'topology_manager') else set()
+                
+                # Log significant changes
+                added = [n for n in new_nodes if n not in old_nodes]
+                removed = [n for n in old_nodes if n not in new_nodes]
+                
+                if added or removed:
+                    logging.info(f"Node {self.worker_index}: Membership change at round {round_num}:" +
+                                f" Added={added}, Removed={removed}")
+                    
+                    # Update topology if needed
+                    if hasattr(self, 'topology_manager'):
+                        self.topology_manager.update_nodes(new_nodes)
+                        
+                        # If this node is leader/coordinator, propagate updated topology
+                        if self.is_coordinator:
+                            self.update_topology_consensus()
+            except Exception as e:
+                logging.error(f"Node {self.worker_index}: Error handling membership change: {e}", exc_info=True)
+    
+    def on_coordinator_change(self, new_coordinator, old_coordinator=None, round_num=0, reason='unspecified'):
+        """
+        Handle notification of coordinator changes from the consensus manager.
+        
+        Args:
+            new_coordinator (int): The ID of the new coordinator
+            old_coordinator (int): The ID of the previous coordinator (may be None)
+            round_num (int): The current training round number
+            reason (str): The reason for the coordinator change
+        """
+        with raise_MPI_error():
+            try:
+                # This method is called when a coordinator change is applied from a log entry
+                # It should NOT start the coordinator process directly, as that's handled by on_become_coordinator
+                
+                # Update our tracking
+                self.coordinator_id = new_coordinator
+                logging.info(f"Node {self.worker_index}: Coordinator changed from {old_coordinator} to {new_coordinator} " +
+                           f"at round {round_num} (reason: {reason})")
+                
+                # Update any dependent components
+                if hasattr(self, 'worker') and self.worker is not None:
+                    self.worker.set_coordinator(new_coordinator)
+                    
+                # Signal that consensus is established
+                self.consensus_established_event.set()
+            except Exception as e:
+                logging.error(f"Node {self.worker_index}: Error handling coordinator change: {e}", exc_info=True)
+    
+    def on_become_coordinator(self, round_num=0):
+        """
+        Handle notification that this node has become the coordinator.
+        
+        This method is called when this node is designated as coordinator and should
+        trigger the start of a training round.
+        
+        Args:
+            round_num (int): The current training round number
+        """
+        with raise_MPI_error():
+            try:
+                if not self.is_coordinator:
+                    # Update state
+                    old_state = self.is_coordinator
+                    self.is_coordinator = True
+                    self.coordinator_id = self.worker_index
+                    
+                    logging.info(f"Node {self.worker_index}: Becoming coordinator for round {round_num}")
+                    
+                    # If not already running the coordinator thread, start it
+                    if old_state != self.is_coordinator:
+                        self.coodinator_thread = threading.Thread(name="coordinator", target=self.run_coordinator)
+                        self.coodinator_thread.start()
+                    
+                    # Notify clients about the new coordinator
+                    self.notify_clients()
+                    
+                    # Trigger the start of a training round if we're already in training mode
+                    if hasattr(self, 'training_thread') and self.training_thread is not None and self.training_thread.is_alive():
+                        # Signal to the training thread that it should proceed with the next round
+                        logging.info(f"Node {self.worker_index}: Triggering next training round as coordinator")
+                        if hasattr(self, 'round_start_event'):
+                            self.round_start_event.set()
+            except Exception as e:
+                logging.error(f"Node {self.worker_index}: Error becoming coordinator: {e}", exc_info=True)
     
     def run_sync(self):
         """Run the training process synchronously with RAFT consensus."""

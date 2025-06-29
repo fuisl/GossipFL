@@ -987,46 +987,108 @@ class RaftNode:
         Args:
             command (dict): The membership change command
         """
-        action = command.get('action')
-        node_id = command.get('node_id')
-        current_nodes = command.get('current_nodes')
-        
-        if action == 'add':
-            # Add the node to known nodes if not already present
-            if node_id not in self.known_nodes:
-                self.known_nodes.add(node_id)
-                self.update_known_nodes(len(self.known_nodes))
-                logging.info(f"Node {self.node_id}: Added node {node_id} to known nodes")
-        elif action == 'remove':
-            # Remove the node from known nodes if present
-            if node_id in self.known_nodes:
-                self.known_nodes.remove(node_id)
-                self.update_known_nodes(len(self.known_nodes))
-                logging.info(f"Node {self.node_id}: Removed node {node_id} from known nodes")
-        
-        # If current_nodes is provided, use it to update known nodes
-        if current_nodes is not None:
-            self.known_nodes = set(current_nodes)
-            self.update_known_nodes(len(self.known_nodes))
-            logging.info(f"Node {self.node_id}: Updated known nodes to {current_nodes}")
+        with self.state_lock:
+            try:
+                action = command.get('action')
+                node_id = command.get('node_id')
+                current_nodes = command.get('current_nodes')
+                round_num = command.get('round', 0)
+                
+                old_known_nodes = set(self.known_nodes)  # Copy for change detection
+                
+                if action == 'add':
+                    # Add the node to known nodes if not already present
+                    if node_id not in self.known_nodes:
+                        self.known_nodes.add(node_id)
+                        logging.info(f"Node {self.node_id}: Added node {node_id} to known nodes at round {round_num}")
+                elif action == 'remove':
+                    # Remove the node from known nodes if present
+                    if node_id in self.known_nodes:
+                        self.known_nodes.remove(node_id)
+                        logging.info(f"Node {self.node_id}: Removed node {node_id} from known nodes at round {round_num}")
+                
+                # If current_nodes is provided, use it to update known nodes
+                if current_nodes is not None:
+                    self.known_nodes = set(current_nodes)
+                    logging.info(f"Node {self.node_id}: Updated known nodes to {current_nodes} at round {round_num}")
+                
+                # Only call update if there was actually a change
+                if old_known_nodes != self.known_nodes:
+                    # Update known nodes count and notify any monitoring components
+                    self.update_known_nodes(len(self.known_nodes))
+                    
+                    # If we have a manager, notify it about membership change
+                    if hasattr(self, 'consensus_manager') and self.consensus_manager is not None:
+                        try:
+                            self.consensus_manager.on_membership_change(self.known_nodes, round_num)
+                            logging.debug(f"Node {self.node_id}: Notified consensus manager of membership change")
+                        except Exception as e:
+                            logging.error(f"Node {self.node_id}: Error notifying consensus manager of membership change: {e}")
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error applying membership change: {e}", exc_info=True)
     
     def _apply_coordinator_change(self, command):
         """
         Apply a coordinator change command.
         
         Args:
-            command (dict): The coordinator change command
+            command (dict): The coordinator change command containing:
+                - coordinator_id: ID of the new coordinator
+                - previous_coordinator_id: ID of the previous coordinator (optional)
+                - round: Training round number (optional)
+                - reason: Reason for coordinator change (optional)
         """
-        coordinator_id = command.get('coordinator_id')
-        previous_coordinator_id = command.get('previous_coordinator_id')
-        round_num = command.get('round')
-        
-        # Update the coordinator information
-        if hasattr(self, 'current_coordinator_id'):
-            self.previous_coordinator_id = self.current_coordinator_id
-        self.current_coordinator_id = coordinator_id
-        
-        logging.info(f"Node {self.node_id}: Updated coordinator from {previous_coordinator_id} to {coordinator_id} at round {round_num}")
+        with self.state_lock:
+            try:
+                coordinator_id = command.get('coordinator_id')
+                previous_coordinator_id = command.get('previous_coordinator_id')
+                round_num = command.get('round', 0)
+                reason = command.get('reason', 'unspecified')
+                
+                if coordinator_id is None:
+                    logging.error(f"Node {self.node_id}: Received coordinator change with null coordinator_id")
+                    return
+                
+                # Track if coordinator actually changed
+                coordinator_changed = False
+                old_coordinator = None
+                
+                # Update the coordinator information
+                if hasattr(self, 'current_coordinator_id'):
+                    old_coordinator = self.current_coordinator_id
+                    if self.current_coordinator_id != coordinator_id:
+                        self.previous_coordinator_id = self.current_coordinator_id
+                        self.current_coordinator_id = coordinator_id
+                        coordinator_changed = True
+                else:
+                    # First time setting coordinator
+                    self.current_coordinator_id = coordinator_id
+                    self.previous_coordinator_id = previous_coordinator_id
+                    coordinator_changed = True
+                
+                if coordinator_changed:
+                    logging.info(f"Node {self.node_id}: Updated coordinator from {old_coordinator} to {coordinator_id} at round {round_num} (reason: {reason})")
+                    
+                    # Notify training components of coordinator change if available
+                    if hasattr(self, 'consensus_manager') and self.consensus_manager is not None:
+                        try:
+                            # Notify consensus manager of coordinator change
+                            self.consensus_manager.on_coordinator_change(
+                                new_coordinator=coordinator_id,
+                                old_coordinator=old_coordinator,
+                                round_num=round_num,
+                                reason=reason
+                            )
+                            logging.debug(f"Node {self.node_id}: Notified consensus manager of coordinator change")
+                            
+                            # If this node is the new coordinator, it should initiate training
+                            if coordinator_id == self.node_id:
+                                logging.info(f"Node {self.node_id}: I am the new coordinator for round {round_num}")
+                                self.consensus_manager.on_become_coordinator(round_num)
+                        except Exception as e:
+                            logging.error(f"Node {self.node_id}: Error notifying of coordinator change: {e}", exc_info=True)
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error applying coordinator change: {e}", exc_info=True)
     
     def add_log_entry(self, command):
         """
