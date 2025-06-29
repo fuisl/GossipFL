@@ -370,6 +370,22 @@ class RaftConsensus:
                 )
             except Exception as e:
                 logging.error(f"Node {self.raft_node.node_id}: Error sending vote request to {node_id}: {e}")
+
+    def broadcast_prevote_request(self, candidate_id, term, last_log_index, last_log_term):
+        """Send PreVote requests to all other nodes."""
+        for node_id in self.raft_node.known_nodes:
+            if node_id == self.raft_node.node_id:
+                continue
+
+            try:
+                self.worker_manager.send_prevote_request(
+                    node_id,
+                    term,
+                    last_log_index,
+                    last_log_term,
+                )
+            except Exception as e:
+                logging.error(f"Node {self.raft_node.node_id}: Error sending prevote request to {node_id}: {e}")
     
     def send_heartbeats(self):
         """Send heartbeat messages to all followers."""
@@ -447,30 +463,6 @@ class RaftConsensus:
                 )
             except Exception as e:
                 logging.error(f"Node {self.raft_node.node_id}: Error replicating logs to {node_id}: {e}")
-
-    def _send_snapshot(self, node_id):
-        """Send a snapshot to a follower that is too far behind."""
-        try:
-            snapshot_data = self.raft_node.get_snapshot()
-            offset = 0
-            chunk_size = 1024 * 64  # 64KB chunks
-            while offset < len(snapshot_data):
-                chunk = snapshot_data[offset : offset + chunk_size]
-                done = offset + chunk_size >= len(snapshot_data)
-                self.worker_manager.send_install_snapshot(
-                    node_id,
-                    self.raft_node.current_term,
-                    self.raft_node.last_snapshot_index,
-                    self.raft_node.last_snapshot_term,
-                    offset,
-                    chunk,
-                    done,
-                )
-                offset += chunk_size
-        except Exception as e:
-            logging.error(
-                f"Node {self.raft_node.node_id}: Error sending snapshot to {node_id}: {e}"
-            )
     
     def handle_vote_request(self, candidate_id, term, last_log_index, last_log_term):
         """
@@ -515,9 +507,20 @@ class RaftConsensus:
             # Notify leadership change
             if self.on_leadership_change:
                 self.on_leadership_change(self.raft_node.node_id)
-            
+
             # Add a no-op entry to the log
             self.add_no_op_entry()
+
+    def handle_prevote_response(self, voter_id, term, prevote_granted):
+        """Handle a PreVote response message."""
+        should_start_election = self.raft_node.receive_prevote_response(
+            voter_id, term, prevote_granted
+        )
+
+        if should_start_election:
+            transitioned = self.raft_node.start_election()
+            if transitioned and self.raft_node.state == RaftState.CANDIDATE:
+                self.request_votes_from_all()
     
     def add_no_op_entry(self):
         """Add a no-op entry to the log to commit previous entries."""

@@ -94,10 +94,18 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         self.register_message_receive_handler(
             RaftMessage.MSG_TYPE_RAFT_REQUEST_VOTE,
             self.handle_request_vote)
-        
+
+        self.register_message_receive_handler(
+            RaftMessage.MSG_TYPE_RAFT_PREVOTE_REQUEST,
+            self.handle_prevote_request)
+
         self.register_message_receive_handler(
             RaftMessage.MSG_TYPE_RAFT_VOTE_RESPONSE,
             self.handle_vote_response)
+
+        self.register_message_receive_handler(
+            RaftMessage.MSG_TYPE_RAFT_PREVOTE_RESPONSE,
+            self.handle_prevote_response)
         
         self.register_message_receive_handler(
             RaftMessage.MSG_TYPE_RAFT_APPEND_ENTRIES,
@@ -489,6 +497,22 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         
         # Process the vote request
         self.raft_consensus.handle_vote_request(candidate_id, term, last_log_index, last_log_term)
+
+    def handle_prevote_request(self, msg_params):
+        """Handle a RAFT PreVote request message."""
+        sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
+        term = msg_params.get(RaftMessage.MSG_ARG_TERM)
+        candidate_id = msg_params.get(RaftMessage.MSG_ARG_CANDIDATE_ID)
+        last_log_index = msg_params.get(RaftMessage.MSG_ARG_LAST_LOG_INDEX)
+        last_log_term = msg_params.get(RaftMessage.MSG_ARG_LAST_LOG_TERM)
+
+        logging.debug(
+            f"Received PreVoteRequest from {sender_id}, term={term}, candidate={candidate_id}"
+        )
+
+        self.raft_consensus.handle_prevote_request(
+            candidate_id, term, last_log_index, last_log_term
+        )
     
     def handle_vote_response(self, msg_params):
         """
@@ -502,9 +526,21 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         vote_granted = msg_params.get(RaftMessage.MSG_ARG_VOTE_GRANTED)
         
         logging.debug(f"Received VoteResponse from {sender_id}, term={term}, granted={vote_granted}")
-        
+
         # Process the vote response
         self.raft_consensus.handle_vote_response(sender_id, term, vote_granted)
+
+    def handle_prevote_response(self, msg_params):
+        """Handle a RAFT PreVote response message."""
+        sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
+        term = msg_params.get(RaftMessage.MSG_ARG_TERM)
+        prevote_granted = msg_params.get(RaftMessage.MSG_ARG_VOTE_GRANTED)
+
+        logging.debug(
+            f"Received PreVoteResponse from {sender_id}, term={term}, granted={prevote_granted}"
+        )
+
+        self.raft_consensus.handle_prevote_response(sender_id, term, prevote_granted)
     
     def handle_append_entries(self, msg_params):
         """
@@ -689,6 +725,16 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         message.add_params(RaftMessage.MSG_ARG_LAST_LOG_TERM, last_log_term)
         
         self.send_message(message)
+
+    def send_prevote_request(self, receiver_id, term, last_log_index, last_log_term):
+        """Send a RAFT PreVote request message."""
+        message = Message(RaftMessage.MSG_TYPE_RAFT_PREVOTE_REQUEST, self.get_sender_id(), receiver_id)
+        message.add_params(RaftMessage.MSG_ARG_TERM, term)
+        message.add_params(RaftMessage.MSG_ARG_CANDIDATE_ID, self.worker_index)
+        message.add_params(RaftMessage.MSG_ARG_LAST_LOG_INDEX, last_log_index)
+        message.add_params(RaftMessage.MSG_ARG_LAST_LOG_TERM, last_log_term)
+
+        self.send_message(message)
     
     def send_vote_response(self, receiver_id, term, vote_granted):
         """
@@ -702,7 +748,17 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         message = Message(RaftMessage.MSG_TYPE_RAFT_VOTE_RESPONSE, self.get_sender_id(), receiver_id)
         message.add_params(RaftMessage.MSG_ARG_TERM, term)
         message.add_params(RaftMessage.MSG_ARG_VOTE_GRANTED, vote_granted)
-        
+
+        self.send_message(message)
+
+    def send_prevote_response(self, receiver_id, term, prevote_granted):
+        """Send a RAFT PreVote response message."""
+        message = Message(
+            RaftMessage.MSG_TYPE_RAFT_PREVOTE_RESPONSE, self.get_sender_id(), receiver_id
+        )
+        message.add_params(RaftMessage.MSG_ARG_TERM, term)
+        message.add_params(RaftMessage.MSG_ARG_VOTE_GRANTED, prevote_granted)
+
         self.send_message(message)
     
     def send_append_entries(self, receiver_id, term, prev_log_index, prev_log_term, entries, leader_commit):
