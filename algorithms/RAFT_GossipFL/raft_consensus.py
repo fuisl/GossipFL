@@ -1,6 +1,7 @@
 import logging
 import threading
 import time
+import traceback
 from enum import Enum
 
 from .raft_node import RaftState
@@ -67,26 +68,16 @@ class RaftConsensus:
         # Set callback for state changes
         self.raft_node.on_state_change = self.handle_state_change
         
-        # Heartbeat thread for leaders
+        self.election_timer_thread = None
         self.heartbeat_thread = None
+        self.log_replication_thread = None
+        
+        # Thread stop events
+        self.election_timer_stop_event = threading.Event()
         self.heartbeat_stop_event = threading.Event()
-        self.heartbeat_failed_event = threading.Event()
-
-        # Election thread for all nodes
-        self.election_thread = None
-        self.election_stop_event = threading.Event()
-        self.election_failed_event = threading.Event()
-
-        # Log replication thread for leaders
-        self.replication_thread = None
-        self.replication_stop_event = threading.Event()
-        self.replication_failed_event = threading.Event()
-
-        # Supervisor thread to monitor worker threads
-        self.supervisor_thread = None
-        self.supervisor_stop_event = threading.Event()
-
-        # Lock to protect thread operations
+        self.log_replication_stop_event = threading.Event()
+        
+        # Lock to protect thread operations and state changes
         self.thread_lock = threading.RLock()
         
         # Callback for leadership changes
@@ -95,246 +86,263 @@ class RaftConsensus:
         # Current leader ID (None if unknown)
         self.current_leader_id = None
         
-        # Initialize election timeout checking
-        self.start_election_thread()
-
-        # Start supervisor thread to monitor other threads
-        self.supervisor_stop_event.clear()
-        self.supervisor_thread = threading.Thread(
-            target=self._supervisor_thread_func,
-            name=f"raft-supervisor-{self.raft_node.node_id}",
-            daemon=True
-        )
-        self.supervisor_thread.start()
-
+        # Thread state tracking
+        self.is_running = False
+        
         logging.info(f"RAFT Consensus initialized for node {raft_node.node_id}")
     
     def start(self):
-        """Start the consensus operations."""
-        pass  # Election thread already started in __init__
+        """Start the consensus operations following RAFT paper specification."""
+        with self.thread_lock:
+            if self.is_running:
+                logging.warning(f"Node {self.raft_node.node_id}: Consensus already running")
+                return
+            
+            self.is_running = True
+            
+            # Start election timer thread (always running for followers/candidates)
+            self._start_election_timer_thread()
+            
+            # If we're already a leader, start leader threads
+            if self.raft_node.state == RaftState.LEADER:
+                self._start_leader_threads()
+            
+            logging.info(f"Node {self.raft_node.node_id}: RAFT consensus operations started")
     
     def stop(self):
         """Stop all consensus operations."""
-        logging.info(f"Node {self.raft_node.node_id}: Stopping all consensus operations")
+        logging.info(f"Node {self.raft_node.node_id}: Stopping RAFT consensus operations")
+        
         with self.thread_lock:
-            self.supervisor_stop_event.set()
-            self.election_stop_event.set()
-            self.heartbeat_stop_event.set()
-            self.replication_stop_event.set()
+            if not self.is_running:
+                return
             
-            threads_to_join = []
+            self.is_running = False
             
-            if self.supervisor_thread and self.supervisor_thread.is_alive():
-                threads_to_join.append((self.supervisor_thread, "supervisor"))
-
-            if self.heartbeat_thread and self.heartbeat_thread.is_alive():
-                threads_to_join.append((self.heartbeat_thread, "heartbeat"))
+            # Stop all threads
+            self._stop_all_threads()
             
-            if self.election_thread and self.election_thread.is_alive():
-                threads_to_join.append((self.election_thread, "election"))
-            
-            if self.replication_thread and self.replication_thread.is_alive():
-                threads_to_join.append((self.replication_thread, "replication"))
-            
-            # Join all threads with timeout
-            for thread, name in threads_to_join:
-                thread.join(timeout=1.0)
-                if thread.is_alive():
-                    logging.warning(f"Node {self.raft_node.node_id}: {name} thread did not terminate gracefully")
-            
-            # Reset thread references
-            # [NOTE]: This might lose the reference to running threads.
-            self.heartbeat_thread = None
-            self.election_thread = None
-            self.replication_thread = None
-            self.supervisor_thread = None
-            
-            logging.info(f"Node {self.raft_node.node_id}: All consensus operations stopped")
+            logging.info(f"Node {self.raft_node.node_id}: RAFT consensus operations stopped")
     
     def handle_state_change(self, new_state):
         """
         Handle RAFT node state changes.
         
+        Based on RAFT paper: Leaders start heartbeat/replication threads,
+        followers/candidates only run election timer.
+        
         Args:
             new_state (RaftState): The new state of the node
         """
-        if new_state == RaftState.LEADER:
-            self.start_heartbeat_thread()
-            self.start_replication_thread()
-            self.current_leader_id = self.raft_node.node_id
-            
-            # Notify leadership change
-            if self.on_leadership_change:
-                self.on_leadership_change(self.raft_node.node_id)
+        logging.info(f"Node {self.raft_node.node_id}: State changed to {new_state}")
         
-        elif new_state == RaftState.FOLLOWER or new_state == RaftState.CANDIDATE:
-            self.stop_heartbeat_thread()
-            self.stop_replication_thread()
-    
-    def start_election_thread(self):
-        """Start the election timeout monitoring thread."""
         with self.thread_lock:
-            if self.election_thread and self.election_thread.is_alive():
-                return
-
-            self.election_stop_event.clear()
-            self.election_failed_event.clear()
-            self.election_thread = threading.Thread(
-                target=self._election_thread_func,
-                name=f"raft-election-{self.raft_node.node_id}",
-                daemon=True
-            )
-            self.election_thread.start()
-    
-    def stop_election_thread(self):
-        """Stop the election timeout monitoring thread."""
-        with self.thread_lock:
-            if not self.election_thread or not self.election_thread.is_alive():
-                return
+            if new_state == RaftState.LEADER:
+                self.current_leader_id = self.raft_node.node_id
+                
+                # Start leader-specific threads
+                self._start_leader_threads()
+                
+                # Notify leadership change
+                if self.on_leadership_change:
+                    try:
+                        self.on_leadership_change(self.raft_node.node_id)
+                    except Exception as e:
+                        logging.error(f"Node {self.raft_node.node_id}: Error in leadership change callback: {e}")
             
-            self.election_stop_event.set()
-            self.election_thread.join(timeout=1.0)
-            self.election_thread = None
+            elif new_state in [RaftState.FOLLOWER, RaftState.CANDIDATE]:
+                # Stop leader-specific threads
+                self._stop_leader_threads()
+                
+                # If we were the leader and now we're not, clear our leader status
+                if self.current_leader_id == self.raft_node.node_id:
+                    self.current_leader_id = None
     
-    def start_heartbeat_thread(self):
-        """Start the heartbeat thread (leaders only)."""
-        with self.thread_lock:
-            if self.heartbeat_thread and self.heartbeat_thread.is_alive():
-                return
-
+    def _start_election_timer_thread(self):
+        """Start the election timer thread (always runs for followers/candidates)."""
+        if self.election_timer_thread and self.election_timer_thread.is_alive():
+            return
+        
+        self.election_timer_stop_event.clear()
+        self.election_timer_thread = threading.Thread(
+            target=self._election_timer_thread_func,
+            name=f"raft-election-timer-{self.raft_node.node_id}",
+            daemon=False
+        )
+        self.election_timer_thread.start()
+        logging.debug(f"Node {self.raft_node.node_id}: Started election timer thread")
+    
+    def _start_leader_threads(self):
+        """Start leader-specific threads (heartbeat and log replication)."""
+        if self.raft_node.state != RaftState.LEADER:
+            return
+        
+        # Start heartbeat thread - more robust checking
+        if self.heartbeat_thread is None or not self.heartbeat_thread.is_alive():
+            # Ensure old thread is cleaned up
+            if self.heartbeat_thread is not None:
+                self.heartbeat_stop_event.set()
+                self.heartbeat_thread.join(timeout=0.5)
+            
             self.heartbeat_stop_event.clear()
-            self.heartbeat_failed_event.clear()
             self.heartbeat_thread = threading.Thread(
                 target=self._heartbeat_thread_func,
                 name=f"raft-heartbeat-{self.raft_node.node_id}",
-                daemon=True
+                daemon=False
             )
             self.heartbeat_thread.start()
-    
-    def stop_heartbeat_thread(self):
-        """Stop the heartbeat thread."""
-        with self.thread_lock:
-            if not self.heartbeat_thread or not self.heartbeat_thread.is_alive():
-                return
+            logging.debug(f"Node {self.raft_node.node_id}: Started heartbeat thread")
+        
+        # Start log replication thread - more robust checking  
+        if self.log_replication_thread is None or not self.log_replication_thread.is_alive():
+            # Ensure old thread is cleaned up
+            if self.log_replication_thread is not None:
+                self.log_replication_stop_event.set()
+                self.log_replication_thread.join(timeout=0.5)
             
-            self.heartbeat_stop_event.set()
-            self.heartbeat_thread.join(timeout=1.0)
-            self.heartbeat_thread = None
-    
-    def start_replication_thread(self):
-        """Start the log replication thread (leaders only)."""
-        with self.thread_lock:
-            if self.replication_thread and self.replication_thread.is_alive():
-                return
-
-            self.replication_stop_event.clear()
-            self.replication_failed_event.clear()
-            self.replication_thread = threading.Thread(
-                target=self._replication_thread_func,
-                name=f"raft-replication-{self.raft_node.node_id}",
-                daemon=True
+            self.log_replication_stop_event.clear()
+            self.log_replication_thread = threading.Thread(
+                target=self._log_replication_thread_func,
+                name=f"raft-log-replication-{self.raft_node.node_id}",
+                daemon=False
             )
-            self.replication_thread.start()
+            self.log_replication_thread.start()
+            logging.debug(f"Node {self.raft_node.node_id}: Started log replication thread")
     
-    def stop_replication_thread(self):
-        """Stop the log replication thread."""
-        with self.thread_lock:
-            if not self.replication_thread or not self.replication_thread.is_alive():
-                return
-            
-            self.replication_stop_event.set()
-            self.replication_thread.join(timeout=1.0)
-            self.replication_thread = None
+    def _stop_leader_threads(self):
+        """Stop leader-specific threads."""
+        # Stop heartbeat thread
+        if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+            self.heartbeat_stop_event.set()
+            self.heartbeat_thread.join(timeout=2.0)  # Increased timeout
+            if self.heartbeat_thread.is_alive():
+                logging.error(f"Node {self.raft_node.node_id}: Heartbeat thread did not stop gracefully - forcing termination")
+                # Note: Python doesn't have clean thread termination, so we log the issue
+            self.heartbeat_thread = None
+        
+        # Stop log replication thread
+        if self.log_replication_thread and self.log_replication_thread.is_alive():
+            self.log_replication_stop_event.set()
+            self.log_replication_thread.join(timeout=2.0)  # Increased timeout
+            if self.log_replication_thread.is_alive():
+                logging.error(f"Node {self.raft_node.node_id}: Log replication thread did not stop gracefully - forcing termination")
+                # Note: Python doesn't have clean thread termination, so we log the issue
+            self.log_replication_thread = None
     
-    def _election_thread_func(self):
-        """Thread function to monitor election timeouts."""
+    def _stop_all_threads(self):
+        """Stop all RAFT threads."""
+        # Stop leader threads first
+        self._stop_leader_threads()
+        
+        # Stop election timer thread
+        if self.election_timer_thread and self.election_timer_thread.is_alive():
+            self.election_timer_stop_event.set()
+            self.election_timer_thread.join(timeout=1.0)
+            if self.election_timer_thread.is_alive():
+                logging.warning(f"Node {self.raft_node.node_id}: Election timer thread did not stop gracefully")
+            self.election_timer_thread = None
+    
+    def _election_timer_thread_func(self):
+        """
+        Election timer thread function (RAFT Algorithm requirement).
+        
+        This thread continuously monitors election timeouts for followers and candidates.
+        It's the core of RAFT's leader election mechanism.
+        """
+        logging.info(f"Node {self.raft_node.node_id}: Election timer thread started")
+        
         try:
-            while not self.election_stop_event.is_set():
-                # Leaders don't have election timeouts
+            while not self.election_timer_stop_event.is_set():
+                # Leaders don't need election timeouts
                 if self.raft_node.state == RaftState.LEADER:
                     time.sleep(0.1)
                     continue
                 
-                # Check for election timeout
+                # Check for election timeout (critical RAFT timing)
                 if self.raft_node.is_election_timeout():
-                    logging.info(f"Node {self.raft_node.node_id}: Election timeout detected")
+                    logging.info(f"Node {self.raft_node.node_id}: Election timeout detected, starting election")
                     
-                    # Start a new election
-                    if self.raft_node.start_election():
-                        # Send vote requests to all other nodes
-                        self.request_votes_from_all()
+                    try:
+                        # Start a new election (RAFT Algorithm Step)
+                        if self.raft_node.start_election():
+                            # Send vote requests to all other nodes
+                            self.request_votes_from_all()
+                    except Exception as e:
+                        logging.error(f"Node {self.raft_node.node_id}: Error starting election: {e}")
                 
-                # Sleep for a short time before checking again
-                time.sleep(0.01)  # 10ms check interval
+                # Short sleep to prevent busy waiting (10ms as per RAFT recommendations)
+                time.sleep(0.01)
+                
         except Exception as e:
-            logging.error(f"Node {self.raft_node.node_id}: Error in election thread: {str(e)}")
-            if not self.election_stop_event.is_set():
-                self.election_failed_event.set()
+            logging.error(f"Node {self.raft_node.node_id}: Fatal error in election timer thread: {e}")
+            logging.error(f"Node {self.raft_node.node_id}: Thread traceback: {traceback.format_exc()}")
+        finally:
+            logging.info(f"Node {self.raft_node.node_id}: Election timer thread finished")
     
     def _heartbeat_thread_func(self):
-        """Thread function to send heartbeats (leaders only)."""
+        """
+        Heartbeat thread function (RAFT Algorithm requirement for leaders).
+        
+        Leaders must send periodic heartbeats to prevent followers from timing out
+        and starting unnecessary elections.
+        """
+        logging.info(f"Node {self.raft_node.node_id}: Heartbeat thread started")
+        
         try:
             while not self.heartbeat_stop_event.is_set():
+                # Only leaders send heartbeats
                 if self.raft_node.state != RaftState.LEADER:
                     break
                 
-                # Send heartbeats to all followers
-                self.send_heartbeats()
+                try:
+                    # Send heartbeats to all followers (RAFT Algorithm Step)
+                    self.send_heartbeats()
+                except Exception as e:
+                    logging.error(f"Node {self.raft_node.node_id}: Error sending heartbeats: {e}")
                 
-                # Sleep for heartbeat interval
-                time.sleep(self.raft_node.heartbeat_interval)
+                # Sleep for heartbeat interval (as specified in RAFT paper)
+                heartbeat_interval = self.raft_node.heartbeat_interval / 1000.0  # Convert ms to seconds
+                time.sleep(heartbeat_interval)
+                
         except Exception as e:
-            logging.error(f"Node {self.raft_node.node_id}: Error in heartbeat thread: {str(e)}")
-            if not self.heartbeat_stop_event.is_set() and self.raft_node.state == RaftState.LEADER:
-                self.heartbeat_failed_event.set()
+            logging.error(f"Node {self.raft_node.node_id}: Fatal error in heartbeat thread: {e}")
+            logging.error(f"Node {self.raft_node.node_id}: Thread traceback: {traceback.format_exc()}")
+        finally:
+            logging.info(f"Node {self.raft_node.node_id}: Heartbeat thread finished")
     
-    def _replication_thread_func(self):
-        """Thread function to replicate logs (leaders only)."""
+    def _log_replication_thread_func(self):
+        """
+        Log replication thread function (RAFT Algorithm requirement for leaders).
+        
+        Leaders must continuously try to replicate log entries to followers
+        and update commit indices based on successful replications.
+        """
+        logging.info(f"Node {self.raft_node.node_id}: Log replication thread started")
+        
         try:
-            while not self.replication_stop_event.is_set():
+            while not self.log_replication_stop_event.is_set():
+                # Only leaders replicate logs
                 if self.raft_node.state != RaftState.LEADER:
                     break
                 
-                # Replicate any pending log entries
-                self.replicate_logs()
+                try:
+                    # Replicate logs to followers (RAFT Algorithm Step)
+                    self.replicate_logs()
+                    
+                    # Update commit index based on successful replications
+                    self.raft_node.update_commit_index()
+                    
+                except Exception as e:
+                    logging.error(f"Node {self.raft_node.node_id}: Error in log replication: {e}")
                 
-                # Update commit index based on match indices
-                self.raft_node.update_commit_index()
+                # Sleep for replication interval (50ms as recommended)
+                time.sleep(0.05)
                 
-                # Sleep for a short time before checking again
-                time.sleep(0.05)  # 50ms check interval
         except Exception as e:
-            logging.error(f"Node {self.raft_node.node_id}: Error in replication thread: {str(e)}")
-            if not self.replication_stop_event.is_set() and self.raft_node.state == RaftState.LEADER:
-                self.replication_failed_event.set()
-
-    def _supervisor_thread_func(self):
-        """Monitor worker threads and restart them on failure."""
-        try:
-            while not self.supervisor_stop_event.is_set():
-                if not self.election_stop_event.is_set():
-                    if (self.election_failed_event.is_set() or
-                        not (self.election_thread and self.election_thread.is_alive())):
-                        self.election_failed_event.clear()
-                        self.start_election_thread()
-
-                if (not self.heartbeat_stop_event.is_set() and
-                        self.raft_node.state == RaftState.LEADER):
-                    if (self.heartbeat_failed_event.is_set() or
-                        not (self.heartbeat_thread and self.heartbeat_thread.is_alive())):
-                        self.heartbeat_failed_event.clear()
-                        self.start_heartbeat_thread()
-
-                if (not self.replication_stop_event.is_set() and
-                        self.raft_node.state == RaftState.LEADER):
-                    if (self.replication_failed_event.is_set() or
-                        not (self.replication_thread and self.replication_thread.is_alive())):
-                        self.replication_failed_event.clear()
-                        self.start_replication_thread()
-
-                time.sleep(0.1)
-        except Exception as e:
-            logging.error(f"Node {self.raft_node.node_id}: Supervisor thread error: {str(e)}")
+            logging.error(f"Node {self.raft_node.node_id}: Fatal error in log replication thread: {e}")
+            logging.error(f"Node {self.raft_node.node_id}: Thread traceback: {traceback.format_exc()}")
+        finally:
+            logging.info(f"Node {self.raft_node.node_id}: Log replication thread finished")
     
     def request_votes_from_all(self):
         """Send vote requests to all other nodes."""
@@ -348,12 +356,75 @@ class RaftConsensus:
                 continue  # Skip self
             
             # Send vote request to node
-            self.worker_manager.send_vote_request(
-                node_id,
-                self.raft_node.current_term,
-                last_log_index,
-                last_log_term
-            )
+            try:
+                self.worker_manager.send_vote_request(
+                    node_id,
+                    self.raft_node.current_term,
+                    last_log_index,
+                    last_log_term
+                )
+            except Exception as e:
+                logging.error(f"Node {self.raft_node.node_id}: Error sending vote request to {node_id}: {e}")
+    
+    def send_heartbeats(self):
+        """Send heartbeat messages to all followers."""
+        if self.raft_node.state != RaftState.LEADER:
+            return
+        
+        for node_id in self.raft_node.known_nodes:
+            if node_id == self.raft_node.node_id:
+                continue  # Skip self
+            
+            try:
+                # Send append entries (heartbeat) to follower
+                prev_log_index = self.raft_node.next_index.get(node_id, 1) - 1
+                prev_log_term = 0
+                if prev_log_index > 0 and prev_log_index <= len(self.raft_node.log):
+                    prev_log_term = self.raft_node.log[prev_log_index - 1].get('term', 0)
+                
+                self.worker_manager.send_append_entries(
+                    node_id,
+                    self.raft_node.current_term,
+                    prev_log_index,
+                    prev_log_term,
+                    [],  # Empty entries for heartbeat
+                    self.raft_node.commit_index
+                )
+            except Exception as e:
+                logging.error(f"Node {self.raft_node.node_id}: Error sending heartbeat to {node_id}: {e}")
+    
+    def replicate_logs(self):
+        """Replicate log entries to followers."""
+        if self.raft_node.state != RaftState.LEADER:
+            return
+        
+        for node_id in self.raft_node.known_nodes:
+            if node_id == self.raft_node.node_id:
+                continue  # Skip self
+            
+            try:
+                next_index = self.raft_node.next_index.get(node_id, len(self.raft_node.log) + 1)
+                
+                # If there are new entries to send
+                if next_index <= len(self.raft_node.log):
+                    prev_log_index = next_index - 1
+                    prev_log_term = 0
+                    if prev_log_index > 0:
+                        prev_log_term = self.raft_node.log[prev_log_index - 1].get('term', 0)
+                    
+                    # Get entries to send
+                    entries_to_send = self.raft_node.log[next_index - 1:]
+                    
+                    self.worker_manager.send_append_entries(
+                        node_id,
+                        self.raft_node.current_term,
+                        prev_log_index,
+                        prev_log_term,
+                        entries_to_send,
+                        self.raft_node.commit_index
+                    )
+            except Exception as e:
+                logging.error(f"Node {self.raft_node.node_id}: Error replicating logs to {node_id}: {e}")
     
     def handle_vote_request(self, candidate_id, term, last_log_index, last_log_term):
         """
@@ -389,9 +460,8 @@ class RaftConsensus:
         if became_leader:
             logging.info(f"Node {self.raft_node.node_id} became leader for term {self.raft_node.current_term}")
             
-            # Start heartbeat and replication threads
-            self.start_heartbeat_thread()
-            self.start_replication_thread()
+            # Start leader threads (handled by state change callback)
+            # The handle_state_change method will start the appropriate threads
             
             # Set current leader
             self.current_leader_id = self.raft_node.node_id
@@ -412,69 +482,6 @@ class RaftConsensus:
             'type': 'no-op',
             'timestamp': time.time()
         })
-    
-    def send_heartbeats(self):
-        """Send heartbeats to all followers."""
-        if self.raft_node.state != RaftState.LEADER:
-            return
-        
-        for node_id in self.raft_node.known_nodes:
-            if node_id == self.raft_node.node_id:
-                continue  # Skip self
-            
-            # Get next index for this follower
-            next_idx = self.raft_node.next_index.get(node_id, 1)
-            prev_log_index = next_idx - 1
-            prev_log_term = 0
-            
-            if prev_log_index > 0 and prev_log_index <= len(self.raft_node.log):
-                prev_log_term = self.raft_node.log[prev_log_index - 1]['term']
-            
-            # Empty entries list for heartbeat
-            entries = []
-            
-            # Send AppendEntries RPC
-            self.worker_manager.send_append_entries(
-                node_id,
-                self.raft_node.current_term,
-                prev_log_index,
-                prev_log_term,
-                entries,
-                self.raft_node.commit_index
-            )
-    
-    def replicate_logs(self):
-        """Replicate logs to all followers."""
-        if self.raft_node.state != RaftState.LEADER:
-            return
-        
-        for node_id in self.raft_node.known_nodes:
-            if node_id == self.raft_node.node_id:
-                continue  # Skip self
-            
-            # Get next index for this follower
-            next_idx = self.raft_node.next_index.get(node_id, 1)
-            
-            # If there are entries to send
-            if next_idx <= len(self.raft_node.log):
-                prev_log_index = next_idx - 1
-                prev_log_term = 0
-                
-                if prev_log_index > 0:
-                    prev_log_term = self.raft_node.log[prev_log_index - 1]['term']
-                
-                # Get entries to send
-                entries = self.raft_node.log[prev_log_index:]
-                
-                # Send AppendEntries RPC
-                self.worker_manager.send_append_entries(
-                    node_id,
-                    self.raft_node.current_term,
-                    prev_log_index,
-                    prev_log_term,
-                    entries,
-                    self.raft_node.commit_index
-                )
     
     def handle_append_entries(self, leader_id, term, prev_log_index, prev_log_term, entries, leader_commit):
         """
@@ -915,26 +922,35 @@ class RaftConsensus:
     
     def get_status(self):
         """
-        Get the current status of the RAFT node.
+        Get the current status of the RAFT consensus.
         
         Returns:
-            dict: Status information including state, term, leader, etc.
+            dict: Status information including threading state, node state, etc.
         """
-        with self.raft_node.state_lock:
-            status = {
+        with self.thread_lock:
+            return {
+                'is_running': self.is_running,
                 'node_id': self.raft_node.node_id,
-                'state': self.raft_node.state.name,
+                'node_state': str(self.raft_node.state),
                 'current_term': self.raft_node.current_term,
-                'voted_for': self.raft_node.voted_for,
-                'current_leader': self.current_leader_id,
-                'log_length': len(self.raft_node.log),
+                'current_leader_id': self.current_leader_id,
                 'commit_index': self.raft_node.commit_index,
-                'last_applied': self.raft_node.last_applied,
-                'known_nodes': list(self.raft_node.known_nodes),
+                'log_length': len(self.raft_node.log),
+                'threads': {
+                    'election_timer_alive': self.election_timer_thread.is_alive() if self.election_timer_thread else False,
+                    'heartbeat_alive': self.heartbeat_thread.is_alive() if self.heartbeat_thread else False,
+                    'log_replication_alive': self.log_replication_thread.is_alive() if self.log_replication_thread else False,
+                }
             }
-            
-            if self.raft_node.state == RaftState.LEADER:
-                status['next_indices'] = dict(self.raft_node.next_index)
-                status['match_indices'] = dict(self.raft_node.match_index)
-            
-            return status
+        
+    def __del__(self):
+        """
+        Destructor to ensure proper cleanup of threads.
+        """
+        try:
+            if hasattr(self, 'is_running') and self.is_running:
+                logging.info(f"Node {getattr(self.raft_node, 'node_id', 'unknown')}: Cleaning up RAFT consensus in destructor")
+                self.stop()
+        except Exception as e:
+            # Don't raise exceptions in destructor
+            pass
