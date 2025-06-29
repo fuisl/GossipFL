@@ -472,6 +472,10 @@ class RaftNode:
         """
         Check if candidate's log is at least as up-to-date as this node's log.
         
+        According to RAFT paper section 5.4.1, this method implements the following logic:
+        1. If the logs have last entries with different terms, then the log with the later term is more up-to-date
+        2. If the logs end with the same term, then the longer log is more up-to-date
+        
         Args:
             last_log_index (int): Index of candidate's last log entry
             last_log_term (int): Term of candidate's last log entry
@@ -479,18 +483,49 @@ class RaftNode:
         Returns:
             bool: True if candidate's log is at least as up-to-date
         """
-        # Get this node's last log entry
-        # [FIXME]: This may break if we use log compaction
-        my_last_log_index = len(self.log)
-        my_last_log_term = self.log[my_last_log_index - 1]['term'] if my_last_log_index > 0 else 0
-        
-        # Compare logs
-        if last_log_term > my_last_log_term:
-            return True
-        elif last_log_term == my_last_log_term and last_log_index >= my_last_log_index:
-            return True
-        else:
-            return False
+        with self.state_lock:
+            try:
+                # Get this node's last log entry details
+                my_last_log_index = len(self.log)
+                
+                # Handle empty log case
+                if my_last_log_index == 0:
+                    my_last_log_term = 0
+                    logging.debug(f"Node {self.node_id}: Log is empty, considering any non-empty log more up-to-date")
+                else:
+                    my_last_log_term = self.log[my_last_log_index - 1]['term']
+                
+                # Implement the RAFT log comparison logic:
+                # 1. Compare terms of the last log entries
+                if last_log_term > my_last_log_term:
+                    result = True
+                    reason = f"candidate's last term ({last_log_term}) > our last term ({my_last_log_term})"
+                elif last_log_term < my_last_log_term:
+                    result = False
+                    reason = f"candidate's last term ({last_log_term}) < our last term ({my_last_log_term})"
+                # 2. If terms are equal, compare log lengths
+                elif last_log_index >= my_last_log_index:
+                    result = True
+                    reason = f"same terms but candidate's log length ({last_log_index}) >= our log length ({my_last_log_index})"
+                else:
+                    result = False
+                    reason = f"same terms but candidate's log length ({last_log_index}) < our log length ({my_last_log_index})"
+                
+                # Log the decision with details for debugging
+                log_level = logging.DEBUG
+                if not result:
+                    # Use higher log level for rejections to make them more visible
+                    log_level = logging.INFO
+                
+                logging.log(log_level, f"Node {self.node_id}: Log comparison result: {result}, {reason}")
+                
+                return result
+                
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error comparing logs: {e}")
+                # In case of error, reject the vote by returning False
+                # This is safer than potentially allowing an invalid leader
+                return False
     
     def append_entries(self, leader_id, term, prev_log_index, prev_log_term, entries, leader_commit):
         """
