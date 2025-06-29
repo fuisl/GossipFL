@@ -501,6 +501,16 @@ class RaftConsensus:
         # Send response back to the candidate
         self.worker_manager.send_vote_response(
             candidate_id, current_term, vote_granted)
+
+    def handle_prevote_request(self, candidate_id, term, last_log_index, last_log_term):
+        """Handle a PreVote request from a potential candidate."""
+        current_term, prevote_granted = self.raft_node.receive_prevote_request(
+            candidate_id, term, last_log_index, last_log_term
+        )
+
+        self.worker_manager.send_prevote_response(
+            candidate_id, current_term, prevote_granted
+        )
     
     def handle_vote_response(self, voter_id, term, vote_granted):
         """
