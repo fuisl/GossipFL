@@ -274,11 +274,18 @@ class RaftConsensus:
                     )
                     
                     try:
-                        # Start a new election or prevote. The raft_node
-                        # will broadcast the appropriate requests.
-                        self.raft_node.start_election()
+                        # Start the PreVote phase
+                        last_log_index, last_log_term = self.raft_node.get_last_log_info()
+                        
+                        # Send PreVote requests to all other nodes
+                        self.broadcast_prevote_request(
+                            self.raft_node.node_id,
+                            self.raft_node.current_term + 1,  # PreVote for next term
+                            last_log_index,
+                            last_log_term
+                        )
                     except Exception as e:
-                        logging.error(f"Node {self.raft_node.node_id}: Error starting election: {e}")
+                        logging.error(f"Node {self.raft_node.node_id}: Error starting PreVote: {e}")
                 
                 # Short sleep to prevent busy waiting (10ms as per RAFT recommendations)
                 time.sleep(0.01)
