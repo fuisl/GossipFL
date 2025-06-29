@@ -124,8 +124,23 @@ class RaftNode:
         logging.debug(f"Node {self.node_id}: Reset election timeout to {self.election_timeout*1000:.2f}ms")
     
     def update_heartbeat(self):
-        """Update the last heartbeat time."""
-        self.last_heartbeat_time = time.time()
+        """
+        Update the last heartbeat time.
+        
+        This method records when the last heartbeat was received, which is used
+        to detect leader failures and trigger elections.
+        """
+        with self.state_lock:
+            # Update the heartbeat timestamp
+            try:
+                self.last_heartbeat_time = time.time()
+                logging.debug(f"Node {self.node_id}: Updated heartbeat time, election timeout in {self.election_timeout*1000:.2f}ms")
+                
+                # If we're in INITIAL state and receiving heartbeats, we may need to transition to FOLLOWER
+                if self.state == RaftState.INITIAL:
+                    logging.debug(f"Node {self.node_id}: Received heartbeat while in INITIAL state")
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error updating heartbeat time: {e}")
     
     def is_election_timeout(self):
         """Check if election timeout has occurred."""
