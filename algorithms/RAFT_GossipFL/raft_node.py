@@ -244,30 +244,66 @@ class RaftNode:
             tuple: (term, vote_granted)
         """
         with self.state_lock:
-            # Do not participate in elections before initialization
-            if self.state == RaftState.INITIAL:
-                return self.current_term, False
+            try:
+                # Validate the candidate
+                if candidate_id not in self.known_nodes:
+                    logging.warning(f"Node {self.node_id}: Received vote request from unknown node {candidate_id}")
+                    return self.current_term, False
+                
+                # Do not participate in elections before initialization
+                if self.state == RaftState.INITIAL:
+                    logging.debug(f"Node {self.node_id}: Cannot vote in INITIAL state, request from {candidate_id} for term {term}")
+                    return self.current_term, False
+                
+                # If term < currentTerm, reject immediately
+                if term < self.current_term:
+                    logging.debug(f"Node {self.node_id}: Rejected vote for {candidate_id}, term {term} < current term {self.current_term}")
+                    return self.current_term, False
 
-            # If term > currentTerm, convert to follower
-            if term > self.current_term:
-                self.become_follower(term)
-            
-            # Check if vote can be granted
-            vote_granted = False
-            if (term == self.current_term and 
-                (self.voted_for is None or self.voted_for == candidate_id) and
-                self.is_log_up_to_date(last_log_index, last_log_term)):
+                # If term > currentTerm, convert to follower
+                if term > self.current_term:
+                    logging.debug(f"Node {self.node_id}: Converting to follower due to higher term from {candidate_id}: {term} > {self.current_term}")
+                    self.become_follower(term)
+                    # Note: voted_for is reset in become_follower(), so we continue to evaluate the vote request
                 
-                # Grant vote
-                self.voted_for = candidate_id
-                vote_granted = True
+                # Leaders should not grant votes (this is a safeguard)
+                if self.state == RaftState.LEADER and term == self.current_term:
+                    logging.warning(f"Node {self.node_id}: Leader for term {self.current_term} refusing to vote for {candidate_id}")
+                    return self.current_term, False
                 
-                # Reset election timeout when granting vote
-                self.update_heartbeat()
+                # Check if vote can be granted:
+                # 1. Our term matches the candidate's term
+                # 2. We haven't voted for anyone else this term (or we already voted for this candidate)
+                # 3. The candidate's log is at least as up-to-date as ours
+                vote_granted = False
+                if (term == self.current_term and 
+                    (self.voted_for is None or self.voted_for == candidate_id) and
+                    self.is_log_up_to_date(last_log_index, last_log_term)):
+                    
+                    # Grant vote
+                    self.voted_for = candidate_id
+                    vote_granted = True
+                    
+                    # Reset election timeout when granting vote
+                    self.update_heartbeat()
+                    
+                    logging.info(f"Node {self.node_id}: Granted vote to {candidate_id} for term {term}")
+                else:
+                    # Log the reason for rejection
+                    if term != self.current_term:
+                        reason = f"term mismatch: candidate term {term} != current term {self.current_term}"
+                    elif self.voted_for is not None and self.voted_for != candidate_id:
+                        reason = f"already voted for {self.voted_for} this term"
+                    else:
+                        reason = "candidate's log is not up-to-date"
+                    
+                    logging.debug(f"Node {self.node_id}: Rejected vote for {candidate_id} - {reason}")
                 
-                logging.info(f"Node {self.node_id}: Granted vote to {candidate_id} for term {term}")
-            
-            return self.current_term, vote_granted
+                return self.current_term, vote_granted
+                
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error processing vote request from {candidate_id}: {e}")
+                return self.current_term, False
     
     def receive_vote_response(self, voter_id, term, vote_granted):
         """
