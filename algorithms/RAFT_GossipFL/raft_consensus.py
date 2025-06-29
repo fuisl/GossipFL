@@ -64,6 +64,9 @@ class RaftConsensus:
             self.raft_node.bandwidth_manager = bandwidth_manager
         if topology_manager:
             self.raft_node.topology_manager = topology_manager
+
+        # Allow the raft_node to access consensus callbacks
+        self.raft_node.consensus_manager = self
         
         # Set callback for state changes
         self.raft_node.on_state_change = self.handle_state_change
@@ -91,6 +94,9 @@ class RaftConsensus:
         
         # Thread state tracking
         self.is_running = False
+
+        # Interval between log replication attempts
+        self.replication_interval = getattr(args, "replication_interval", self.raft_node.heartbeat_interval)
         
         logging.info(f"RAFT Consensus initialized for node {raft_node.node_id}")
     
@@ -268,10 +274,9 @@ class RaftConsensus:
                     )
                     
                     try:
-                        # Start a new election (RAFT Algorithm Step)
-                        if self.raft_node.start_election():
-                            # Send vote requests to all other nodes
-                            self.request_votes_from_all()
+                        # Start a new election or prevote. The raft_node
+                        # will broadcast the appropriate requests.
+                        self.raft_node.start_election()
                     except Exception as e:
                         logging.error(f"Node {self.raft_node.node_id}: Error starting election: {e}")
                 
@@ -340,8 +345,8 @@ class RaftConsensus:
                 except Exception as e:
                     logging.error(f"Node {self.raft_node.node_id}: Error in log replication: {e}")
                 
-                # Sleep for replication interval (50ms as recommended)
-                time.sleep(0.05)
+                # Sleep for configured replication interval
+                time.sleep(self.replication_interval)
                 
         except Exception as e:
             logging.error(f"Node {self.raft_node.node_id}: Fatal error in log replication thread: {e}")
@@ -395,20 +400,18 @@ class RaftConsensus:
         for node_id in self.raft_node.known_nodes:
             if node_id == self.raft_node.node_id:
                 continue  # Skip self
-            
-            try:
-                prev_log_index = self.raft_node.next_index.get(
-                    node_id, self.raft_node.first_log_index + len(self.raft_node.log)
-                ) - 1
 
-                if prev_log_index == self.raft_node.last_snapshot_index:
-                    prev_log_term = self.raft_node.last_snapshot_term
-                elif prev_log_index >= self.raft_node.first_log_index:
-                    prev_log_term = self.raft_node.log[
-                        prev_log_index - self.raft_node.first_log_index
-                    ]["term"]
-                else:
-                    prev_log_term = 0
+            try:
+                next_index = self.raft_node.next_index.get(
+                    node_id, self.raft_node.first_log_index + len(self.raft_node.log)
+                )
+
+                if next_index <= self.raft_node.last_snapshot_index:
+                    self._send_snapshot(node_id)
+                    continue
+
+                prev_log_index = next_index - 1
+                prev_log_term = self.raft_node.get_term_at_index(prev_log_index)
                 
                 self.worker_manager.send_append_entries(
                     node_id,
@@ -444,14 +447,7 @@ class RaftConsensus:
                 entries_to_send = self.raft_node.log[array_idx:]
 
                 prev_log_index = next_index - 1
-                if prev_log_index == self.raft_node.last_snapshot_index:
-                    prev_log_term = self.raft_node.last_snapshot_term
-                elif prev_log_index >= self.raft_node.first_log_index:
-                    prev_log_term = self.raft_node.log[
-                        prev_log_index - self.raft_node.first_log_index
-                    ]["term"]
-                else:
-                    prev_log_term = 0
+                prev_log_term = self.raft_node.get_term_at_index(prev_log_index)
 
                 self.worker_manager.send_append_entries(
                     node_id,
@@ -463,6 +459,23 @@ class RaftConsensus:
                 )
             except Exception as e:
                 logging.error(f"Node {self.raft_node.node_id}: Error replicating logs to {node_id}: {e}")
+
+    def _send_snapshot(self, node_id):
+        """Send a snapshot of the current state to the given follower."""
+        try:
+            self.worker_manager.send_state_snapshot(
+                node_id,
+                self.raft_node.current_term,
+                self.raft_node.log,
+                self.raft_node.commit_index,
+            )
+            logging.debug(
+                f"Node {self.raft_node.node_id}: Sent snapshot to follower {node_id}"
+            )
+        except Exception as e:
+            logging.error(
+                f"Node {self.raft_node.node_id}: Error sending snapshot to {node_id}: {e}"
+            )
     
     def handle_vote_request(self, candidate_id, term, last_log_index, last_log_term):
         """
@@ -574,8 +587,12 @@ class RaftConsensus:
             self.raft_node.install_snapshot_chunk(
                 last_incl_idx, last_incl_term, offset, data, done
             )
-            self.worker_manager.send_install_snapshot_response(
-                leader_id, self.raft_node.current_term
+            # Acknowledge snapshot reception using existing snapshot message
+            self.worker_manager.send_state_snapshot(
+                leader_id,
+                self.raft_node.current_term,
+                [],
+                self.raft_node.commit_index,
             )
         except Exception as e:
             logging.error(
@@ -866,9 +883,16 @@ class RaftConsensus:
                 'raft_commit_index': self.raft_node.commit_index
             }
             
+            # Determine the last index available in our log
+            last_index = self.raft_node.first_log_index + len(self.raft_node.log) - 1
+            start_index = min(self.raft_node.commit_index, last_index)
+
             # Search through committed log entries from most recent to oldest
-            for idx in range(min(self.raft_node.commit_index, len(self.raft_node.log)) - 1, -1, -1):
-                entry = self.raft_node.log[idx]
+            for log_index in range(start_index, self.raft_node.first_log_index - 1, -1):
+                array_idx = log_index - self.raft_node.first_log_index
+                if array_idx < 0 or array_idx >= len(self.raft_node.log):
+                    continue
+                entry = self.raft_node.log[array_idx]
                 entry_type = entry.get('type')
                 entry_data = entry.get('data', {})
                 
@@ -999,9 +1023,15 @@ class RaftConsensus:
             numpy.ndarray or None: The topology matrix if found, None otherwise
         """
         with self.raft_node.state_lock:
+            last_index = self.raft_node.first_log_index + len(self.raft_node.log) - 1
+            end_index = min(self.raft_node.commit_index, last_index)
+
             # Search through committed log entries
-            for idx in range(self.raft_node.commit_index):
-                entry = self.raft_node.log[idx]
+            for log_index in range(self.raft_node.first_log_index, end_index + 1):
+                array_idx = log_index - self.raft_node.first_log_index
+                if array_idx < 0 or array_idx >= len(self.raft_node.log):
+                    continue
+                entry = self.raft_node.log[array_idx]
                 if entry.get('type') == 'topology':
                     data = entry.get('data', {})
                     if data.get('round') == round_number:
@@ -1021,9 +1051,15 @@ class RaftConsensus:
         latest_bandwidth = None
         
         with self.raft_node.state_lock:
+            last_index = self.raft_node.first_log_index + len(self.raft_node.log) - 1
+            end_index = min(self.raft_node.commit_index, last_index)
+
             # Search through committed log entries
-            for idx in range(self.raft_node.commit_index):
-                entry = self.raft_node.log[idx]
+            for log_index in range(self.raft_node.first_log_index, end_index + 1):
+                array_idx = log_index - self.raft_node.first_log_index
+                if array_idx < 0 or array_idx >= len(self.raft_node.log):
+                    continue
+                entry = self.raft_node.log[array_idx]
                 if entry.get('type') == 'bandwidth':
                     data = entry.get('data', {})
                     timestamp = data.get('timestamp', 0)

@@ -1257,6 +1257,21 @@ class RaftNode:
                 else:
                     return self.last_snapshot_index, self.last_snapshot_term
         return last_log_index, last_log_term
+
+    def get_term_at_index(self, index):
+        """Get the term of the log entry at the given absolute index."""
+        with self.state_lock:
+            if index == self.last_snapshot_index:
+                return self.last_snapshot_term
+
+            if index < self.first_log_index:
+                return 0
+
+            array_idx = index - self.first_log_index
+            if array_idx < 0 or array_idx >= len(self.log):
+                return 0
+
+            return self.log[array_idx]["term"]
     
     def add_node(self, new_node_id, round_num=0):
         """
@@ -1267,17 +1282,21 @@ class RaftNode:
             round_num (int, optional): Current training round number
             
         Returns:
-            bool: True if successful, False otherwise
+            int: Log index of the membership entry, or -1 on failure
         """
         with self.state_lock:
             try:
                 if self.state != RaftState.LEADER:
-                    logging.warning(f"Node {self.node_id}: Cannot add node {new_node_id} - not a leader")
-                    return False
+                    logging.warning(
+                        f"Node {self.node_id}: Cannot add node {new_node_id} - not a leader"
+                    )
+                    return -1
                     
                 if new_node_id in self.known_nodes:
-                    logging.debug(f"Leader {self.node_id}: Node {new_node_id} already in cluster, no action needed")
-                    return True  # Node already known
+                    logging.debug(
+                        f"Leader {self.node_id}: Node {new_node_id} already in cluster, no action needed"
+                    )
+                    return -1  # Already known, nothing appended
                 
                 # Make a copy of current nodes for the log entry (for consistency)
                 current_nodes = set(self.known_nodes)
@@ -1306,15 +1325,17 @@ class RaftNode:
                         del self.next_index[new_node_id]
                     if new_node_id in self.match_index:
                         del self.match_index[new_node_id]
-                    return False
+                    return -1
                 
                 # Only update known_nodes after successful log entry creation
                 # The actual change will be applied when the entry is committed
                 self.known_nodes.add(new_node_id)
                 self.update_known_nodes(len(self.known_nodes))
                 
-                logging.info(f"Leader {self.node_id}: Added new node {new_node_id} to cluster at round {round_num}")
-                return True
+                logging.info(
+                    f"Leader {self.node_id}: Added new node {new_node_id} to cluster at round {round_num}"
+                )
+                return log_index
                 
             except Exception as e:
                 logging.error(f"Leader {self.node_id}: Error adding node {new_node_id}: {e}", exc_info=True)
@@ -1323,7 +1344,7 @@ class RaftNode:
                     del self.next_index[new_node_id]
                 if new_node_id in self.match_index:
                     del self.match_index[new_node_id]
-                return False
+                return -1
     
     def remove_node(self, node_id, round_num=0, reason="unspecified"):
         """
@@ -1335,17 +1356,21 @@ class RaftNode:
             reason (str, optional): Reason for node removal (e.g., "timeout", "failure", "voluntary")
             
         Returns:
-            bool: True if successful, False otherwise
+            int: Log index of the membership entry, or -1 on failure
         """
         with self.state_lock:
             try:
                 if self.state != RaftState.LEADER:
-                    logging.warning(f"Node {self.node_id}: Cannot remove node {node_id} - not a leader")
-                    return False
+                    logging.warning(
+                        f"Node {self.node_id}: Cannot remove node {node_id} - not a leader"
+                    )
+                    return -1
                     
                 if node_id not in self.known_nodes:
-                    logging.debug(f"Leader {self.node_id}: Node {node_id} not in cluster, no action needed")
-                    return True  # Node already removed
+                    logging.debug(
+                        f"Leader {self.node_id}: Node {node_id} not in cluster, no action needed"
+                    )
+                    return -1  # Already removed
                 
                 # Make a copy of current nodes for the log entry (for consistency)
                 current_nodes = set(self.known_nodes)
@@ -1363,8 +1388,10 @@ class RaftNode:
                 })
                 
                 if log_index == -1:
-                    logging.error(f"Leader {self.node_id}: Failed to add log entry for node removal")
-                    return False
+                    logging.error(
+                        f"Leader {self.node_id}: Failed to add log entry for node removal"
+                    )
+                    return -1
                 
                 # Only update state after successful log entry creation
                 # The actual change will be applied when the entry is committed
@@ -1383,12 +1410,14 @@ class RaftNode:
                     # The actual coordinator change would typically be handled elsewhere
                     # but we note it here for visibility
                 
-                logging.info(f"Leader {self.node_id}: Removed node {node_id} from cluster at round {round_num} (reason: {reason})")
-                return True
+                logging.info(
+                    f"Leader {self.node_id}: Removed node {node_id} from cluster at round {round_num} (reason: {reason})"
+                )
+                return log_index
                 
             except Exception as e:
                 logging.error(f"Leader {self.node_id}: Error removing node {node_id}: {e}", exc_info=True)
-                return False
+                return -1
     
     def update_commit_index(self):
         """
