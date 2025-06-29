@@ -15,6 +15,7 @@ class RaftMessage:
     MSG_TYPE_RAFT_LEADER_REDIRECT = 109
     MSG_TYPE_RAFT_PREVOTE_REQUEST = 110
     MSG_TYPE_RAFT_PREVOTE_RESPONSE = 111
+    MSG_TYPE_RAFT_INSTALL_SNAPSHOT = 112
     
     # Message arguments
     MSG_ARG_KEY_TYPE = "msg_type"
@@ -35,6 +36,13 @@ class RaftMessage:
     MSG_ARG_MATCH_INDEX = "match_index"
     MSG_ARG_LOG = "log"
     MSG_ARG_COMMIT_INDEX = "commit_index"
+
+    # Install snapshot arguments
+    MSG_ARG_LAST_INCLUDED_INDEX = "last_included_index"
+    MSG_ARG_LAST_INCLUDED_TERM = "last_included_term"
+    MSG_ARG_OFFSET = "offset"
+    MSG_ARG_DATA = "data"
+    MSG_ARG_DONE = "done"
 
     # Initialization / parameter exchange
     MSG_ARG_MODEL_PARAMS = "model_params"
