@@ -1298,28 +1298,82 @@ class RaftNode:
     def update_commit_index(self):
         """
         Update commit index based on match_index (leaders only).
+        
+        According to the RAFT paper (section 5.3 and 5.4.2), the leader:
+        1. Maintains a matchIndex for each follower, indicating the highest
+           log entry known to be replicated on that follower
+        2. Uses this information to advance the commitIndex when an entry
+           is replicated on a majority of servers
+        3. Only commits entries from the current term
+        
+        This method implements these rules and also handles log compaction.
         """
-        if self.state != RaftState.LEADER:
-            return
-            
-        # Find the highest index that is replicated on a majority of servers
-        for n in range(len(self.log), 0, -1):
-            # Only commit entries from current term
-            if self.log[n - 1]['term'] != self.current_term:
-                continue
+        with self.state_lock:
+            try:
+                if self.state != RaftState.LEADER:
+                    return
                 
-            # Count replications
-            count = 1  # Leader itself
-            for node_id in self.match_index:
-                if self.match_index[node_id] >= n:
-                    count += 1
+                # If no followers, we still commit our own entries
+                if len(self.known_nodes) == 1:  # Only the leader itself
+                    # Calculate how many entries can be committed
+                    last_log_index, _ = self.get_last_log_info()
+                    if last_log_index > self.commit_index:
+                        old_commit_index = self.commit_index
+                        self.commit_index = last_log_index
+                        logging.info(f"Single-node leader {self.node_id}: Updated commit index from {old_commit_index} to {last_log_index}")
+                        self.apply_committed_entries()
+                    return
+                
+                # Calculate majority needed for commitment
+                majority = (len(self.known_nodes) // 2) + 1
+                
+                # Instead of iterating through all entries, start from the highest match index
+                # among followers and work backwards
+                potential_commit_indices = sorted([idx for idx in self.match_index.values()], reverse=True)
+                # Add leader's own last index
+                last_log_index, _ = self.get_last_log_info()
+                potential_commit_indices.insert(0, last_log_index)
+                
+                # Keep track of highest index that can be committed
+                highest_committable_index = self.commit_index
+                
+                # Check each potential commit index
+                for potential_index in potential_commit_indices:
+                    # Skip indices we've already committed or those below what we're considering
+                    if potential_index <= self.commit_index or potential_index <= highest_committable_index:
+                        continue
+                    
+                    # Skip indices that aren't in our log (could happen after compaction)
+                    log_array_idx = potential_index - self.first_log_index
+                    if log_array_idx < 0 or log_array_idx >= len(self.log):
+                        continue
+                    
+                    # Only commit entries from current term (RAFT safety property)
+                    if self.log[log_array_idx]['term'] != self.current_term:
+                        continue
+                    
+                    # Count replications (including leader itself)
+                    count = 1  # Leader itself
+                    for follower_id, match_idx in self.match_index.items():
+                        if match_idx >= potential_index:
+                            count += 1
+                    
+                    # If majority, this index can be committed
+                    if count >= majority:
+                        highest_committable_index = potential_index
+                        break  # Found highest committable index
+                
+                # Update commit index if we found a higher committable index
+                if highest_committable_index > self.commit_index:
+                    old_commit_index = self.commit_index
+                    self.commit_index = highest_committable_index
+                    
+                    # Apply the newly committed entries
+                    logging.info(f"Leader {self.node_id}: Updated commit index from {old_commit_index} to {highest_committable_index} (replicated on {count}/{len(self.known_nodes)} nodes)")
+                    self.apply_committed_entries()
             
-            # If majority, update commit index
-            if count >= self.majority and n > self.commit_index:
-                self.commit_index = n
-                self.apply_committed_entries()
-                logging.info(f"Leader {self.node_id}: Updated commit index to {n}")
-                break
+            except Exception as e:
+                logging.error(f"Leader {self.node_id}: Error updating commit index: {e}", exc_info=True)
     
     def get_current_timestamp(self):
         """Get the current timestamp."""
