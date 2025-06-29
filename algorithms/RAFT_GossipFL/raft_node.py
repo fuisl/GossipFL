@@ -47,6 +47,12 @@ class RaftNode:
         self.commit_index = 0
         self.last_applied = 0
         
+        # Log compaction state
+        self.log_compaction_threshold = getattr(args, 'raft_log_compaction_threshold', 100)  # default 100 entries
+        self.first_log_index = 1  # Index of the first entry in log (changes with compaction)
+        self.last_snapshot_index = 0  # Index of last entry in the snapshot
+        self.last_snapshot_term = 0  # Term of last entry in the snapshot
+        
         # Leader state (initialized when becoming leader)
         self.next_index = {}  # {node_id: next_log_index, ...}
         self.match_index = {}  # {node_id: match_index, ...}
@@ -531,73 +537,273 @@ class RaftNode:
         """
         Handle AppendEntries RPC from leader.
         
+        This is the core mechanism for log replication in the RAFT consensus algorithm.
+        It handles both heartbeats (empty entries) and actual log replication.
+        
         Args:
-            leader_id (int): ID of the leader
-            term (int): Leader's term
+            leader_id (int): ID of the leader sending the request
+            term (int): Leader's current term
             prev_log_index (int): Index of log entry immediately preceding new ones
             prev_log_term (int): Term of prev_log_index entry
-            entries (list): List of log entries to append
+            entries (list): List of log entries to append (empty for heartbeats)
             leader_commit (int): Leader's commit index
             
         Returns:
-            tuple: (term, success)
+            tuple: (current_term, success) - current_term is for the leader to update its term
+                  if needed, success indicates whether the append was successful
         """
         with self.state_lock:
-            # If the node is uninitialized, accept the leader and convert to follower
-            if self.state == RaftState.INITIAL:
-                self.become_follower(term)
+            try:
+                # Log heartbeat/append request at appropriate level
+                is_heartbeat = not entries
+                log_level = logging.DEBUG if is_heartbeat else logging.INFO
+                logging.log(log_level, 
+                           f"Node {self.node_id}: Received {'heartbeat' if is_heartbeat else 'AppendEntries'} " +
+                           f"from leader {leader_id} for term {term} " +
+                           f"(prev_idx={prev_log_index}, prev_term={prev_log_term}, " +
+                           f"entries={len(entries) if entries else 0}, leader_commit={leader_commit})")
+                
+                # --- Step 1: State validation and updates ---
+                
+                # If the node is uninitialized, accept the leader and convert to follower
+                if self.state == RaftState.INITIAL:
+                    logging.info(f"Node {self.node_id}: Converting from INITIAL to FOLLOWER on receiving AppendEntries")
+                    self.become_follower(term)
 
-            # If term < currentTerm, reject
-            if term < self.current_term:
-                return self.current_term, False
-            
-            # If term > currentTerm, convert to follower
-            if term > self.current_term:
-                self.become_follower(term)
-            
-            # This is a valid AppendEntries from current leader, so reset election timeout
-            self.update_heartbeat()
-            
-            # If we were a candidate, step down
-            if self.state == RaftState.CANDIDATE:
-                self.become_follower(term)
-            
-            # Log consistency check
-            log_ok = (prev_log_index == 0 or
-                     (prev_log_index <= len(self.log) and
-                      (prev_log_index == 0 or self.log[prev_log_index - 1]['term'] == prev_log_term)))
-            
-            if not log_ok:
-                return self.current_term, False
-            
-            # Process entries
-            # Checking if entries is not None and not empty
-            if entries:
-                # Handle conflicts
-                for i, entry in enumerate(entries):
-                    idx = prev_log_index + i + 1
+                # If term < currentTerm, reject
+                if term < self.current_term:
+                    logging.info(f"Node {self.node_id}: Rejecting AppendEntries with term {term} < current term {self.current_term}")
+                    return self.current_term, False
+                
+                # If term > currentTerm, convert to follower
+                if term > self.current_term:
+                    logging.info(f"Node {self.node_id}: Converting to follower due to higher term from leader {leader_id}")
+                    self.become_follower(term)
+                
+                # This is a valid AppendEntries from current leader, reset election timeout
+                self.update_heartbeat()
+                
+                # If we were a candidate, step down
+                if self.state == RaftState.CANDIDATE:
+                    logging.info(f"Node {self.node_id}: Stepping down from candidate due to valid leader for term {term}")
+                    self.become_follower(term)
+                
+                # --- Step 2: Log consistency check ---
+                
+                # Check if our log has the entry at prev_log_index with term prev_log_term
+                # Special case: prev_log_index = 0 means we're starting from the beginning
+                if prev_log_index == 0:
+                    log_ok = True
+                    reason = "starting from beginning of log"
+                elif prev_log_index > len(self.log):
+                    log_ok = False
+                    reason = f"prev_log_index ({prev_log_index}) > log length ({len(self.log)})"
+                elif self.log[prev_log_index - 1]['term'] != prev_log_term:
+                    log_ok = False
+                    reason = f"term mismatch at prev_log_index: expected {prev_log_term}, found {self.log[prev_log_index - 1]['term']}"
+                else:
+                    log_ok = True
+                    reason = "log consistency check passed"
+                
+                logging.log(logging.INFO if not log_ok else logging.DEBUG, 
+                           f"Node {self.node_id}: Log consistency check: {log_ok}, {reason}")
+                
+                if not log_ok:
+                    # For future log compaction support, we might return nextIndex hint here
+                    return self.current_term, False
+                
+                # --- Step 3: Process entries ---
+                
+                # Only process entries if we received any
+                if entries:
+                    # Track if log was modified for logging purposes
+                    log_modified = False
+                    truncated = False
+                    appended = 0
                     
-                    # If new entry, append
-                    if idx > len(self.log):
-                        self.log.append(entry)
-                    # If conflict, truncate log and append new entry
-                    elif self.log[idx - 1]['term'] != entry['term']:
-                        self.log = self.log[:idx - 1]
-                        self.log.append(entry)
-                    # Otherwise entry already exists
-              # Update commit index
-            if leader_commit > self.commit_index:
-                self.commit_index = min(leader_commit, len(self.log))
-                self.apply_committed_entries()
-            
-            return self.current_term, True
+                    # Process each entry
+                    for i, entry in enumerate(entries):
+                        # Calculate the absolute index for this entry
+                        idx = prev_log_index + i + 1
+                        
+                        # Case 1: This entry goes beyond our log, so append it
+                        if idx > len(self.log):
+                            self.log.append(entry)
+                            log_modified = True
+                            appended += 1
+                        # Case 2: This entry conflicts with our log, truncate and append
+                        elif self.log[idx - 1]['term'] != entry['term']:
+                            self.log = self.log[:idx - 1]  # Truncate log
+                            self.log.append(entry)
+                            log_modified = True
+                            truncated = True
+                            appended = 1
+                            # We've truncated, so all further entries will be appends
+                        # Case 3: Entry already exists in our log with the same term
+                        # No action needed, entry already exists
+                    
+                    # Log what happened for debugging
+                    if log_modified:
+                        log_msg = f"Node {self.node_id}: Log updated: "
+                        if truncated:
+                            log_msg += f"truncated to index {prev_log_index}, "
+                        log_msg += f"appended {appended} entries"
+                        logging.info(log_msg)
+                
+                # --- Step 4: Update commit index ---
+                
+                # Update commit index if leader's commit index is higher
+                if leader_commit > self.commit_index:
+                    old_commit_index = self.commit_index
+                    self.commit_index = min(leader_commit, len(self.log))
+                    
+                    if self.commit_index > old_commit_index:
+                        logging.info(f"Node {self.node_id}: Updated commit index from {old_commit_index} to {self.commit_index}")
+                        self.apply_committed_entries()
+                
+                return self.current_term, True
+                
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error processing AppendEntries: {e}", exc_info=True)
+                # On error, it's safer to reject the append
+                return self.current_term, False
+    
+    def compact_log(self, up_to_index=None):
+        """
+        Compact the log by creating a snapshot up to the given index.
+        
+        This method implements log compaction according to section 7 of the RAFT paper.
+        It removes entries up to the specified index (or commit_index if not specified)
+        and updates state variables to reflect the new log beginning.
+        
+        Args:
+            up_to_index (int, optional): Last log index to include in the snapshot.
+                                        If not provided, uses commit_index.
+        
+        Returns:
+            bool: True if compaction was performed, False otherwise
+        """
+        with self.state_lock:
+            try:
+                # Determine compaction index (never compact beyond commit_index for safety)
+                if up_to_index is None:
+                    # Default to commit_index to ensure we don't lose uncommitted entries
+                    up_to_index = self.commit_index
+                else:
+                    # Don't compact beyond commit_index
+                    up_to_index = min(up_to_index, self.commit_index)
+                
+                # Don't compact if there's nothing to compact
+                if up_to_index <= self.last_snapshot_index:
+                    logging.debug(f"Node {self.node_id}: Skipping log compaction, no new entries to compact " +
+                                 f"(up_to_index={up_to_index}, last_snapshot_index={self.last_snapshot_index})")
+                    return False
+                
+                # Don't compact if the log isn't long enough yet
+                current_log_size = len(self.log)
+                if current_log_size < self.log_compaction_threshold:
+                    logging.debug(f"Node {self.node_id}: Skipping log compaction, log not full yet " +
+                                 f"({current_log_size}/{self.log_compaction_threshold} entries)")
+                    return False
+                
+                # Adjust for real index in log array
+                array_index = up_to_index - self.first_log_index
+                
+                if array_index < 0 or array_index >= len(self.log):
+                    logging.warning(f"Node {self.node_id}: Invalid compaction index: {up_to_index} " +
+                                  f"(first_log_index={self.first_log_index}, log length={len(self.log)})")
+                    return False
+                
+                # Save the term of the last included entry
+                last_included_term = self.log[array_index]['term']
+                
+                # In a real implementation, we would serialize the state machine up to this point
+                # For this implementation, we'll just note what would be in the snapshot
+                
+                logging.info(f"Node {self.node_id}: Compacting log up to index {up_to_index} (term {last_included_term}), " +
+                           f"removing {array_index + 1} entries")
+                
+                # Update snapshot metadata
+                self.last_snapshot_index = up_to_index
+                self.last_snapshot_term = last_included_term
+                
+                # Remove compacted entries from log
+                self.log = self.log[array_index + 1:]
+                
+                # Update first_log_index to reflect the new beginning of the log
+                self.first_log_index = up_to_index + 1
+                
+                logging.debug(f"Node {self.node_id}: Log compaction complete. New log size: {len(self.log)}, " +
+                            f"first_log_index: {self.first_log_index}")
+                
+                return True
+                
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error during log compaction: {e}", exc_info=True)
+                return False
+    
+    def check_and_compact_log(self):
+        """
+        Check if log needs compaction and perform it if necessary.
+        
+        This method is intended to be called periodically to keep the log size manageable.
+        """
+        # Only compact if log exceeds the threshold
+        if len(self.log) >= self.log_compaction_threshold:
+            # Compact up to last_applied to ensure we keep all data needed for catching up
+            return self.compact_log(self.last_applied)
+        return False
     
     def apply_committed_entries(self):
-        """Apply committed but not yet applied log entries."""
-        while self.last_applied < self.commit_index:
-            self.last_applied += 1
-            entry = self.log[self.last_applied - 1]
-            self.apply_log_entry(entry)
+        """
+        Apply committed but not yet applied log entries.
+        
+        This method iterates through all committed but not yet applied entries
+        and applies them to the state machine. It also checks if log compaction
+        should be performed after applying entries.
+        """
+        entries_applied = 0
+        
+        try:
+            while self.last_applied < self.commit_index:
+                self.last_applied += 1
+                
+                # Calculate actual index in the log array
+                log_array_index = self.last_applied - self.first_log_index
+                
+                # Skip if this entry is in the snapshot (already applied)
+                if self.last_applied <= self.last_snapshot_index:
+                    logging.debug(f"Node {self.node_id}: Skipping entry {self.last_applied} (in snapshot)")
+                    continue
+                    
+                # Check if entry exists in current log
+                if log_array_index < 0 or log_array_index >= len(self.log):
+                    logging.error(f"Node {self.node_id}: Cannot apply entry at index {self.last_applied}, " +
+                                f"array index {log_array_index} is out of bounds (log size {len(self.log)}, " +
+                                f"first_log_index {self.first_log_index})")
+                    # Reset last_applied to prevent repeated errors
+                    self.last_applied -= 1
+                    break
+                
+                # Get and apply the entry
+                entry = self.log[log_array_index]
+                self.apply_log_entry(entry)
+                entries_applied += 1
+            
+            # Consider compaction after applying entries
+            if entries_applied > 0:
+                logging.debug(f"Node {self.node_id}: Applied {entries_applied} committed entries, " + 
+                            f"now at index {self.last_applied}")
+                
+                # Check if we should compact the log
+                if len(self.log) >= self.log_compaction_threshold:
+                    self.check_and_compact_log()
+        
+        except Exception as e:
+            logging.error(f"Node {self.node_id}: Error applying committed entries: {e}", exc_info=True)
+            # On error, roll back the last_applied counter to avoid skipping entries
+            if entries_applied > 0:
+                self.last_applied -= 1
             
     def apply_log_entry(self, entry):
         """
@@ -797,31 +1003,66 @@ class RaftNode:
             int: Index of the new log entry, or -1 if not leader
         """
         with self.state_lock:
-            if self.state != RaftState.LEADER:
-                return -1
+            try:
+                if self.state != RaftState.LEADER:
+                    return -1
+                    
+                # Calculate the next log index considering log compaction
+                # We need to account for gaps in the log due to compaction
+                next_log_index = self.first_log_index + len(self.log)
                 
-            # Create and append the log entry
-            # [FIXME]: This breaks if we use log compaction
-            index = len(self.log) + 1
-            entry = {
-                'term': self.current_term,
-                'command': command,
-                'index': index
-            }
-            self.log.append(entry)
-            
-            logging.info(f"Leader {self.node_id}: Added new log entry at index {index}")
-            return index
+                # Create and append the log entry
+                entry = {
+                    'term': self.current_term,
+                    'command': command,
+                    'index': next_log_index
+                }
+                self.log.append(entry)
+                
+                logging.info(f"Leader {self.node_id}: Added new log entry at index {next_log_index}")
+                
+                # Check if we should compact the log after adding a new entry
+                if len(self.log) > self.log_compaction_threshold:
+                    # Only initiate compaction if enough entries are committed
+                    if self.commit_index - self.last_snapshot_index > self.log_compaction_threshold / 2:
+                        logging.debug(f"Leader {self.node_id}: Initiating log compaction check after adding entry")
+                        self.check_and_compact_log()
+                
+                return next_log_index
+                
+            except Exception as e:
+                logging.error(f"Leader {self.node_id}: Error adding log entry: {e}", exc_info=True)
+                return -1
     
     def get_last_log_info(self):
         """
         Get information about the last log entry.
         
+        This method accounts for log compaction and correctly returns
+        the absolute log index and term of the last entry.
+        
         Returns:
             tuple: (last_log_index, last_log_term)
         """
-        last_log_index = len(self.log)
-        last_log_term = self.log[last_log_index - 1]['term'] if last_log_index > 0 else 0
+        with self.state_lock:
+            try:
+                # If log is empty, check if we have a snapshot
+                if len(self.log) == 0:
+                    return self.last_snapshot_index, self.last_snapshot_term
+                
+                # Calculate the actual log index considering compaction
+                last_log_index = self.first_log_index + len(self.log) - 1
+                last_log_term = self.log[-1]['term']
+                
+                return last_log_index, last_log_term
+                
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error getting last log info: {e}", exc_info=True)
+                # Return safe defaults in case of error
+                if len(self.log) > 0:
+                    return len(self.log), self.log[-1]['term']
+                else:
+                    return self.last_snapshot_index, self.last_snapshot_term
         return last_log_index, last_log_term
     
     def add_node(self, new_node_id):
