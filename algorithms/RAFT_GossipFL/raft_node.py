@@ -418,24 +418,55 @@ class RaftNode:
                 self.state = RaftState.FOLLOWER
     
     def become_leader(self):
-        """Transition to LEADER state."""
+        """
+        Transition to LEADER state.
+        
+        This is called when a candidate has received votes from a majority
+        of the servers and becomes the leader for the current term.
+        
+        Returns:
+            bool: True if successfully became leader, False otherwise
+        """
         with self.state_lock:
-            if self.state != RaftState.CANDIDATE:
+            try:
+                # Only candidates can become leaders
+                if self.state != RaftState.CANDIDATE:
+                    logging.warning(f"Node {self.node_id}: Cannot become leader from {self.state.name} state")
+                    return False
+                
+                # Transition to leader state
+                self.state = RaftState.LEADER
+                
+                # Reset election state
+                self.votes_received = set()
+                
+                # Initialize leader state for each follower
+                last_log_index = len(self.log)
+                self.next_index = {node_id: last_log_index + 1 for node_id in self.known_nodes if node_id != self.node_id}
+                self.match_index = {node_id: 0 for node_id in self.known_nodes if node_id != self.node_id}
+                
+                # RAFT recommends appending a no-op entry immediately upon becoming leader
+                # This helps commit entries from previous terms more quickly
+                no_op_entry = {
+                    'type': 'no-op',
+                    'timestamp': self.get_current_timestamp()
+                }
+                self.add_log_entry(no_op_entry)
+                
+                # Notify state change via callback if set
+                if self.on_state_change:
+                    self.on_state_change(RaftState.LEADER)
+                
+                logging.info(f"Node {self.node_id}: Became LEADER for term {self.current_term} with {len(self.known_nodes)-1} followers")
+                
+                # Note: Heartbeats will be sent by the manager's heartbeat thread
+                # which regularly calls send_heartbeats for the leader
+                
+                return True
+                
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error transitioning to leader state: {e}")
                 return False
-                
-            self.state = RaftState.LEADER
-            
-            # Initialize leader state
-            self.next_index = {node_id: len(self.log) + 1 for node_id in self.known_nodes if node_id != self.node_id}
-            self.match_index = {node_id: 0 for node_id in self.known_nodes if node_id != self.node_id}
-            
-            # Notify state change
-            # Checking if on_state_change is not None
-            if self.on_state_change:
-                self.on_state_change(RaftState.LEADER)
-                
-            logging.info(f"Node {self.node_id}: Became LEADER for term {self.current_term}")
-            return True
     
     def is_log_up_to_date(self, last_log_index, last_log_term):
         """
