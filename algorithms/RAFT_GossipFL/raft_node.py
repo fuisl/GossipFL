@@ -318,27 +318,47 @@ class RaftNode:
             bool: True if node becomes leader, False otherwise
         """
         with self.state_lock:
-            # If term > currentTerm, convert to follower
-            if term > self.current_term:
-                self.become_follower(term)
-                return False
-            
-            # Ignore if not a candidate or from a previous term
-            if self.state != RaftState.CANDIDATE or term < self.current_term:
-                return False
-            
-            # Count the vote
-            if vote_granted:
-                self.votes_received.add(voter_id)
-                logging.info(f"Node {self.node_id}: Received vote from {voter_id}, " +
-                            f"total votes: {len(self.votes_received)}/{self.majority}")
+            try:
+                # Validate the voter is a known node
+                if voter_id not in self.known_nodes:
+                    logging.warning(f"Node {self.node_id}: Received vote response from unknown node {voter_id}")
+                    return False
                 
-                # Check if we have majority
-                if len(self.votes_received) >= self.majority:
-                    self.become_leader()
-                    return True
-            
-            return False
+                # If term > currentTerm, convert to follower
+                if term > self.current_term:
+                    logging.debug(f"Node {self.node_id}: Converting to follower due to higher term from {voter_id}: {term} > {self.current_term}")
+                    self.become_follower(term)
+                    return False
+                
+                # Ignore if not a candidate or from a previous term
+                if self.state != RaftState.CANDIDATE:
+                    logging.debug(f"Node {self.node_id}: Ignoring vote from {voter_id} as we are not a candidate (state={self.state.name})")
+                    return False
+                    
+                if term < self.current_term:
+                    logging.debug(f"Node {self.node_id}: Ignoring vote from {voter_id} for outdated term {term} (current={self.current_term})")
+                    return False
+                
+                # Count the vote
+                if vote_granted:
+                    self.votes_received.add(voter_id)
+                    logging.info(f"Node {self.node_id}: Received vote from {voter_id}, " +
+                                f"total votes: {len(self.votes_received)}/{self.majority}")
+                    
+                    # Check if we have majority
+                    if len(self.votes_received) >= self.majority:
+                        success = self.become_leader()
+                        if success:
+                            logging.info(f"Node {self.node_id}: Won election with {len(self.votes_received)} votes")
+                        return success
+                else:
+                    logging.debug(f"Node {self.node_id}: Vote denied by {voter_id} for term {term}")
+                
+                return False
+                
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error processing vote response from {voter_id}: {e}")
+                return False
     
     def become_follower(self, term):
         """
