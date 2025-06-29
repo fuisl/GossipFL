@@ -45,9 +45,10 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         self.raft_consensus = raft_consensus
         self.bandwidth_manager = bandwidth_manager
         
-        # Register for leadership changes and state updates
-        self.raft_consensus.on_leadership_change = self.handle_leadership_change
-        self.raft_consensus.on_state_commit = self.handle_raft_state_commit
+        # Register for leadership changes and state updates if raft_consensus is available
+        if self.raft_consensus is not None:
+            self.raft_consensus.on_leadership_change = self.handle_leadership_change
+            self.raft_consensus.on_state_commit = self.handle_raft_state_commit
         
         # State variables for RAFT-SAPS_FL integration
         self.is_coordinator = False
@@ -65,6 +66,23 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         self._override_saps_coordinator_logic()
         
         logging.info(f"RaftWorkerManager initialized for node {rank}")
+    
+    def set_raft_consensus(self, raft_consensus):
+        """
+        Set the raft_consensus reference and register callbacks after initialization.
+        
+        This is needed because of circular dependencies in initialization order.
+        
+        Args:
+            raft_consensus: The RAFT consensus manager
+        """
+        self.raft_consensus = raft_consensus
+        
+        # Now register for leadership changes and state updates
+        if self.raft_consensus is not None:
+            self.raft_consensus.on_leadership_change = self.handle_leadership_change
+            self.raft_consensus.on_state_commit = self.handle_raft_state_commit
+            logging.info(f"RAFT consensus callbacks registered for node {self.rank}")
     
     def register_message_receive_handlers(self):
         """Register message handlers for RAFT and GossipFL messages."""
@@ -518,7 +536,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                 self.send_leader_redirect(sender_id, leader_id)
             return
         
-        # Send parameters with RAFT consistency metadata
+        # Send parameters with RAFT state metadata for consistency checking
         if hasattr(self.worker, "model_trainer"):
             params = self.worker.model_trainer.get_model_params()
             # Include RAFT state metadata for consistency checking

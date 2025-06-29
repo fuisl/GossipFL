@@ -34,7 +34,11 @@ class RaftNode:
         
         # RAFT state
         # Newly started nodes are in INITIAL state until synchronized
-        self.state = RaftState.INITIAL
+        # [BUG]: This is a temporary fix to set the initial state problem
+        if self.node_id == 0:
+            self.state = RaftState.FOLLOWER
+        else:
+            self.state = RaftState.INITIAL
         self.current_term = 0
         self.voted_for = None
         

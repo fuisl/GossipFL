@@ -102,7 +102,7 @@ def FedML_RAFT_GossipFL(process_id, worker_number, device, comm, model, train_da
     # Set cross-references for RAFT integration
     topology_manager.raft_consensus = raft_consensus
     bandwidth_manager.raft_consensus = raft_consensus
-    worker_manager.raft_consensus = raft_consensus
+    worker_manager.set_raft_consensus(raft_consensus)  # Use method to avoid circular dependency issues
     
     logging.info(f"RAFT-GossipFL initialized for node {process_id} with {worker_number} total nodes")
     logging.info(f"RAFT configuration: election_timeout={getattr(args, 'max_election_timeout', 300)}ms, "
