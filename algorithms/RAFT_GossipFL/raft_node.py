@@ -182,33 +182,53 @@ class RaftNode:
         """
         Start a new election (transition to CANDIDATE state).
         
+        This method initiates a leader election by incrementing the current term,
+        voting for itself, and transitioning to the CANDIDATE state. It follows the
+        RAFT algorithm's election process.
+        
         Returns:
             bool: True if successfully started election, False otherwise
         """
         with self.state_lock:
-            if self.state == RaftState.LEADER:
-                return False  # Leaders don't start elections
-
-            # Newly initialized nodes should not start elections until synchronized
-            if self.state == RaftState.INITIAL:
+            try:
+                # Check current state
+                if self.state == RaftState.LEADER:
+                    logging.debug(f"Node {self.node_id}: Cannot start election as LEADER")
+                    return False
+                
+                # Newly initialized nodes should not start elections until synchronized
+                if self.state == RaftState.INITIAL:
+                    logging.debug(f"Node {self.node_id}: Cannot start election in INITIAL state")
+                    return False
+                
+                # Check if we have enough known nodes to potentially win an election
+                if len(self.known_nodes) < self.majority:
+                    logging.warning(f"Node {self.node_id}: Not enough known nodes ({len(self.known_nodes)}) " +
+                                  f"to reach majority ({self.majority}), skipping election")
+                    return False
+                
+                # Increment term, vote for self
+                old_term = self.current_term
+                self.current_term += 1
+                self.voted_for = self.node_id
+                self.state = RaftState.CANDIDATE
+                self.votes_received = {self.node_id}  # Vote for self
+                
+                # Reset election timeout
+                self.reset_election_timeout()
+                self.update_heartbeat()
+                
+                # Notify state change
+                if self.on_state_change:
+                    self.on_state_change(RaftState.CANDIDATE)
+                
+                logging.info(f"Node {self.node_id}: Starting election for term {self.current_term} " +
+                            f"(previous term: {old_term}, known nodes: {len(self.known_nodes)})")
+                return True
+                
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error starting election: {e}")
                 return False
-                
-            # Increment term, vote for self
-            self.current_term += 1
-            self.voted_for = self.node_id
-            self.state = RaftState.CANDIDATE
-            self.votes_received = {self.node_id}  # Vote for self
-            
-            # Reset election timeout
-            self.reset_election_timeout()
-            self.update_heartbeat()
-            
-            # Notify state change
-            if self.on_state_change:
-                self.on_state_change(RaftState.CANDIDATE)
-                
-            logging.info(f"Node {self.node_id}: Starting election for term {self.current_term}")
-            return True
     
     def receive_vote_request(self, candidate_id, term, last_log_index, last_log_term):
         """
