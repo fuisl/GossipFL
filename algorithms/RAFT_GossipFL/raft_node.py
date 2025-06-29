@@ -9,8 +9,9 @@ class RaftState(Enum):
 
     INITIAL = 0
     FOLLOWER = 1
-    CANDIDATE = 2
-    LEADER = 3
+    PREVOTE = 2    # Pre-candidate state for election safety
+    CANDIDATE = 3
+    LEADER = 4
 
 
 class RaftNode:
@@ -60,6 +61,11 @@ class RaftNode:
         # Election state
         self.votes_received = set()  # Set of nodes that voted for this node in current term
         self.last_heartbeat_time = time.time()
+        
+        # PreVote state
+        self.prevote_requested = False  # Whether this node has requested prevotes for a potential election
+        self.prevotes_received = set()  # Set of nodes that granted prevotes for this node
+        self.prevote_term = 0  # The term for which prevotes are being collected (current_term + 1)
         
         # Election timeout (randomized to prevent split votes)
         self.min_election_timeout = getattr(args, 'min_election_timeout', 150) / 1000.0  # default 150ms
@@ -125,8 +131,12 @@ class RaftNode:
             logging.info(f"Node {self.node_id}: Known nodes updated, total={self.total_nodes}, majority={self.majority}, nodes={sorted(self.known_nodes)}")
     
     def reset_election_timeout(self):
-        """Reset the election timeout with a random value."""
+        """Reset the election timeout with a random value and clear prevote state."""
         self.election_timeout = random.uniform(self.min_election_timeout, self.max_election_timeout)
+        # Reset prevote state
+        self.prevote_requested = False
+        self.prevotes_received.clear()
+        self.prevote_term = 0
         logging.debug(f"Node {self.node_id}: Reset election timeout to {self.election_timeout*1000:.2f}ms")
     
     def update_heartbeat(self):
@@ -169,6 +179,10 @@ class RaftNode:
                 if self.state == RaftState.INITIAL:
                     return False
                 
+                # If we're already in PREVOTE state, don't start another prevote
+                if self.state == RaftState.PREVOTE and self.prevote_requested:
+                    return False
+                
                 # Calculate time since last heartbeat
                 elapsed = time.time() - self.last_heartbeat_time
                 is_timeout = elapsed > self.election_timeout
@@ -184,19 +198,88 @@ class RaftNode:
                 # Return False on error to avoid unnecessary elections
                 return False
     
+    def start_prevote(self):
+        """
+        Start the prevote phase before initiating an election.
+        
+        The prevote phase is a preliminary step before a full election to prevent
+        disruptions from temporarily disconnected nodes or network partitions.
+        
+        Returns:
+            bool: True if successfully started prevote, False otherwise
+        """
+        with self.state_lock:
+            try:
+                # Check current state - only followers initiate prevotes
+                if self.state not in [RaftState.FOLLOWER]:
+                    logging.debug(f"Node {self.node_id}: Cannot start prevote in {self.state} state")
+                    return False
+                
+                # Check if we have enough known nodes to potentially win an election
+                if not hasattr(self, 'known_nodes') or not hasattr(self, 'majority'):
+                    logging.warning(f"Node {self.node_id}: Cannot determine majority, skipping prevote")
+                    return False
+                
+                if len(self.known_nodes) < self.majority:
+                    logging.warning(f"Node {self.node_id}: Not enough known nodes ({len(self.known_nodes)}) " +
+                                  f"to reach majority ({self.majority}), skipping prevote")
+                    return False
+                
+                # Set prevote state
+                self.state = RaftState.PREVOTE
+                self.prevote_requested = True
+                self.prevote_term = self.current_term + 1  # The term we would use if election succeeds
+                self.prevotes_received = {self.node_id}  # Count our own vote
+                
+                # Notify state change if callback exists
+                if hasattr(self, 'on_state_change') and callable(self.on_state_change):
+                    self.on_state_change(RaftState.PREVOTE)
+                
+                # Get last log info for vote requests
+                last_log_index, last_log_term = self.get_last_log_info()
+                
+                logging.info(f"Node {self.node_id}: Starting prevote for potential term {self.prevote_term} " +
+                            f"(current term: {self.current_term}, known nodes: {len(self.known_nodes)})")
+                
+                # Request prevotes from all other nodes
+                # Note: This would actually send RPCs to other nodes in a real implementation
+                # For the implementation here, we need to call the consensus manager
+                if hasattr(self, 'consensus_manager') and self.consensus_manager is not None:
+                    self.consensus_manager.broadcast_prevote_request(
+                        candidate_id=self.node_id,
+                        term=self.prevote_term,
+                        last_log_index=last_log_index,
+                        last_log_term=last_log_term
+                    )
+                
+                return True
+                
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error starting prevote: {e}")
+                # Reset state on error
+                if self.state == RaftState.PREVOTE:
+                    self.state = RaftState.FOLLOWER
+                self.prevote_requested = False
+                return False
+    
     def start_election(self):
         """
         Start a new election (transition to CANDIDATE state).
         
         This method initiates a leader election by incrementing the current term,
         voting for itself, and transitioning to the CANDIDATE state. It follows the
-        RAFT algorithm's election process.
+        RAFT algorithm's election process with the prevote enhancement.
         
         Returns:
             bool: True if successfully started election, False otherwise
         """
         with self.state_lock:
             try:
+                # Check if we're already in CANDIDATE state
+                if self.state == RaftState.CANDIDATE:
+                    logging.debug(f"Node {self.node_id}: Already in CANDIDATE state for term {self.current_term}")
+                    return False
+                
                 # Check current state
                 if self.state == RaftState.LEADER:
                     logging.debug(f"Node {self.node_id}: Cannot start election as LEADER")
@@ -207,15 +290,15 @@ class RaftNode:
                     logging.debug(f"Node {self.node_id}: Cannot start election in INITIAL state")
                     return False
                 
-                # Check if we have enough known nodes to potentially win an election
-                if len(self.known_nodes) < self.majority:
-                    logging.warning(f"Node {self.node_id}: Not enough known nodes ({len(self.known_nodes)}) " +
-                                  f"to reach majority ({self.majority}), skipping election")
-                    return False
+                # If we're not in PREVOTE state or didn't get majority prevotes, start prevote instead
+                if self.state != RaftState.PREVOTE or len(self.prevotes_received) < self.majority:
+                    logging.debug(f"Node {self.node_id}: Starting prevote phase instead of full election")
+                    return self.start_prevote()
                 
+                # We have majority prevotes, proceed with real election
                 # Increment term, vote for self
                 old_term = self.current_term
-                self.current_term += 1
+                self.current_term = self.prevote_term  # Use the term we got prevotes for
                 self.voted_for = self.node_id
                 self.state = RaftState.CANDIDATE
                 self.votes_received = {self.node_id}  # Vote for self
@@ -224,12 +307,24 @@ class RaftNode:
                 self.reset_election_timeout()
                 self.update_heartbeat()
                 
-                # Notify state change
-                if self.on_state_change:
+                # Notify state change if callback exists
+                if hasattr(self, 'on_state_change') and callable(self.on_state_change):
                     self.on_state_change(RaftState.CANDIDATE)
                 
                 logging.info(f"Node {self.node_id}: Starting election for term {self.current_term} " +
                             f"(previous term: {old_term}, known nodes: {len(self.known_nodes)})")
+                
+                # Request votes from all other nodes
+                # In a real implementation, this would send RPCs to other nodes
+                if hasattr(self, 'consensus_manager') and self.consensus_manager is not None:
+                    last_log_index, last_log_term = self.get_last_log_info()
+                    self.consensus_manager.broadcast_vote_request(
+                        candidate_id=self.node_id,
+                        term=self.current_term,
+                        last_log_index=last_log_index,
+                        last_log_term=last_log_term
+                    )
+                
                 return True
                 
             except Exception as e:
@@ -1416,3 +1511,111 @@ class RaftNode:
             self.consensus_manager.request_full_bandwidth_update()
         except Exception as e:
             logging.error(f"Node {self.node_id}: Error requesting bandwidth update: {e}")
+    
+    def receive_prevote_request(self, candidate_id, term, last_log_index, last_log_term):
+        """
+        Handle a prevote request from a potential candidate.
+        
+        A prevote is granted if:
+        1. The candidate's term is at least as up-to-date as our current term
+        2. The candidate's log is at least as up-to-date as ours
+        3. We haven't heard from a valid leader recently (election timeout is close)
+        
+        Args:
+            candidate_id (int): ID of the potential candidate requesting the prevote
+            term (int): Candidate's proposed term (usually current_term + 1)
+            last_log_index (int): Index of candidate's last log entry
+            last_log_term (int): Term of candidate's last log entry
+            
+        Returns:
+            tuple: (current_term, prevote_granted)
+        """
+        with self.state_lock:
+            try:
+                logging.debug(f"Node {self.node_id}: Received prevote request from {candidate_id} for term {term}")
+                
+                # Always reject prevotes if we are a leader with an active lease
+                if self.state == RaftState.LEADER:
+                    logging.debug(f"Node {self.node_id}: Rejecting prevote as LEADER")
+                    return self.current_term, False
+                
+                # The candidate's term should be future term (current + 1)
+                if term < self.current_term:
+                    logging.debug(f"Node {self.node_id}: Rejecting prevote - term {term} < current term {self.current_term}")
+                    return self.current_term, False
+                
+                # Only grant prevote if we haven't heard from the leader recently
+                # This is a key optimization - if we're getting heartbeats, don't disrupt the leader
+                time_since_heartbeat = time.time() - self.last_heartbeat_time
+                if time_since_heartbeat < 0.8 * self.election_timeout:  # Still getting regular heartbeats
+                    logging.debug(f"Node {self.node_id}: Rejecting prevote - still receiving heartbeats " +
+                                 f"({time_since_heartbeat*1000:.2f}ms < {0.8*self.election_timeout*1000:.2f}ms)")
+                    return self.current_term, False
+                
+                # Check if the candidate's log is up-to-date with ours
+                if not self.is_log_up_to_date(last_log_index, last_log_term):
+                    logging.debug(f"Node {self.node_id}: Rejecting prevote - candidate log not up-to-date")
+                    return self.current_term, False
+                
+                # Grant the prevote
+                logging.info(f"Node {self.node_id}: Granting prevote to node {candidate_id} for term {term}")
+                return self.current_term, True
+                
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error processing prevote request: {e}")
+                # Safer to reject on error
+                return self.current_term, False
+    
+    def receive_prevote_response(self, voter_id, term, prevote_granted):
+        """
+        Handle prevote response from another node.
+        
+        Args:
+            voter_id (int): ID of the voting node
+            term (int): Current term in the prevote response
+            prevote_granted (bool): Whether the prevote was granted
+            
+        Returns:
+            bool: True if node should start actual election, False otherwise
+        """
+        with self.state_lock:
+            try:
+                # Ignore responses if no longer in PREVOTE state
+                if self.state != RaftState.PREVOTE:
+                    logging.debug(f"Node {self.node_id}: Ignoring prevote response from {voter_id} - no longer in PREVOTE state")
+                    return False
+                
+                # Ignore responses for wrong term
+                if term != self.prevote_term:
+                    logging.debug(f"Node {self.node_id}: Ignoring prevote response from {voter_id} - " +
+                                 f"term mismatch (got {term}, expected {self.prevote_term})")
+                    return False
+                
+                # If we see a higher term, become follower
+                if term > self.current_term:
+                    logging.info(f"Node {self.node_id}: Discovered higher term {term} in prevote response from {voter_id}")
+                    self.become_follower(term)
+                    return False
+                
+                # Process the vote
+                if prevote_granted:
+                    self.prevotes_received.add(voter_id)
+                    votes_count = len(self.prevotes_received)
+                    majority_count = self.majority
+                    
+                    logging.info(f"Node {self.node_id}: Received prevote from {voter_id} " +
+                                f"({votes_count}/{len(self.known_nodes)} votes, need {majority_count})")
+                    
+                    # If we have a majority of prevotes, start actual election
+                    if votes_count >= majority_count:
+                        logging.info(f"Node {self.node_id}: Received majority of prevotes " +
+                                    f"({votes_count}/{len(self.known_nodes)}), can proceed to election")
+                        return True
+                else:
+                    logging.debug(f"Node {self.node_id}: Node {voter_id} rejected prevote request")
+                
+                return False
+                
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error processing prevote response: {e}")
+                return False
