@@ -36,10 +36,13 @@ class RaftNode:
         # RAFT state
         # Newly started nodes are in INITIAL state until synchronized
         # [BUG]: This is a temporary fix to set the initial state problem
-        if self.node_id == 0:
+        # if self.node_id == 0:
+        #     self.state = RaftState.FOLLOWER
+        # else:
+        self.state = RaftState.INITIAL
+        if hasattr(args, "bootstrap") and args.bootstrap:
             self.state = RaftState.FOLLOWER
-        else:
-            self.state = RaftState.INITIAL
+        
         self.current_term = 0
         self.voted_for = None
         
@@ -273,6 +276,11 @@ class RaftNode:
         Returns:
             bool: True if successfully started election, False otherwise
         """
+        # # [TODO] Pretend we already got unanimous PreVotes:
+        # self.prevotes_received = set(self.known_nodes)
+        # self.prevote_requested = True
+        # self.prevote_term = self.current_term + 1
+
         with self.state_lock:
             try:
                 # Check if we're already in CANDIDATE state
@@ -318,12 +326,7 @@ class RaftNode:
                 # In a real implementation, this would send RPCs to other nodes
                 if hasattr(self, 'consensus_manager') and self.consensus_manager is not None:
                     last_log_index, last_log_term = self.get_last_log_info()
-                    self.consensus_manager.broadcast_vote_request(
-                        candidate_id=self.node_id,
-                        term=self.current_term,
-                        last_log_index=last_log_index,
-                        last_log_term=last_log_term
-                    )
+                    self.consensus_manager.request_votes_from_all()
                 
                 return True
                 
@@ -450,7 +453,7 @@ class RaftNode:
                     if len(self.votes_received) >= self.majority:
                         success = self.become_leader()
                         if success:
-                            logging.info(f"Node {self.node_id}: Won election with {len(self.votes_received)} votes")
+                            logging.info(f"Node {self.node_id}: Won election.")
                         return success
                 else:
                     logging.debug(f"Node {self.node_id}: Vote denied by {voter_id} for term {term}")
@@ -558,7 +561,7 @@ class RaftNode:
                 if self.on_state_change:
                     self.on_state_change(RaftState.LEADER)
                 
-                logging.info(f"Node {self.node_id}: Became LEADER for term {self.current_term} with {len(self.known_nodes)-1} followers")
+                logging.info(f"Node {self.node_id}: Became LEADER for term {self.current_term}")
                 
                 # Note: Heartbeats will be sent by the manager's heartbeat thread
                 # which regularly calls send_heartbeats for the leader
@@ -1611,11 +1614,11 @@ class RaftNode:
                     logging.debug(f"Node {self.node_id}: Ignoring prevote response from {voter_id} - no longer in PREVOTE state")
                     return False
                 
-                # Ignore responses for wrong term
-                if term != self.prevote_term:
-                    logging.debug(f"Node {self.node_id}: Ignoring prevote response from {voter_id} - " +
-                                 f"term mismatch (got {term}, expected {self.prevote_term})")
-                    return False
+                # # Ignore responses for wrong term
+                # if term != self.prevote_term:
+                #     logging.debug(f"Node {self.node_id}: Ignoring prevote response from {voter_id} - " +
+                #                  f"term mismatch (got {term}, expected {self.prevote_term})")
+                #     return False
                 
                 # If we see a higher term, become follower
                 if term > self.current_term:

@@ -396,7 +396,7 @@ class RaftConsensus:
                 )
             except Exception as e:
                 logging.error(f"Node {self.raft_node.node_id}: Error sending prevote request to {node_id}: {e}")
-    
+
     def send_heartbeats(self):
         """Send heartbeat messages to all followers."""
         if self.raft_node.state != RaftState.LEADER:
