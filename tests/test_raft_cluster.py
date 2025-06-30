@@ -132,6 +132,7 @@ def run_simulation(num_nodes=3, runtime=10):
         max_election_timeout=300,
         heartbeat_interval=100,
         client_num_in_total=num_nodes,
+        bootstrap=True,
     )
     transport = LocalTransport()
     consensuses = [create_consensus(i, args, transport) for i in range(num_nodes)]
