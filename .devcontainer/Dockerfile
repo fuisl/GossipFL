@@ -1,24 +1,12 @@
-FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel
+FROM quay.io/fedora/fedora-minimal:42
 
-LABEL name="GossipFL"
+# No pulling optional dependencies
+RUN echo install_weak_deps=False >> /etc/dnf/dnf.conf && \
+    dnf install -y git sudo openssh-server nano wget tar bash-completion python3.9 openmpi-devel --skip-unavailable && \
+    dnf clean all && rm -rf /var/cache/dnf
 
-# Install necessary packages including sudo and passwd
-RUN apt-get update && \
-    apt-get install -y sudo passwd git openssh-client gnupg2 curl dos2unix && \
-    apt-get clean
-
-# Create devuser with a home dir and Bash as shell
-RUN useradd -ms /bin/bash devuser && \
-    echo "devuser:devuser" | chpasswd && \
-    echo "devuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/devuser && \
-    chmod 0440 /etc/sudoers.d/devuser && \
-    passwd -d root
-
-USER devuser
-WORKDIR /workspaces
-
-
-RUN NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-ENV PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:$PATH"
-RUN echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> /home/devuser/.bashrc
-RUN brew install gh mpi
+# Create a user for ssh
+RUN useradd -m dev && \
+# Passwordless sudo privilege
+    echo "dev ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/dev && \
+    chmod 0440 /etc/sudoers.d/dev
