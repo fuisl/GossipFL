@@ -11,9 +11,9 @@ from .raft_worker_manager import RaftWorkerManager
 from .raft_topology_manager import RaftTopologyManager
 from .raft_bandwidth_manager import RaftBandwidthManager
 
-# Gateway components for dynamic node discovery
-from .gateway_server import GatewayServer, GatewayState, NodeInfo, NodeStatus
-from .gateway_client import GatewayClient, GatewayDiscoveryMixin
+# Gateway components for dynamic node discovery (gRPC-based)
+from .grpc_gateway_server import GRPCGatewayServer
+from .grpc_gateway_client import GRPCGatewayClient, GRPCGatewayDiscoveryMixin
 
 # API
 from .RAFT_GossipFL_API import RAFT_GossipFL_API
@@ -28,13 +28,10 @@ __all__ = [
     'RaftTopologyManager',
     'RaftBandwidthManager',
     
-    # Gateway
-    'GatewayServer',
-    'GatewayState',
-    'NodeInfo',
-    'NodeStatus',
-    'GatewayClient',
-    'GatewayDiscoveryMixin',
+    # Gateway (gRPC-based)
+    'GRPCGatewayServer',
+    'GRPCGatewayClient',
+    'GRPCGatewayDiscoveryMixin',
     
     # API
     'RAFT_GossipFL_API'

@@ -8,25 +8,26 @@ The gateway server provides a lightweight service discovery mechanism that allow
 
 ## Components
 
-### 1. Gateway Server (`gateway_server.py`)
+### 1. gRPC Gateway Server (`grpc_gateway_server.py`)
 
-The main gateway server implementation that provides:
+The main gRPC-based gateway server implementation that provides:
 
 - **Node Registration**: Allows nodes to register themselves with the cluster
 - **Node Discovery**: Provides lists of active nodes to new joiners
 - **Bootstrap Coordination**: Handles the first node scenario and leader assignment
 - **Health Monitoring**: Tracks node health through heartbeats
-- **HTTP API**: RESTful API for all gateway operations
+- **gRPC API**: High-performance gRPC service for all gateway operations
 
 #### Key Features
 
-- Lightweight HTTP-based communication
-- Thread-safe node registry
+- High-performance gRPC-based communication
+- Thread-safe node registry with RLock protection
 - Automatic cleanup of inactive nodes
 - Bootstrap detection and coordination
 - Leader tracking and updates
+- Integration with existing gRPC infrastructure
 
-### 2. Gateway Client (`gateway_client.py`)
+### 2. gRPC Gateway Client (`grpc_gateway_client.py`)
 
 Client library for nodes to interact with the gateway server:
 
@@ -34,101 +35,98 @@ Client library for nodes to interact with the gateway server:
 - **Cluster Discovery**: Discover existing cluster nodes
 - **Heartbeat Management**: Automatic heartbeat to maintain registration
 - **Leader Updates**: Update leader information in gateway
-- **Mixin Support**: `GatewayDiscoveryMixin` for easy integration
+- **Mixin Support**: `GRPCGatewayDiscoveryMixin` for easy integration
 
 #### Key Features
 
 - Automatic heartbeat management
-- Connection retry logic
+- Connection retry logic with exponential backoff
 - Simple API for common operations
 - Thread-safe implementation
+- Event callbacks for registration and connection events
 
-### 3. Test Suite (`test_gateway.py`)
+### 3. Test Suite (`test_grpc_gateway.py`)
 
 Comprehensive test suite that validates:
 
-- Gateway server functionality
-- Gateway client operations
+- gRPC Gateway server functionality
+- gRPC Gateway client operations
 - Multi-node scenarios
 - Bootstrap detection
 - Heartbeat functionality
+- Discovery mixin integration
 
 ## API Reference
 
-### Gateway Server HTTP API
+### gRPC Gateway Service
+
+The gateway service is defined in `grpc_comm_manager.proto` and provides the following RPC methods:
 
 #### Health Check
 
-```
-GET /health
+```protobuf
+rpc HealthCheck (HealthCheckRequest) returns (HealthCheckResponse);
 ```
 
-Returns gateway health status.
+Returns gateway health status, timestamp, and version information.
 
 #### Node Registration
 
+```protobuf
+rpc RegisterNode (RegisterNodeRequest) returns (RegisterNodeResponse);
 ```
-POST /register
-{
-    "node_id": 1,
-    "ip_address": "127.0.0.1",
-    "port": 5001,
-    "capabilities": ["raft", "gossip"],
-    "metadata": {"role": "worker"}
-}
-```
+
+Registers a node with the gateway and returns cluster information.
 
 #### Get Nodes
 
-```
-GET /nodes?node_id=1
+```protobuf
+rpc GetNodes (GetNodesRequest) returns (GetNodesResponse);
 ```
 
-Returns list of active nodes (excluding the requesting node if node_id provided).
+Returns list of active nodes (excluding the requesting node if specified).
 
 #### Get Leader
 
-```
-GET /leader
+```protobuf
+rpc GetLeader (GetLeaderRequest) returns (GetLeaderResponse);
 ```
 
 Returns current leader information.
 
 #### Update Leader
 
+```protobuf
+rpc UpdateLeader (UpdateLeaderRequest) returns (UpdateLeaderResponse);
 ```
-POST /leader
-{
-    "leader_id": 2
-}
-```
+
+Updates leader information in the gateway.
 
 #### Heartbeat
 
+```protobuf
+rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
 ```
-POST /heartbeat
-{
-    "node_id": 1
-}
-```
+
+Sends heartbeat to maintain node registration.
 
 #### Get Statistics
 
-```
-GET /stats
+```protobuf
+rpc GetStats (GetStatsRequest) returns (GetStatsResponse);
 ```
 
-Returns gateway statistics.
+Returns gateway statistics including node counts, leader info, and uptime.
 
 ## Usage Examples
 
-### Starting the Gateway Server
+### Starting the gRPC Gateway Server
 
 ```python
-from gateway_server import GatewayServer
+from grpc_gateway_server import GRPCGatewayServer
 
-# Start gateway server
-gateway = GatewayServer(host='0.0.0.0', port=8080)
+# Start gRPC gateway server
+gateway = GRPCGatewayServer(host='0.0.0.0', port=8090)
 gateway.start()
 
 # Gateway runs in background threads
@@ -136,13 +134,13 @@ gateway.start()
 gateway.stop()
 ```
 
-### Using the Gateway Client
+### Using the gRPC Gateway Client
 
 ```python
-from gateway_client import GatewayClient
+from grpc_gateway_client import GRPCGatewayClient
 
 # Create client
-client = GatewayClient('localhost', 8080)
+client = GRPCGatewayClient('localhost', 8090)
 
 # Discover cluster and register
 is_bootstrap, cluster_info = client.discover_cluster(
@@ -165,16 +163,16 @@ client.shutdown()
 ### Integration with Existing Classes
 
 ```python
-from gateway_client import GatewayDiscoveryMixin
+from grpc_gateway_client import GRPCGatewayDiscoveryMixin
 
-class MyNode(GatewayDiscoveryMixin):
+class MyNode(GRPCGatewayDiscoveryMixin):
     def __init__(self, node_id, ip, port):
         super().__init__()
         
         # Initialize gateway discovery
         self.initialize_gateway_discovery(
             gateway_host='localhost',
-            gateway_port=8080,
+            gateway_port=8090,
             node_id=node_id,
             ip_address=ip,
             port=port,
@@ -196,79 +194,140 @@ node = MyNode(1, '127.0.0.1', 5001)
 
 ```bash
 # Run all tests
-python test_gateway.py
+python test_grpc_gateway.py
 
 # Run specific test scenarios
-python -c "from test_gateway import test_gateway_server; test_gateway_server()"
+python -c "from test_grpc_gateway import test_grpc_gateway_server; test_grpc_gateway_server()"
 ```
 
 ## Command Line Usage
 
-### Start Gateway Server
+### Start gRPC Gateway Server
 
 ```bash
-python gateway_server.py --host 0.0.0.0 --port 8080 --log-level INFO
+python grpc_gateway_server.py --host 0.0.0.0 --port 8090 --log-level INFO
 ```
 
-### Test Gateway Client
+### Test gRPC Gateway Client
 
 ```bash
-python gateway_client.py --gateway-host localhost --gateway-port 8080 --node-id 1 --ip 127.0.0.1 --port 5001
+python grpc_gateway_client.py --gateway-host localhost --gateway-port 8090 --node-id 1 --ip 127.0.0.1 --port 5001
 ```
 
 ## Configuration
 
-### Gateway Server Configuration
+### gRPC Gateway Server Configuration
 
-The gateway server supports the following configuration options:
+The gRPC gateway server supports the following configuration options:
 
-- `host`: Bind address (default: '0.0.0.0')
-- `port`: Port number (default: 8080)
+- `host`: Bind address (default: 'localhost')
+- `port`: Port number (default: 8090)
 - `node_timeout`: Node timeout in seconds (default: 300)
 - `heartbeat_interval`: Heartbeat check interval (default: 30)
+- `max_workers`: Maximum gRPC worker threads (default: 10)
 
-### Gateway Client Configuration
+### gRPC Gateway Client Configuration
 
-The gateway client supports:
+The gRPC gateway client supports:
 
 - `gateway_host`: Gateway server hostname/IP
 - `gateway_port`: Gateway server port
-- `timeout`: Request timeout in seconds (default: 10)
-- `heartbeat_interval`: Heartbeat interval in seconds (default: 30)
+- `timeout`: Request timeout in seconds (default: 10.0)
+- `max_retry_attempts`: Maximum retry attempts (default: 3)
+- `heartbeat_interval`: Heartbeat interval in seconds (default: 30.0)
 
 ## Integration with RAFT+GossipFL
 
-The gateway implementation is designed to integrate seamlessly with the existing RAFT consensus and GossipFL training components:
+The gRPC gateway implementation is designed to integrate seamlessly with the existing RAFT consensus and GossipFL training components:
 
 1. **Bootstrap Detection**: The gateway identifies the first node and marks it for bootstrap mode
-2. **Leader Discovery**: New nodes can discover the current RAFT leader
+2. **Leader Discovery**: New nodes can discover the current RAFT leader through gRPC
 3. **Topology Management**: Provides initial peer lists for gossip network formation
 4. **Fault Tolerance**: Gateway failure doesn't affect cluster operation
+5. **gRPC Integration**: Uses the same gRPC infrastructure as the main communication layer
 
 ## Error Handling
 
-The implementation includes comprehensive error handling:
+The gRPC implementation includes comprehensive error handling:
 
 - **Connection Failures**: Retry logic with exponential backoff
-- **Invalid Requests**: Proper HTTP error responses
+- **gRPC Errors**: Proper gRPC status code handling
 - **Node Failures**: Automatic cleanup of inactive nodes
 - **Gateway Failures**: Graceful degradation for client operations
+- **Timeout Handling**: Configurable timeouts for all operations
 
 ## Dependencies
 
 - Python 3.6+
-- Standard library only (no external dependencies for core functionality)
-- `requests` library for test suite
-- `threading` for concurrent operations
-- `http.server` for HTTP server implementation
+- gRPC libraries (`grpcio`, `grpcio-tools`)
+- Protobuf (`protobuf`)
+- Threading for concurrent operations
+- Integration with existing `fedml_core` gRPC infrastructure
+
+## Performance Considerations
+
+- **High Throughput**: gRPC provides better performance than HTTP REST
+- **Connection Pooling**: Reuses gRPC connections for efficiency
+- **Concurrent Operations**: Thread-safe implementation supports concurrent requests
+- **Memory Efficiency**: Protobuf serialization is more efficient than JSON
+- **Stream Support**: Ready for future streaming operations if needed
 
 ## Future Enhancements
 
-Potential improvements for the gateway implementation:
+Potential improvements for the gRPC gateway implementation:
 
-1. **SSL/TLS Support**: Add HTTPS support for secure communication
+1. **SSL/TLS Support**: Add secure gRPC communication
 2. **Authentication**: Add node authentication and authorization
-3. **Load Balancing**: Support multiple gateway instances
-4. **Persistence**: Add optional state persistence
+3. **Load Balancing**: Support multiple gateway instances with load balancing
+4. **Persistence**: Add optional state persistence for gateway restarts
 5. **Monitoring**: Enhanced metrics and monitoring capabilities
 6. **Configuration Management**: Dynamic configuration updates
+7. **Streaming**: Use gRPC streaming for real-time updates
+8. **Service Discovery**: Integration with service mesh technologies
+
+## Architecture
+
+The gRPC gateway follows a clean architecture:
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                    gRPC Gateway Server                      │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────┐  │
+│  │  Node Registry  │  │  Leader Track   │  │  Bootstrap  │  │
+│  │   (Thread-Safe) │  │   (Thread-Safe) │  │   Manager   │  │
+│  └─────────────────┘  └─────────────────┘  └─────────────┘  │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │              gRPC Service Layer                        │  │
+│  │  RegisterNode | GetNodes | GetLeader | Heartbeat      │  │
+│  └─────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+                                │
+                                │ gRPC Communication
+                                │
+┌─────────────────────────────────────────────────────────────┐
+│                    gRPC Gateway Client                      │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────┐  │
+│  │  Connection     │  │  Retry Logic    │  │  Heartbeat  │  │
+│  │  Management     │  │  (Exponential)  │  │  Manager    │  │
+│  └─────────────────┘  └─────────────────┘  └─────────────┘  │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │              Discovery Mixin                          │  │
+│  │  Bootstrap Detection | Cluster Info | Leader Updates  │  │
+│  └─────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Migration from HTTP Gateway
+
+If you're migrating from the HTTP-based gateway:
+
+1. **Update imports**: Change from `gateway_client` to `grpc_gateway_client`
+2. **Class names**: Use `GRPCGatewayClient` instead of `GatewayClient`
+3. **Mixin**: Use `GRPCGatewayDiscoveryMixin` instead of `GatewayDiscoveryMixin`
+4. **Dependencies**: Ensure gRPC libraries are installed
+5. **Configuration**: Update port numbers (default 8090 instead of 8080)
+6. **Testing**: Use `test_grpc_gateway.py` for validation
+
+The API remains largely the same, making migration straightforward.
