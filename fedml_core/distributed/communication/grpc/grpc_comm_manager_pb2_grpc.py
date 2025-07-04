@@ -138,3 +138,379 @@ class gRPCCommManager(object):
             timeout,
             metadata,
             _registered_method=True)
+
+
+class GatewayServiceStub(object):
+    """Gateway Service for node discovery and registration
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.RegisterNode = channel.unary_unary(
+                '/GatewayService/RegisterNode',
+                request_serializer=grpc__comm__manager__pb2.RegisterNodeRequest.SerializeToString,
+                response_deserializer=grpc__comm__manager__pb2.RegisterNodeResponse.FromString,
+                _registered_method=True)
+        self.GetNodes = channel.unary_unary(
+                '/GatewayService/GetNodes',
+                request_serializer=grpc__comm__manager__pb2.GetNodesRequest.SerializeToString,
+                response_deserializer=grpc__comm__manager__pb2.GetNodesResponse.FromString,
+                _registered_method=True)
+        self.GetLeader = channel.unary_unary(
+                '/GatewayService/GetLeader',
+                request_serializer=grpc__comm__manager__pb2.GetLeaderRequest.SerializeToString,
+                response_deserializer=grpc__comm__manager__pb2.GetLeaderResponse.FromString,
+                _registered_method=True)
+        self.UpdateLeader = channel.unary_unary(
+                '/GatewayService/UpdateLeader',
+                request_serializer=grpc__comm__manager__pb2.UpdateLeaderRequest.SerializeToString,
+                response_deserializer=grpc__comm__manager__pb2.UpdateLeaderResponse.FromString,
+                _registered_method=True)
+        self.Heartbeat = channel.unary_unary(
+                '/GatewayService/Heartbeat',
+                request_serializer=grpc__comm__manager__pb2.HeartbeatRequest.SerializeToString,
+                response_deserializer=grpc__comm__manager__pb2.HeartbeatResponse.FromString,
+                _registered_method=True)
+        self.HealthCheck = channel.unary_unary(
+                '/GatewayService/HealthCheck',
+                request_serializer=grpc__comm__manager__pb2.HealthCheckRequest.SerializeToString,
+                response_deserializer=grpc__comm__manager__pb2.HealthCheckResponse.FromString,
+                _registered_method=True)
+        self.RemoveNode = channel.unary_unary(
+                '/GatewayService/RemoveNode',
+                request_serializer=grpc__comm__manager__pb2.RemoveNodeRequest.SerializeToString,
+                response_deserializer=grpc__comm__manager__pb2.RemoveNodeResponse.FromString,
+                _registered_method=True)
+        self.GetStats = channel.unary_unary(
+                '/GatewayService/GetStats',
+                request_serializer=grpc__comm__manager__pb2.GetStatsRequest.SerializeToString,
+                response_deserializer=grpc__comm__manager__pb2.GetStatsResponse.FromString,
+                _registered_method=True)
+
+
+class GatewayServiceServicer(object):
+    """Gateway Service for node discovery and registration
+    """
+
+    def RegisterNode(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetNodes(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetLeader(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def UpdateLeader(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Heartbeat(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def HealthCheck(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RemoveNode(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetStats(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_GatewayServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'RegisterNode': grpc.unary_unary_rpc_method_handler(
+                    servicer.RegisterNode,
+                    request_deserializer=grpc__comm__manager__pb2.RegisterNodeRequest.FromString,
+                    response_serializer=grpc__comm__manager__pb2.RegisterNodeResponse.SerializeToString,
+            ),
+            'GetNodes': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetNodes,
+                    request_deserializer=grpc__comm__manager__pb2.GetNodesRequest.FromString,
+                    response_serializer=grpc__comm__manager__pb2.GetNodesResponse.SerializeToString,
+            ),
+            'GetLeader': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetLeader,
+                    request_deserializer=grpc__comm__manager__pb2.GetLeaderRequest.FromString,
+                    response_serializer=grpc__comm__manager__pb2.GetLeaderResponse.SerializeToString,
+            ),
+            'UpdateLeader': grpc.unary_unary_rpc_method_handler(
+                    servicer.UpdateLeader,
+                    request_deserializer=grpc__comm__manager__pb2.UpdateLeaderRequest.FromString,
+                    response_serializer=grpc__comm__manager__pb2.UpdateLeaderResponse.SerializeToString,
+            ),
+            'Heartbeat': grpc.unary_unary_rpc_method_handler(
+                    servicer.Heartbeat,
+                    request_deserializer=grpc__comm__manager__pb2.HeartbeatRequest.FromString,
+                    response_serializer=grpc__comm__manager__pb2.HeartbeatResponse.SerializeToString,
+            ),
+            'HealthCheck': grpc.unary_unary_rpc_method_handler(
+                    servicer.HealthCheck,
+                    request_deserializer=grpc__comm__manager__pb2.HealthCheckRequest.FromString,
+                    response_serializer=grpc__comm__manager__pb2.HealthCheckResponse.SerializeToString,
+            ),
+            'RemoveNode': grpc.unary_unary_rpc_method_handler(
+                    servicer.RemoveNode,
+                    request_deserializer=grpc__comm__manager__pb2.RemoveNodeRequest.FromString,
+                    response_serializer=grpc__comm__manager__pb2.RemoveNodeResponse.SerializeToString,
+            ),
+            'GetStats': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetStats,
+                    request_deserializer=grpc__comm__manager__pb2.GetStatsRequest.FromString,
+                    response_serializer=grpc__comm__manager__pb2.GetStatsResponse.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'GatewayService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('GatewayService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class GatewayService(object):
+    """Gateway Service for node discovery and registration
+    """
+
+    @staticmethod
+    def RegisterNode(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/GatewayService/RegisterNode',
+            grpc__comm__manager__pb2.RegisterNodeRequest.SerializeToString,
+            grpc__comm__manager__pb2.RegisterNodeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetNodes(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/GatewayService/GetNodes',
+            grpc__comm__manager__pb2.GetNodesRequest.SerializeToString,
+            grpc__comm__manager__pb2.GetNodesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetLeader(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/GatewayService/GetLeader',
+            grpc__comm__manager__pb2.GetLeaderRequest.SerializeToString,
+            grpc__comm__manager__pb2.GetLeaderResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UpdateLeader(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/GatewayService/UpdateLeader',
+            grpc__comm__manager__pb2.UpdateLeaderRequest.SerializeToString,
+            grpc__comm__manager__pb2.UpdateLeaderResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Heartbeat(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/GatewayService/Heartbeat',
+            grpc__comm__manager__pb2.HeartbeatRequest.SerializeToString,
+            grpc__comm__manager__pb2.HeartbeatResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def HealthCheck(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/GatewayService/HealthCheck',
+            grpc__comm__manager__pb2.HealthCheckRequest.SerializeToString,
+            grpc__comm__manager__pb2.HealthCheckResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RemoveNode(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/GatewayService/RemoveNode',
+            grpc__comm__manager__pb2.RemoveNodeRequest.SerializeToString,
+            grpc__comm__manager__pb2.RemoveNodeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetStats(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/GatewayService/GetStats',
+            grpc__comm__manager__pb2.GetStatsRequest.SerializeToString,
+            grpc__comm__manager__pb2.GetStatsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)

@@ -5,6 +5,19 @@ service gRPCCommManager {
   rpc handleReceiveMessage(CommRequest) returns (CommResponse);
 }
 
+// Gateway Service for node discovery and registration
+service GatewayService {
+  rpc RegisterNode (RegisterNodeRequest) returns (RegisterNodeResponse);
+  rpc GetNodes (GetNodesRequest) returns (GetNodesResponse);
+  rpc GetLeader (GetLeaderRequest) returns (GetLeaderResponse);
+  rpc UpdateLeader (UpdateLeaderRequest) returns (UpdateLeaderResponse);
+  rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
+  rpc HealthCheck (HealthCheckRequest) returns (HealthCheckResponse);
+  rpc RemoveNode (RemoveNodeRequest) returns (RemoveNodeResponse);
+  rpc GetStats (GetStatsRequest) returns (GetStatsResponse);
+}
+
+// Existing communication messages
 message CommRequest {
   int32 client_id = 1;
   bytes message = 2;
@@ -13,4 +26,102 @@ message CommRequest {
 message CommResponse {
   int32 client_id = 1;
   bytes message = 2;
+}
+
+// Gateway service messages
+message NodeInfo {
+  int32 node_id = 1;
+  string ip_address = 2;
+  int32 port = 3;
+  repeated string capabilities = 4;
+  string status = 5;
+  double last_seen = 6;
+  double join_timestamp = 7;
+  map<string, string> metadata = 8;
+}
+
+message RegisterNodeRequest {
+  int32 node_id = 1;
+  string ip_address = 2;
+  int32 port = 3;
+  repeated string capabilities = 4;
+  map<string, string> metadata = 5;
+}
+
+message RegisterNodeResponse {
+  string status = 1;
+  int32 node_id = 2;
+  bool is_bootstrap = 3;
+  int32 registry_version = 4;
+  repeated NodeInfo nodes = 5;
+  NodeInfo leader = 6;
+  string message = 7;
+}
+
+message GetNodesRequest {
+  int32 requesting_node_id = 1;
+}
+
+message GetNodesResponse {
+  repeated NodeInfo nodes = 1;
+  int32 registry_version = 2;
+}
+
+message GetLeaderRequest {
+}
+
+message GetLeaderResponse {
+  NodeInfo leader = 1;
+  int32 registry_version = 2;
+  string message = 3;
+}
+
+message UpdateLeaderRequest {
+  int32 leader_id = 1;
+}
+
+message UpdateLeaderResponse {
+  string status = 1;
+  int32 leader_id = 2;
+  string message = 3;
+}
+
+message HeartbeatRequest {
+  int32 node_id = 1;
+}
+
+message HeartbeatResponse {
+  string status = 1;
+  int32 registry_version = 2;
+}
+
+message HealthCheckRequest {
+}
+
+message HealthCheckResponse {
+  string status = 1;
+  double timestamp = 2;
+  string version = 3;
+}
+
+message RemoveNodeRequest {
+  int32 node_id = 1;
+}
+
+message RemoveNodeResponse {
+  string status = 1;
+  int32 node_id = 2;
+  string message = 3;
+}
+
+message GetStatsRequest {
+}
+
+message GetStatsResponse {
+  int32 total_nodes = 1;
+  int32 active_nodes = 2;
+  int32 leader_id = 3;
+  int32 registry_version = 4;
+  bool bootstrap_initiated = 5;
+  double uptime = 6;
 }
