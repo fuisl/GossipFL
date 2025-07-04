@@ -163,6 +163,9 @@ class GRPCGatewayClient:
         Returns:
             Registration response from gateway or None if failed
         """
+        if metadata:
+            metadata = {str(k): str(v) for k, v in metadata.items()}
+        
         request = grpc_comm_manager_pb2.RegisterNodeRequest(
             node_id=node_id,
             ip_address=ip_address,
