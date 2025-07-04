@@ -4,7 +4,13 @@ import time
 import traceback
 from enum import Enum
 
-from .raft_node import RaftState
+try:
+    from .raft_node import RaftState
+    from .discovery_hints import DiscoveryHintSender, RaftState as HintRaftState
+except ImportError:
+    # Handle case when running tests directly
+    from raft_node import RaftState
+    from discovery_hints import DiscoveryHintSender, RaftState as HintRaftState
 
 
 class ConsensusType(Enum):
@@ -98,6 +104,22 @@ class RaftConsensus:
         # Interval between log replication attempts
         self.replication_interval = getattr(args, "replication_interval", self.raft_node.heartbeat_interval)
         
+        # Initialize discovery hint sender if discovery service is configured
+        self.discovery_hint_sender = None
+        discovery_host = getattr(args, "discovery_host", None)
+        discovery_port = getattr(args, "discovery_port", None)
+        
+        if discovery_host and discovery_port:
+            self.discovery_hint_sender = DiscoveryHintSender(
+                discovery_host=discovery_host,
+                discovery_port=discovery_port,
+                node_id=raft_node.node_id,
+                send_interval=30.0  # Send hints every 30 seconds
+            )
+            logging.info(f"Node {raft_node.node_id}: Discovery hint sender initialized for {discovery_host}:{discovery_port}")
+        else:
+            logging.info(f"Node {raft_node.node_id}: No discovery service configured, hints disabled")
+        
         logging.info(f"RAFT Consensus initialized for node {raft_node.node_id}")
     
     def start(self):
@@ -111,6 +133,11 @@ class RaftConsensus:
             
             # Start election timer thread (always running for followers/candidates)
             self._start_election_timer_thread()
+            
+            # Start discovery hint sender if configured
+            if self.discovery_hint_sender:
+                self.discovery_hint_sender.start()
+                logging.debug(f"Node {self.raft_node.node_id}: Started discovery hint sender")
             
             # If we're already a leader, start leader threads
             if self.raft_node.state == RaftState.LEADER:
@@ -130,6 +157,11 @@ class RaftConsensus:
             
             # Stop all threads
             self._stop_all_threads()
+            
+            # Stop discovery hint sender if configured
+            if self.discovery_hint_sender:
+                self.discovery_hint_sender.stop()
+                logging.debug(f"Node {self.raft_node.node_id}: Stopped discovery hint sender")
             
             logging.info(f"Node {self.raft_node.node_id}: RAFT consensus operations stopped")
     
@@ -152,6 +184,15 @@ class RaftConsensus:
                 # Start leader-specific threads
                 self._start_leader_threads()
                 
+                # Update discovery hint sender when becoming leader
+                if self.discovery_hint_sender:
+                    self.discovery_hint_sender.update_raft_state(
+                        new_state=HintRaftState.LEADER,
+                        term=self.raft_node.current_term,
+                        known_nodes=self.raft_node.known_nodes
+                    )
+                    logging.debug(f"Node {self.raft_node.node_id}: Updated discovery hint sender for leader state")
+                
                 # Notify leadership change
                 if self.on_leadership_change:
                     try:
@@ -162,6 +203,16 @@ class RaftConsensus:
             elif new_state in [RaftState.FOLLOWER, RaftState.CANDIDATE]:
                 # Stop leader-specific threads
                 self._stop_leader_threads()
+                
+                # Update discovery hint sender when becoming follower/candidate
+                if self.discovery_hint_sender:
+                    hint_state = HintRaftState.FOLLOWER if new_state == RaftState.FOLLOWER else HintRaftState.CANDIDATE
+                    self.discovery_hint_sender.update_raft_state(
+                        new_state=hint_state,
+                        term=self.raft_node.current_term,
+                        known_nodes=self.raft_node.known_nodes
+                    )
+                    logging.debug(f"Node {self.raft_node.node_id}: Updated discovery hint sender for {hint_state} state")
                 
                 # If we were the leader and now we're not, clear our leader status
                 if self.current_leader_id == self.raft_node.node_id:
@@ -793,6 +844,15 @@ class RaftConsensus:
                 logging.debug(f"Node {self.raft_node.node_id}: Worker manager notified of membership change")
             else:
                 logging.warning(f"Node {self.raft_node.node_id}: No worker manager available to notify about membership change")
+            
+            # Update discovery hint sender with new membership information
+            if self.discovery_hint_sender and self.raft_node.state == RaftState.LEADER:
+                self.discovery_hint_sender.update_raft_state(
+                    new_state=HintRaftState.LEADER,
+                    term=self.raft_node.current_term,
+                    known_nodes=new_nodes
+                )
+                logging.debug(f"Node {self.raft_node.node_id}: Discovery hint sender updated with new membership")
         except Exception as e:
             logging.error(f"Node {self.raft_node.node_id}: Error in on_membership_change: {e}", exc_info=True)
     
@@ -1106,6 +1166,90 @@ class RaftConsensus:
                     'log_replication_alive': self.log_replication_thread.is_alive() if self.log_replication_thread else False,
                 }
             }
+    
+    # Discovery integration helper methods
+    
+    def set_discovery_service(self, discovery_host, discovery_port):
+        """
+        Set or update the discovery service configuration.
+        
+        This can be called after initialization to configure discovery service.
+        
+        Args:
+            discovery_host (str): Discovery service hostname/IP
+            discovery_port (int): Discovery service port
+        """
+        if self.discovery_hint_sender:
+            self.discovery_hint_sender.stop()
+        
+        self.discovery_hint_sender = DiscoveryHintSender(
+            discovery_host=discovery_host,
+            discovery_port=discovery_port,
+            node_id=self.raft_node.node_id,
+            send_interval=30.0
+        )
+        
+        # Start the hint sender if consensus is already running
+        if self.is_running:
+            self.discovery_hint_sender.start()
+        
+        logging.info(f"Node {self.raft_node.node_id}: Discovery service configured for {discovery_host}:{discovery_port}")
+    
+    def get_discovery_stats(self):
+        """
+        Get statistics from the discovery hint sender.
+        
+        Returns:
+            dict: Discovery hint sender statistics, or None if not configured
+        """
+        if self.discovery_hint_sender:
+            return self.discovery_hint_sender.get_stats()
+        return None
+    
+    def is_discovery_enabled(self):
+        """
+        Check if discovery service integration is enabled.
+        
+        Returns:
+            bool: True if discovery hint sender is configured and active
+        """
+        return self.discovery_hint_sender is not None
+        
+    def get_leader_id(self):
+        """
+        Get the current leader ID.
+        
+        Returns:
+            int: ID of the current leader, or None if no leader is known
+        """
+        return self.current_leader_id
+    
+    def is_leader(self):
+        """
+        Check if this node is the current leader.
+        
+        Returns:
+            bool: True if this node is the leader
+        """
+        return self.raft_node.state == RaftState.LEADER
+    
+    def get_known_nodes(self):
+        """
+        Get the set of known nodes in the cluster.
+        
+        Returns:
+            set: Set of known node IDs
+        """
+        return self.raft_node.known_nodes.copy() if self.raft_node.known_nodes else set()
+        
+    def get_current_term(self):
+        """
+        Get the current RAFT term.
+        
+        Returns:
+            int: Current RAFT term
+        """
+        return self.raft_node.current_term
         
     def __del__(self):
         """
