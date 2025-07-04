@@ -78,6 +78,19 @@ class Message(object):
         msg_str = str(self.__to_msg_type_string()) + ": " + str(print_dict)
         return msg_str
 
+    def set_type(self, msg_type):
+        """Set the message type."""
+        self.type = str(msg_type)
+        self.msg_params[Message.MSG_ARG_KEY_TYPE] = msg_type
+
+    def set_content(self, content):
+        """Set the message content."""
+        if isinstance(content, dict):
+            for key, value in content.items():
+                self.msg_params[key] = value
+        else:
+            self.msg_params["content"] = content
+
     def __to_msg_type_string(self):
         type = self.msg_params[Message.MSG_ARG_KEY_TYPE]
         return type
