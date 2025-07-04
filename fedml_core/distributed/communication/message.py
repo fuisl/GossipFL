@@ -15,9 +15,11 @@ class Message(object):
     MSG_OPERATION_REDUCE = "reduce"
 
     MSG_ARG_KEY_MODEL_PARAMS = "model_params"
+    MSG_ARG_KEY_MODEL_PARAMS_URL = "model_params_url"
+    MSG_ARG_KEY_MODEL_PARAMS_KEY = "model_params_key"
 
-    def __init__(self, type=0, sender_id=0, receiver_id=0):
-        self.type = type
+    def __init__(self, type="default", sender_id=0, receiver_id=0):
+        self.type = str(type)
         self.sender_id = sender_id
         self.receiver_id = receiver_id
         self.msg_params = {}
@@ -33,7 +35,12 @@ class Message(object):
         self.type = self.msg_params[Message.MSG_ARG_KEY_TYPE]
         self.sender_id = self.msg_params[Message.MSG_ARG_KEY_SENDER]
         self.receiver_id = self.msg_params[Message.MSG_ARG_KEY_RECEIVER]
-        # print("msg_params = " + str(self.msg_params))
+
+    def init_from_json_object(self, json_object):
+        self.msg_params = json_object
+        self.type = self.msg_params[Message.MSG_ARG_KEY_TYPE]
+        self.sender_id = self.msg_params[Message.MSG_ARG_KEY_SENDER]
+        self.receiver_id = self.msg_params[Message.MSG_ARG_KEY_RECEIVER]
 
     def get_sender_id(self):
         return self.sender_id
@@ -51,6 +58,8 @@ class Message(object):
         self.msg_params[key] = value
 
     def get(self, key):
+        if key not in self.msg_params.keys():
+            return None
         return self.msg_params[key]
 
     def get_type(self):
