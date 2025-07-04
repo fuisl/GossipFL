@@ -539,9 +539,6 @@ class RaftConsensus:
             if self.on_leadership_change:
                 self.on_leadership_change(self.raft_node.node_id)
 
-            # Add a no-op entry to the log
-            self.add_no_op_entry()
-
     def handle_prevote_response(self, voter_id, term, prevote_granted):
         """Handle a PreVote response message."""
         should_start_election = self.raft_node.receive_prevote_response(
