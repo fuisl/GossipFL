@@ -89,12 +89,30 @@ class PureDiscoveryServer:
             raise
     
     def stop(self):
-        """Stop the pure discovery server."""
-        if self.server:
-            self.logger.info("Stopping pure discovery server...")
-            self.server.stop()
-            self.server = None
-            self.logger.info("Pure discovery server stopped")
+        """Stop the pure discovery server (idempotent)."""
+        # Use a class-level flag to prevent multiple cleanup attempts
+        if not hasattr(self, '_stop_called'):
+            self._stop_called = threading.Event()
+        
+        if self._stop_called.is_set():
+            self.logger.debug("Stop already called for discovery server, skipping...")
+            return
+        
+        # Set the flag to prevent re-entry
+        self._stop_called.set()
+        
+        try:
+            if self.server:
+                self.logger.info("Stopping pure discovery server...")
+                self.server.stop()
+                self.server = None
+                self.logger.info("Pure discovery server stopped")
+            else:
+                self.logger.debug("Discovery server was already stopped")
+        except Exception as e:
+            self.logger.error(f"Error during server stop: {e}")
+            import traceback
+            traceback.print_exc()
     
     def wait_for_termination(self):
         """Wait for the server to terminate."""
@@ -141,8 +159,15 @@ class PureDiscoveryServer:
 def setup_signal_handlers(server: PureDiscoveryServer):
     """Set up signal handlers for graceful shutdown."""
     def signal_handler(signum, frame):
-        print(f"\nReceived signal {signum}")
-        server.stop()
+        print(f"\nReceived signal {signum}, shutting down server...")
+        
+        # Simple, idempotent cleanup
+        try:
+            server.stop()
+        except Exception as e:
+            print(f"Error during server shutdown: {e}")
+        
+        # Exit cleanly
         sys.exit(0)
     
     signal.signal(signal.SIGINT, signal_handler)

@@ -79,7 +79,7 @@ class ServiceDiscoveryClient:
     """
     
     def __init__(self, service_host: str, service_port: int, 
-                 timeout: float = 10.0, max_retry_attempts: int = 3):
+                 timeout: float = 5.0, max_retry_attempts: int = 2):
         """
         Initialize the service discovery client.
         
@@ -337,7 +337,7 @@ class ServiceDiscoveryClient:
                 "unregister_node"
             )
             
-            if response and response.status == "success":
+            if response and response.status == "removed":
                 logging.info(f"Node {node_id} unregistered successfully")
                 return True
             else:
@@ -350,6 +350,11 @@ class ServiceDiscoveryClient:
     
     def close(self):
         """Close the client connection."""
+        # Don't close connection here - let cleanup handle it
+        logging.debug("Service discovery client close requested")
+    
+    def force_close(self):
+        """Force close the client connection."""
         self._close_connection()
         logging.info("Service discovery client closed")
 
@@ -498,8 +503,8 @@ class RefactoredDynamicGRPCCommManager(BaseCommunicationManager):
             self.service_discovery_client = ServiceDiscoveryClient(
                 service_host, 
                 service_port,
-                timeout=10.0,
-                max_retry_attempts=3
+                timeout=5.0,  # 5 second timeout
+                max_retry_attempts=2
             )
             
             # Discover cluster and determine bootstrap status
@@ -933,24 +938,57 @@ class RefactoredDynamicGRPCCommManager(BaseCommunicationManager):
         return self.is_bootstrap_node_flag
     
     def cleanup(self):
-        """Clean up resources."""
+        """Clean up resources (idempotent)."""
+        # Use a class-level flag to prevent multiple cleanup attempts
+        if not hasattr(self, '_cleanup_called'):
+            self._cleanup_called = threading.Event()
+        
+        if self._cleanup_called.is_set():
+            logging.debug(f"Cleanup already called for node {self.node_id}, skipping...")
+            return
+        
+        # Set the flag to prevent re-entry
+        self._cleanup_called.set()
+        
         try:
             # Stop message handling
             self.is_running = False
             
             # Unregister from service discovery
             if self.use_service_discovery and self.service_discovery_client:
-                self.service_discovery_client.unregister_node(self.node_id)
-                self.service_discovery_client.close()
+                try:
+                    logging.info(f"Unregistering node {self.node_id} from service discovery")
+                    success = self.service_discovery_client.unregister_node(self.node_id)
+                    if success:
+                        logging.info(f"Node {self.node_id} unregistered successfully")
+                    else:
+                        logging.warning(f"Failed to unregister node {self.node_id}")
+                except Exception as e:
+                    logging.warning(f"Service discovery unregister error: {e}")
+                finally:
+                    # Close the client
+                    try:
+                        if hasattr(self.service_discovery_client, 'force_close'):
+                            self.service_discovery_client.force_close()
+                        self.service_discovery_client = None
+                    except:
+                        pass
             
             # Stop gRPC server
-            if hasattr(self, 'grpc_server'):
-                self.grpc_server.stop(grace=5)
+            if hasattr(self, 'grpc_server') and self.grpc_server:
+                try:
+                    self.grpc_server.stop(grace=2)  # Give a brief grace period
+                    logging.debug(f"gRPC server stopped for node {self.node_id}")
+                except Exception as e:
+                    logging.debug(f"gRPC server stop error: {e}")
+                finally:
+                    self.grpc_server = None
             
             logging.info(f"Communication manager cleanup completed for node {self.node_id}")
             
         except Exception as e:
             logging.error(f"Cleanup error: {e}")
+            # Don't force exit - let the process handle it naturally
     
     def __del__(self):
         """Destructor to ensure cleanup."""

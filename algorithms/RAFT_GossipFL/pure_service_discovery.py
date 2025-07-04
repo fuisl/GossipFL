@@ -581,25 +581,68 @@ class PureServiceDiscoveryServer:
             raise
     
     def stop(self):
-        """Stop the discovery server."""
-        if not self.is_running:
+        """Stop the discovery server (idempotent)."""
+        # Use a class-level flag to prevent multiple cleanup attempts
+        if not hasattr(self, '_stop_called'):
+            self._stop_called = threading.Event()
+        
+        if self._stop_called.is_set():
+            logging.debug("Stop already called for pure service discovery server, skipping...")
             return
         
-        self.is_running = False
+        # Set the flag to prevent re-entry
+        self._stop_called.set()
         
-        if self.server:
-            self.server.stop(grace=5)
-        
-        if self.http_server:
-            self.http_server.shutdown()
-        
-        if self.cleanup_thread:
-            self.cleanup_thread.join(timeout=5)
-        
-        if self.http_thread:
-            self.http_thread.join(timeout=5)
-        
-        logging.info("Pure service discovery server stopped")
+        try:
+            if not self.is_running:
+                logging.debug("Pure service discovery server was already stopped")
+                return
+            
+            self.is_running = False
+            
+            # Stop gRPC server
+            if self.server:
+                try:
+                    self.server.stop(grace=2)  # Brief grace period
+                    logging.debug("gRPC server stopped")
+                except Exception as e:
+                    logging.warning(f"Error stopping gRPC server: {e}")
+                finally:
+                    self.server = None
+            
+            # Stop HTTP server
+            if self.http_server:
+                try:
+                    self.http_server.shutdown()
+                    logging.debug("HTTP server stopped")
+                except Exception as e:
+                    logging.warning(f"Error stopping HTTP server: {e}")
+                finally:
+                    self.http_server = None
+            
+            # Stop cleanup thread
+            if self.cleanup_thread:
+                try:
+                    self.cleanup_thread.join(timeout=2)  # Brief timeout
+                except Exception as e:
+                    logging.warning(f"Error joining cleanup thread: {e}")
+                finally:
+                    self.cleanup_thread = None
+            
+            # Stop HTTP thread
+            if self.http_thread:
+                try:
+                    self.http_thread.join(timeout=2)  # Brief timeout
+                except Exception as e:
+                    logging.warning(f"Error joining HTTP thread: {e}")
+                finally:
+                    self.http_thread = None
+            
+            logging.info("Pure service discovery server stopped")
+            
+        except Exception as e:
+            logging.error(f"Error during service discovery stop: {e}")
+            # Don't force exit - let the process handle it naturally
     
     def wait_for_termination(self):
         """Wait for the server to terminate."""

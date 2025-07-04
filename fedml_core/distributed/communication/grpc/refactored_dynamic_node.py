@@ -146,8 +146,13 @@ class RefactoredDynamicNode:
             self.observer = TestObserver(self.node_id)
             self.comm_manager.add_observer(self.observer)
             
-            # Start message handling
-            self.comm_manager.handle_receive_message()
+            # Start message handling in a separate thread
+            import threading
+            self.message_handler_thread = threading.Thread(
+                target=self.comm_manager.handle_receive_message,
+                daemon=True
+            )
+            self.message_handler_thread.start()
             
             self.running = True
             
@@ -166,21 +171,41 @@ class RefactoredDynamicNode:
             raise
     
     def stop(self):
-        """Stop the dynamic node."""
-        if self.running:
-            self.logger.info(f"Stopping refactored dynamic node {self.node_id}")
-            self.running = False
-            
-            # Stop message sender
-            if self.message_sender_thread:
-                self.message_sender_thread.join(timeout=5)
-            
-            # Clean up communication manager
-            if self.comm_manager:
-                self.comm_manager.cleanup()
-                self.comm_manager = None
-            
-            self.logger.info(f"Refactored dynamic node {self.node_id} stopped")
+        """Stop the dynamic node (idempotent)."""
+        # Use a class-level flag to prevent multiple cleanup attempts
+        if not hasattr(self, '_stop_called'):
+            self._stop_called = threading.Event()
+        
+        if self._stop_called.is_set():
+            self.logger.debug(f"Stop already called for node {self.node_id}, skipping...")
+            return
+        
+        # Set the flag to prevent re-entry
+        self._stop_called.set()
+        
+        try:
+            if self.running:
+                self.logger.info(f"Stopping refactored dynamic node {self.node_id}")
+                self.running = False
+                
+                # Clean up communication manager
+                if self.comm_manager:
+                    try:
+                        self.comm_manager.cleanup()
+                    except Exception as e:
+                        self.logger.error(f"Error during cleanup: {e}")
+                        import traceback
+                        traceback.print_exc()
+                    finally:
+                        self.comm_manager = None
+                
+                self.logger.info(f"Refactored dynamic node {self.node_id} stopped")
+            else:
+                self.logger.debug(f"Node {self.node_id} was already stopped")
+        except Exception as e:
+            self.logger.error(f"Error during stop: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _print_node_info(self):
         """Print node information."""
@@ -314,11 +339,15 @@ class RefactoredDynamicNode:
 def setup_signal_handlers(node: RefactoredDynamicNode):
     """Set up signal handlers for graceful shutdown."""
     def signal_handler(signum, frame):
-        print(f"\nReceived signal {signum}")
-        print("Shutting down gracefully...")
-        node.stop()
-        # Give a moment for cleanup
-        time.sleep(0.5)
+        print(f"\nReceived signal {signum}, shutting down...")
+        
+        # Simple, idempotent cleanup
+        try:
+            node.stop()
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
+        
+        # Exit cleanly
         sys.exit(0)
     
     signal.signal(signal.SIGINT, signal_handler)
@@ -445,13 +474,15 @@ Examples:
             time.sleep(1)
         
     except KeyboardInterrupt:
-        # This should not be reached due to signal handler, but kept as backup
         print("\nShutdown signal received...")
         node.stop()
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Unexpected error: {e}")
         node.stop()
-        sys.exit(1)
+    finally:
+        # Ensure cleanup happens
+        node.stop()
+        print("Node shutdown complete.")
 
 
 if __name__ == "__main__":
