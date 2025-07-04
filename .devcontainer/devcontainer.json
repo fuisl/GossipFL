@@ -16,10 +16,13 @@
 	// Configure tool-specific properties.
 	// "customizations": {},
 
-    "runArgs": [
+	// Uncomment when running on non-github-codespaces.
+    /*
+	"runArgs": [
         "--gpus",
         "all"
     ],
+	*/
 
 	// Uncomment to connect as root instead. More info: https://aka.ms/dev-containers-non-root.
 	"remoteUser": "dev"
