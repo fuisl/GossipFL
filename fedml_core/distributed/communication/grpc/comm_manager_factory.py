@@ -9,6 +9,7 @@ import logging
 from typing import Optional, Dict, List, Any
 from .grpc_comm_manager import GRPCCommManager
 from .dynamic_grpc_comm_manager import DynamicGRPCCommManager
+from .refactored_dynamic_grpc_comm_manager import RefactoredDynamicGRPCCommManager
 
 
 class CommManagerFactory:
@@ -30,6 +31,8 @@ class CommManagerFactory:
         use_gateway: bool = True,
         # Static configuration parameters
         ip_config_path: Optional[str] = None,
+        # Refactored version parameter
+        use_refactored: bool = False,
         **kwargs
     ):
         """
@@ -48,6 +51,7 @@ class CommManagerFactory:
             metadata: Additional metadata (for dynamic_grpc)
             use_gateway: Whether to use gateway service discovery (for dynamic_grpc)
             ip_config_path: Path to static IP configuration file
+            use_refactored: Whether to use the refactored version (for dynamic_grpc)
             **kwargs: Additional parameters
             
         Returns:
@@ -55,19 +59,34 @@ class CommManagerFactory:
         """
         
         if communication_type == "dynamic_grpc":
-            return DynamicGRPCCommManager(
-                host=host,
-                port=port,
-                node_id=node_id,
-                client_num=client_num,
-                topic=topic,
-                gateway_host=gateway_host,
-                gateway_port=gateway_port,
-                capabilities=capabilities,
-                metadata=metadata,
-                ip_config_path=ip_config_path,
-                use_gateway=use_gateway
-            )
+            if use_refactored:
+                return RefactoredDynamicGRPCCommManager(
+                    host=host,
+                    port=port,
+                    node_id=node_id,
+                    client_num=client_num,
+                    topic=topic,
+                    service_discovery_host=gateway_host,
+                    service_discovery_port=gateway_port,
+                    capabilities=capabilities,
+                    metadata=metadata,
+                    ip_config_path=ip_config_path,
+                    use_service_discovery=use_gateway
+                )
+            else:
+                return DynamicGRPCCommManager(
+                    host=host,
+                    port=port,
+                    node_id=node_id,
+                    client_num=client_num,
+                    topic=topic,
+                    gateway_host=gateway_host,
+                    gateway_port=gateway_port,
+                    capabilities=capabilities,
+                    metadata=metadata,
+                    ip_config_path=ip_config_path,
+                    use_gateway=use_gateway
+                )
         
         elif communication_type == "grpc":
             if not ip_config_path:
@@ -147,6 +166,41 @@ class CommManagerFactory:
             topic=topic,
             client_id=node_id,
             client_num=client_num
+        )
+
+    @staticmethod
+    def create_refactored_dynamic_grpc_manager(
+        host: str,
+        port: int,
+        node_id: int,
+        client_num: int = 1,
+        service_discovery_host: str = "localhost",
+        service_discovery_port: int = 8090,
+        capabilities: List[str] = None,
+        metadata: Dict[str, Any] = None,
+        fallback_ip_config: Optional[str] = None,
+        use_service_discovery: bool = True
+    ) -> RefactoredDynamicGRPCCommManager:
+        """
+        Create a refactored dynamic gRPC communication manager with pure service discovery.
+        
+        This version uses the new pure service discovery architecture:
+        - No polling mechanisms
+        - Direct gRPC calls to service discovery
+        - Event-driven registration and discovery
+        - Robust fault tolerance
+        """
+        return RefactoredDynamicGRPCCommManager(
+            host=host,
+            port=port,
+            node_id=node_id,
+            client_num=client_num,
+            service_discovery_host=service_discovery_host,
+            service_discovery_port=service_discovery_port,
+            capabilities=capabilities or ['grpc', 'fedml'],
+            metadata=metadata or {},
+            ip_config_path=fallback_ip_config,
+            use_service_discovery=use_service_discovery
         )
 
 

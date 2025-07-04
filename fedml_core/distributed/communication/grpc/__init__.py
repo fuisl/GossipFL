@@ -10,6 +10,7 @@ from .grpc_comm_manager import GRPCCommManager
 # Import dynamic components - use try/except for robustness
 try:
     from .dynamic_grpc_comm_manager import DynamicGRPCCommManager, NodeInfo
+    from .refactored_dynamic_grpc_comm_manager import RefactoredDynamicGRPCCommManager
     from .comm_manager_factory import (
         CommManagerFactory,
         AutoCommManager,
@@ -19,6 +20,7 @@ try:
     __all__ = [
         "GRPCCommManager",
         "DynamicGRPCCommManager",
+        "RefactoredDynamicGRPCCommManager",
         "NodeInfo",
         "CommManagerFactory",
         "AutoCommManager",

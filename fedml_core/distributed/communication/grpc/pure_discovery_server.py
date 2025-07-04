@@ -50,19 +50,15 @@ class PureDiscoveryServer:
         self.log_level = log_level
         self.server: Optional[PureServiceDiscoveryServer] = None
         
-        # Configure logging - Fix duplicate logging by configuring only once
-        self.logger = logging.getLogger(__name__)
-        
-        # Only configure if root logger has no handlers (prevents duplicate logging)
-        if not logging.root.handlers:
-            logging.basicConfig(
-                level=getattr(logging, log_level.upper()),
-                format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                handlers=[
-                    logging.StreamHandler(sys.stdout),
-                    logging.FileHandler('pure_discovery_server.log')
-                ]
-            )
+        # Configure logging
+        logging.basicConfig(
+            level=getattr(logging, log_level.upper()),
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.StreamHandler(sys.stdout),
+                logging.FileHandler('pure_discovery_server.log')
+            ]
+        )
         
         self.logger = logging.getLogger(__name__)
         self.logger.info(f"Pure discovery server initialized - {host}:{port}")
@@ -146,10 +142,7 @@ def setup_signal_handlers(server: PureDiscoveryServer):
     """Set up signal handlers for graceful shutdown."""
     def signal_handler(signum, frame):
         print(f"\nReceived signal {signum}")
-        print("Shutting down gracefully...")
         server.stop()
-        # Give a moment for cleanup
-        time.sleep(0.5)
         sys.exit(0)
     
     signal.signal(signal.SIGINT, signal_handler)
@@ -176,7 +169,6 @@ def print_stats_periodically(server: PureDiscoveryServer, interval: int):
                 if nodes:
                     print(f"\nRegistered Nodes:")
                     for node in nodes:
-                        # Handle DiscoveryNodeInfo dataclass objects
                         status = node.status.value if hasattr(node.status, 'value') else str(node.status)
                         last_seen = node.last_seen
                         time_since_seen = time.time() - last_seen
@@ -258,8 +250,7 @@ Examples:
         server.wait_for_termination()
         
     except KeyboardInterrupt:
-        # This should not be reached due to signal handler, but kept as backup
-        print("\nShutdown signal received...")
+        print("\nShutting down...")
         server.stop()
     except Exception as e:
         print(f"Error: {e}")
