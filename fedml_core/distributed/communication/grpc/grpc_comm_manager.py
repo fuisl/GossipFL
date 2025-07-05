@@ -890,7 +890,15 @@ class RefactoredDynamicGRPCCommManager(BaseCommunicationManager):
         while self.is_running:
             try:
                 # Check for messages in the gRPC servicer queue
-                msg_type, msg_params = self.grpc_servicer.message_q.get()
+                msg_bytes = self.grpc_servicer.message_q.get()
+                
+                # Deserialize the message
+                try:
+                    msg_params = pickle.loads(msg_bytes)
+                    msg_type = msg_params.get_type()
+                except (pickle.UnpicklingError, AttributeError) as e:
+                    logging.error(f"Failed to deserialize message: {e}")
+                    continue
                 
                 logging.debug(f"Received message type: {msg_type}")
                 
