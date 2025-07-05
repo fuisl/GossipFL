@@ -400,7 +400,7 @@ class RaftNodeWithBridge:
     def handle_raft_message(self, msg_type: str, msg_params):
         """Handle incoming RAFT messages."""
         try:
-            data = msg_params.get('data', {})
+            data = msg_params.get('data')
             
             if msg_type == 'raft_vote_request':
                 self.raft_consensus.handle_vote_request(

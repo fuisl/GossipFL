@@ -36,6 +36,7 @@ from typing import Dict, List, Optional, Any
 from unittest.mock import Mock, MagicMock
 from dataclasses import dataclass
 import grpc
+import traceback
 
 # Add the project root to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -69,6 +70,14 @@ class MockArgs:
     dataset: str = 'cifar10'
     data_dir: str = './data'
     log_level: str = 'INFO'
+    backend: str = 'gRPC'
+    compression: str = "topk"
+    compress_ratio: float = 0.1
+    quantize_level: int = 8
+    is_biased: int = 0
+    # Additional fields that might be needed
+    warmup_epochs: int = 0
+    Failure_chance: Optional[float] = None
 
 
 class MockTrainer:
@@ -121,7 +130,8 @@ class MockTopologyManager:
     def __init__(self, node_id: int):
         self.node_id = node_id
         self.neighbors = set()
-        self.topology = {}
+        # Initialize topology with the current node to avoid KeyError
+        self.topology = {node_id: []}
         
     def get_topology(self) -> Dict[int, List[int]]:
         """Get current topology."""
@@ -136,6 +146,15 @@ class MockTopologyManager:
         self.topology = new_topology
         self.neighbors = set(new_topology.get(self.node_id, []))
         logging.info(f"Node {self.node_id}: Updated topology with {len(self.neighbors)} neighbors")
+    
+    def generate_topology(self, t: int = 0):
+        """Generate topology for a given round."""
+        # For testing, just maintain the existing topology
+        pass
+    
+    def get_out_neighbor_idx_list(self, node_id: int) -> List[int]:
+        """Get list of outgoing neighbors for a node."""
+        return self.topology.get(node_id, [])
 
 
 class MockBandwidthManager:
@@ -153,6 +172,13 @@ class MockBandwidthManager:
         """Update bandwidth measurements."""
         self.bandwidth_data = measurements
         logging.info(f"Node {self.node_id}: Updated bandwidth measurements")
+    
+    def apply_bandwidth_update(self, update_data: Dict[str, Any]):
+        """Apply bandwidth update from state snapshot."""
+        if 'matrix' in update_data:
+            # Convert matrix to dict format
+            matrix = update_data['matrix']
+            self.bandwidth_data = {i: float(val) for i, val in enumerate(matrix) if val > 0}
 
 
 class MockTimer:
@@ -181,6 +207,8 @@ class MockMetrics:
     def __init__(self, node_id: int):
         self.node_id = node_id
         self.metrics = {}
+        # Add metric_names attribute expected by RuntimeTracker
+        self.metric_names = ['accuracy', 'loss', 'samples', 'round']
         
     def record_metric(self, name: str, value: Any):
         """Record a metric."""
@@ -229,6 +257,19 @@ class StandaloneRaftNode:
         # Create mock worker
         self.worker = Mock()
         self.worker.node_id = self.node_id
+        self.worker.num_iterations = 10  # Mock number of iterations per epoch
+        self.worker.param_groups = []  # Mock parameter groups
+        self.worker.param_names = []   # Mock parameter names
+        self.worker.shapes = {}        # Mock parameter shapes
+        self.worker.neighbor_hat_params = {"memory": {}}  # Mock neighbor parameters
+        
+        # Mock methods that might be called
+        self.worker.refresh_gossip_info = Mock()
+        self.worker.init_neighbor_hat_params = Mock()
+        self.worker.get_dataset_len = Mock(return_value=1000)
+        self.worker.aggregate = Mock()
+        self.worker.train_one_step = Mock(return_value=(0.5, None, None))  # (loss, output, target)
+        self.worker.set_coordinator = Mock()
         
         # Create RAFT components
         self.raft_node = RaftNode(self.node_id, args)
@@ -256,9 +297,16 @@ class StandaloneRaftNode:
             raft_consensus=self.raft_consensus,
             bandwidth_manager=self.bandwidth_manager
         )
+
+        self.worker_manager.register_message_receive_handlers()
         
         # Now set the worker manager in the consensus
         self.raft_consensus.worker_manager = self.worker_manager
+        
+        # Register the service discovery bridge with the communication manager
+        if hasattr(self.worker_manager, 'service_discovery_bridge'):
+            self.worker_manager.service_discovery_bridge.register_with_comm_manager(self.comm_manager)
+            self.logger.info("Service discovery bridge registered with communication manager")
         
         # Setup monitoring
         self.status_monitor = StatusMonitor(self)
@@ -281,10 +329,18 @@ class StandaloneRaftNode:
             self.logger.info(f"Starting RAFT node {self.node_id}")
             
             # Start gRPC communication manager
-            self.comm_manager.handle_receive_message()
+            self.comm_thread = threading.Thread(
+                target=self.worker_manager.com_manager.handle_receive_message,
+                daemon=True,
+                name=f"CommHandler-{self.node_id}"
+            )
+            self.comm_thread.start()
             
             # Start status monitoring
             self.status_monitor.start()
+
+            # Initialize RAFT state based on discovered nodes
+            self._initialize_raft_state()
             
             # Start RAFT consensus
             self.raft_consensus.start()
@@ -350,6 +406,58 @@ class StandaloneRaftNode:
         except Exception as e:
             self.logger.error(f"Error getting status: {e}")
             return {'error': str(e)}
+    
+    def _initialize_raft_state(self):
+        """Initialize RAFT state based on discovered nodes."""
+        self.logger.info("Initializing RAFT state based on discovered nodes...")
+        
+        # Get cluster nodes from communication manager
+        cluster_nodes = self.comm_manager.get_cluster_nodes_info()
+        discovered_nodes = list(cluster_nodes.keys())
+        
+        if not discovered_nodes:
+            self.logger.warning("No nodes discovered from service discovery")
+            # Wait a bit more and try again
+            time.sleep(3)
+            cluster_nodes = self.comm_manager.get_cluster_nodes_info()
+            discovered_nodes = list(cluster_nodes.keys())
+        
+        if not discovered_nodes:
+            self.logger.warning("Still no nodes discovered - assuming bootstrap node")
+            discovered_nodes = [self.node_id]
+        
+        # Update known nodes in RAFT
+        self.raft_node.update_known_nodes(node_ids=discovered_nodes)
+        self.logger.info(f"Discovered nodes: {discovered_nodes}")
+        
+        # Simple logic: if only this node exists, it's the bootstrap node
+        other_nodes = [n for n in discovered_nodes if n != self.node_id]
+        
+        if len(other_nodes) == 0:
+            # Bootstrap node: become leader immediately
+            self.logger.info("Bootstrap node detected - becoming leader")
+            result = self.raft_node.bootstrap_detection(set(discovered_nodes))
+            if result:
+                self.logger.info("Bootstrap successful - node is now leader")
+            else:
+                self.logger.error("Bootstrap failed")
+        else:
+            # Joining node: actively initiate join protocol
+            self.logger.info(f"Joining existing cluster with nodes: {other_nodes}")
+            self.logger.info("Initiating cluster join via request_cluster_join...")
+            
+            try:
+                # Use the worker manager's request_cluster_join to initiate handshake
+                join_result = self.worker_manager.request_cluster_join()
+                if join_result:
+                    self.logger.info("Cluster join request sent successfully")
+                    self.logger.info("Waiting for leader to process join and sync state...")
+                else:
+                    self.logger.error("Failed to send cluster join request")
+                    self.logger.info("Will stay in INITIAL state and wait for leader contact")
+            except Exception as e:
+                self.logger.error(f"Error during cluster join: {e}")
+                self.logger.info("Will stay in INITIAL state and wait for leader contact")
 
 
 class StatusMonitor:
@@ -412,9 +520,9 @@ def main():
     parser.add_argument('--min-election-timeout', type=int, default=150, help='Min election timeout (ms)')
     parser.add_argument('--max-election-timeout', type=int, default=300, help='Max election timeout (ms)')
     parser.add_argument('--heartbeat-interval', type=int, default=50, help='Heartbeat interval (ms)')
-    parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
+    parser.add_argument('--log-level', default='DEBUG', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
     parser.add_argument('--comm-round', type=int, default=100, help='Communication rounds')
-    
+
     args = parser.parse_args()
     
     # Auto-assign port if not specified
@@ -474,11 +582,12 @@ def main():
         print("\nReceived interrupt signal...")
     except Exception as e:
         print(f"Error: {e}")
+        traceback.print_exc()
         return 1
     finally:
         if node:
             node.shutdown()
-    
+
     return 0
 
 

@@ -1330,77 +1330,100 @@ class RaftNode:
 
             return self.log[array_idx]["term"]
     
-    def add_node(self, new_node_id, round_num=0):
+    def add_node(self, new_node_info, round_num=0):
         """
-        Add a new node to the cluster (leaders only).
+        Add a new node to the cluster with connection information.
         
         Args:
-            new_node_id (int): ID of the new node
-            round_num (int, optional): Current training round number
-            
+            new_node_info: Can be either:
+                - int: Just the node ID (for backward compatibility)
+                - dict: Dictionary containing node_id, ip_address, port, etc.
+            round_num (int): Current training round number
+                
         Returns:
             int: Log index of the membership entry, or -1 on failure
         """
         with self.state_lock:
             try:
                 if self.state != RaftState.LEADER:
-                    logging.warning(
-                        f"Node {self.node_id}: Cannot add node {new_node_id} - not a leader"
-                    )
+                    logging.warning(f"Node {self.node_id}: Cannot add node - not a leader")
                     return -1
-                    
-                if new_node_id in self.known_nodes:
-                    logging.debug(
-                        f"Leader {self.node_id}: Node {new_node_id} already in cluster, no action needed"
-                    )
-                    return -1  # Already known, nothing appended
                 
-                # Make a copy of current nodes for the log entry (for consistency)
+                # Extract node ID and connection info from parameter
+                if isinstance(new_node_info, dict):
+                    new_node_id = new_node_info.get('node_id')
+                    if new_node_id is None:
+                        logging.error(f"Leader {self.node_id}: No node_id found in node info")
+                        return -1
+                    
+                    # Extract connection information
+                    node_connection_info = {
+                        'ip_address': new_node_info.get('ip_address', 'localhost'),
+                        'port': new_node_info.get('port', 9000 + new_node_id),
+                        'capabilities': new_node_info.get('capabilities', ['grpc', 'fedml']),
+                        'timestamp': new_node_info.get('timestamp', time.time())
+                    }
+                else:
+                    # Backward compatibility - just node ID
+                    new_node_id = new_node_info
+                    node_connection_info = {
+                        'ip_address': 'localhost',
+                        'port': 9000 + new_node_id,
+                        'capabilities': ['grpc', 'fedml'],
+                        'timestamp': time.time()
+                    }
+                
+                # Check if node already exists
+                if new_node_id in self.known_nodes:
+                    logging.debug(f"Leader {self.node_id}: Node {new_node_id} already in cluster")
+                    return -1
+                
+                # Store connection information locally
+                if not hasattr(self, 'node_connection_info'):
+                    self.node_connection_info = {}
+                self.node_connection_info[new_node_id] = node_connection_info
+                
+                # Create membership log entry with complete connection info
                 current_nodes = set(self.known_nodes)
                 current_nodes.add(new_node_id)
                 
-                # Initialize leader state for the new node (before applying changes)
-                # This allows us to start sending AppendEntries to the new node right away
-                last_log_index = self.first_log_index + len(self.log) - 1 if len(self.log) > 0 else 0
-                self.next_index[new_node_id] = last_log_index + 1
-                self.match_index[new_node_id] = 0
+                # Collect connection info for all nodes
+                current_nodes_info = {}
+                for node_id in current_nodes:
+                    if hasattr(self, 'node_connection_info') and node_id in self.node_connection_info:
+                        current_nodes_info[node_id] = self.node_connection_info[node_id]
                 
-                # Add a log entry for the membership change
-                # We include current_nodes to ensure all nodes have the same view
+                # Add log entry with complete node and connection information
                 log_index = self.add_log_entry({
                     'type': 'membership',
                     'action': 'add',
                     'node_id': new_node_id,
-                    'current_nodes': list(current_nodes),  # Convert set to list for JSON serialization
+                    'node_info': node_connection_info,  # Connection info for the new node
+                    'current_nodes': list(current_nodes),  # All current nodes
+                    'current_nodes_info': current_nodes_info,  # Connection info for all nodes
                     'round': round_num
                 })
                 
                 if log_index == -1:
                     logging.error(f"Leader {self.node_id}: Failed to add log entry for node addition")
-                    # Clean up our premature leader state updates
-                    if new_node_id in self.next_index:
-                        del self.next_index[new_node_id]
-                    if new_node_id in self.match_index:
-                        del self.match_index[new_node_id]
                     return -1
                 
-                # Only update known_nodes after successful log entry creation
-                # The actual change will be applied when the entry is committed
-                self.known_nodes.add(new_node_id)
-                self.update_known_nodes(len(self.known_nodes))
+                # Initialize leader state for the new node
+                last_log_index = self.first_log_index + len(self.log) - 1 if len(self.log) > 0 else 0
+                self.next_index[new_node_id] = last_log_index + 1
+                self.match_index[new_node_id] = 0
                 
-                logging.info(
-                    f"Leader {self.node_id}: Added new node {new_node_id} to cluster at round {round_num}"
-                )
+                # Update known nodes
+                self.known_nodes.add(new_node_id)
+                self.update_known_nodes(node_ids=list(self.known_nodes))
+                
+                logging.info(f"Leader {self.node_id}: Added node {new_node_id} with connection info " +
+                            f"{node_connection_info['ip_address']}:{node_connection_info['port']} at round {round_num}")
+                
                 return log_index
                 
             except Exception as e:
-                logging.error(f"Leader {self.node_id}: Error adding node {new_node_id}: {e}", exc_info=True)
-                # Clean up if we failed after initializing leader state
-                if new_node_id in self.next_index:
-                    del self.next_index[new_node_id]
-                if new_node_id in self.match_index:
-                    del self.match_index[new_node_id]
+                logging.error(f"Leader {self.node_id}: Error adding node: {e}", exc_info=True)
                 return -1
     
     def remove_node(self, node_id, round_num=0, reason="unspecified"):

@@ -60,7 +60,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         self.cluster_size = size  # Initial size, can change dynamically
         
         # Initialize service discovery bridge for dynamic membership management
-        self.service_discovery_bridge = RaftServiceDiscoveryBridge(node_id, raft_consensus)
+        self.service_discovery_bridge = RaftServiceDiscoveryBridge(node_id, raft_consensus, self)
         
         # Register the bridge with this worker manager as the communication manager
         self.service_discovery_bridge.register_with_comm_manager(self)
@@ -629,7 +629,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
         term = msg_params.get(RaftMessage.MSG_ARG_TERM)
         success = msg_params.get(RaftMessage.MSG_ARG_SUCCESS)
-        match_index = msg_params.get(RaftMessage.MSG_ARG_MATCH_INDEX, 0)
+        match_index = msg_params.get(RaftMessage.MSG_ARG_MATCH_INDEX)
         
         logging.debug(f"Received AppendResponse from {sender_id}, term={term}, success={success}")
         
@@ -763,7 +763,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         Enhanced to validate RAFT consistency before applying parameters.
         """
         params = msg_params.get(RaftMessage.MSG_ARG_MODEL_PARAMS)
-        raft_metadata = msg_params.get(RaftMessage.MSG_ARG_RAFT_METADATA, {})
+        raft_metadata = msg_params.get(RaftMessage.MSG_ARG_RAFT_METADATA)
         
         if params is not None and hasattr(self.worker, "model_trainer"):
             # Validate RAFT consistency before applying parameters
@@ -793,8 +793,8 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         """
         try:
             # Extract sender ID from message parameters using standardized method
-            sender_id = self._extract_sender_id(msg_params)
-            node_info = msg_params.get('node_info', {})
+            sender_id = msg_params.get_sender_id()
+            node_info = msg_params.get(RaftMessage.MSG_ARG_NODE_INFO)
             
             logging.info(f"Received join request from node {sender_id}")
             
@@ -808,6 +808,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                     self.send_join_response(sender_id, success, leader_id)
         
         except Exception as e:
+            traceback.print_exc()
             logging.error(f"Error handling join request: {e}")
     
     def handle_join_response(self, msg_params):
@@ -816,8 +817,8 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         
         This method processes join responses and initiates proper state synchronization.
         """
-        sender_id = self._extract_sender_id(msg_params)
-        success = msg_params.get(RaftMessage.MSG_ARG_SUCCESS, False)
+        sender_id = msg_params.get_sender_id()
+        success = msg_params.get(RaftMessage.MSG_ARG_SUCCESS)
         leader_id = msg_params.get(RaftMessage.MSG_ARG_LEADER_ID)
         error_msg = msg_params.get(RaftMessage.MSG_ARG_ERROR_MSG)
         
@@ -825,42 +826,20 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             logging.info(f"Join request accepted, leader is {leader_id}")
             self.coordinator_id = leader_id
             
+            # Transition from INITIAL to FOLLOWER state
+            if self.raft_consensus.raft_node.state == RaftState.INITIAL:
+                self.raft_consensus.raft_node.state = RaftState.FOLLOWER
+                self.raft_consensus.raft_node.current_term = 0
+                self.raft_consensus.raft_node.voted_for = None
+                self.raft_consensus.raft_node.reset_election_timeout()
+                logging.info(f"Node {self.node_id} transitioned from INITIAL to FOLLOWER after successful join")
+            
             # Request state synchronization from leader
             if leader_id != self.node_id:
                 self.send_state_request(leader_id)
         else:
             logging.error(f"Join request rejected by {sender_id}: {error_msg}")
             # Could implement retry logic here
-    
-    def _extract_sender_id(self, msg_params):
-        """
-        Extract sender ID from message parameters using standardized logic.
-        
-        Args:
-            msg_params: Message parameters (dict or message object)
-            
-        Returns:
-            int: Sender ID if found, None otherwise
-        """
-        if not isinstance(msg_params, dict):
-            return None
-            
-        # Try the standard FedML message framework key first
-        sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
-        
-        # If not found, try common alternatives
-        if sender_id is None:
-            sender_id = msg_params.get('sender_id')
-            
-        # If still not found, try to get from message object
-        if sender_id is None:
-            message = msg_params.get('message')
-            if message and hasattr(message, 'sender'):
-                sender_id = message.sender
-            elif message and hasattr(message, 'get_sender'):
-                sender_id = message.get_sender()
-        
-        return sender_id
 
     # RAFT message sending methods
     

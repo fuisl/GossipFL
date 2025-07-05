@@ -7,6 +7,7 @@ When nodes are discovered/lost, this bridge converts them to RAFT membership pro
 
 import logging
 import threading
+import time
 from typing import Optional, Dict, Any
 
 
@@ -17,16 +18,18 @@ class RaftServiceDiscoveryBridge:
     Receives service discovery events and translates them into RAFT operations.
     """
     
-    def __init__(self, node_id: int, raft_consensus=None):
+    def __init__(self, node_id: int, raft_consensus=None, worker_manager=None):
         """
         Initialize the service discovery bridge.
         
         Args:
             node_id: Local node identifier
             raft_consensus: RAFT consensus manager (can be set later)
+            worker_manager: Worker manager for sending messages (can be set later)
         """
         self.node_id = node_id
         self.raft_consensus = raft_consensus
+        self.worker_manager = worker_manager
         self.comm_manager = None
         self.lock = threading.RLock()
         
@@ -159,8 +162,8 @@ class RaftServiceDiscoveryBridge:
             
             # Only leaders can process join requests
             if not self.raft_consensus.is_leader():
-                logging.info(f"Bridge: Not leader, redirecting join request")
-                return False
+                logging.info(f"Bridge: Not leader, forwarding join request to leader")
+                return self._forward_join_request_to_leader(joining_node_id, node_info)
             
             # Propose adding the node
             self._propose_add_node(joining_node_id, type('NodeInfo', (), node_info)())
@@ -170,6 +173,50 @@ class RaftServiceDiscoveryBridge:
             logging.error(f"Bridge: Error handling join request from {joining_node_id}: {e}")
             return False
     
+    def handle_node_discovered(self, node_id: int, node_info: Dict[str, Any] = None):
+        """Handle a node discovery event for joining the cluster."""
+        try:
+            # If this is self-discovery, send join request to discovered nodes
+            if node_id == self.node_id:
+                logging.info(f"Bridge: Self-discovery for node {node_id}, sending join request")
+                
+                # Get discovered nodes from communication manager
+                if not self.comm_manager:
+                    logging.error(f"Bridge: No communication manager available")
+                    return False
+                
+                cluster_nodes = self.comm_manager.get_cluster_nodes_info()
+                other_nodes = [n for n in cluster_nodes.keys() if n != self.node_id]
+                
+                if not other_nodes:
+                    logging.warning(f"Bridge: No other nodes discovered, cannot join cluster")
+                    return False
+                
+                # Create default node info if not provided
+                if node_info is None:
+                    node_info = {
+                        'node_id': node_id,
+                        'ip_address': 'localhost',
+                        'port': 9000 + node_id,
+                        'capabilities': ['grpc', 'fedml'],
+                        'timestamp': time.time()
+                    }
+                
+                # Send join request to the first discovered node (assume it's leader or will forward)
+                target_node = other_nodes[0]
+                
+                if hasattr(self, 'worker_manager') and self.worker_manager:
+                    self.worker_manager.send_join_request(target_node, node_info)
+                    logging.info(f"Bridge: Sent join request to node {target_node}")
+                    return True
+                else:
+                    logging.error(f"Bridge: No worker manager available to send join request")
+                    return False
+                    
+        except Exception as e:
+            logging.error(f"Bridge: Error handling node discovered event for {node_id}: {e}")
+            return False
+
     def on_membership_change(self, new_nodes: set, round_num: int = 0):
         """
         Handle membership change notifications from RAFT consensus.
@@ -239,3 +286,32 @@ class RaftServiceDiscoveryBridge:
                 
         except Exception as e:
             logging.error(f"Bridge: Error stopping service discovery bridge: {e}")
+
+    def _forward_join_request_to_leader(self, joining_node_id: int, node_info: Dict[str, Any]) -> bool:
+        """Forward join request to the current leader."""
+        try:
+            # Get the current leader from RAFT consensus
+            leader_id = self.raft_consensus.get_current_leader()
+            
+            if leader_id is None:
+                logging.warning(f"Bridge: No known leader to forward join request")
+                return False
+            
+            # Send join request message to leader
+            if hasattr(self, 'worker_manager') and self.worker_manager:
+                self.worker_manager.send_join_request(leader_id, node_info)
+                logging.info(f"Bridge: Forwarded join request from {joining_node_id} to leader {leader_id}")
+                return True
+            else:
+                logging.error(f"Bridge: No worker manager available to forward join request")
+                return False
+                
+        except Exception as e:
+            logging.error(f"Bridge: Error forwarding join request to leader: {e}")
+            return False
+        
+    def set_worker_manager(self, worker_manager):
+        """Set the worker manager reference."""
+        with self.lock:
+            self.worker_manager = worker_manager
+            logging.info(f"Bridge: Worker manager set for node {self.node_id}")
