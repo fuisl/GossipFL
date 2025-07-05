@@ -265,6 +265,12 @@ class RaftNode:
                         last_log_term=last_log_term
                     )
                 
+                # Check if we already have majority prevotes (for single-node cluster)
+                if len(self.prevotes_received) >= self.majority:
+                    logging.info(f"Node {self.node_id}: Already have majority prevotes ({len(self.prevotes_received)}/{self.majority}), proceeding to election")
+                    # Proceed directly to election since we have majority
+                    return self._proceed_to_election_from_prevote()
+                
                 return True
                 
             except Exception as e:
@@ -2309,3 +2315,78 @@ class RaftNode:
         with self.state_lock:
             self.discovered_through_service_discovery = True
             logging.debug(f"Node {self.node_id}: Marked as discovered through service discovery")
+    
+    def _proceed_to_election_from_prevote(self):
+        """
+        Proceed to actual election after getting majority prevotes.
+        
+        This method transitions from PREVOTE to CANDIDATE state and starts
+        the actual election process.
+        
+        Returns:
+            bool: True if successfully transitioned to election, False otherwise
+        """
+        try:
+            # We should be in PREVOTE state with majority prevotes
+            if self.state != RaftState.PREVOTE:
+                logging.error(f"Node {self.node_id}: Cannot proceed to election from {self.state} state")
+                return False
+            
+            if len(self.prevotes_received) < self.majority:
+                logging.error(f"Node {self.node_id}: Insufficient prevotes {len(self.prevotes_received)}/{self.majority}")
+                return False
+            
+            # Transition to CANDIDATE state
+            old_term = self.current_term
+            self.current_term = self.prevote_term  # Use the term we got prevotes for
+            self.voted_for = self.node_id
+            self.state = RaftState.CANDIDATE
+            
+            # Reset votes for actual election
+            self.votes_received = {self.node_id}  # Vote for ourselves
+            
+            # Clear prevote state
+            self.prevote_requested = False
+            self.prevotes_received.clear()
+            self.prevote_term = 0
+            
+            # Notify state change
+            if hasattr(self, 'on_state_change') and callable(self.on_state_change):
+                self.on_state_change(RaftState.CANDIDATE)
+            
+            logging.info(f"Node {self.node_id}: Transitioned to CANDIDATE for term {self.current_term} " +
+                        f"(previous term: {old_term})")
+            
+            # For single-node cluster, immediately become leader
+            if len(self.known_nodes) == 1 and self.node_id in self.known_nodes:
+                logging.info(f"Node {self.node_id}: Single-node cluster detected, becoming leader immediately")
+                return self.become_leader()
+            
+            # For multi-node cluster, proceed with election
+            # Send vote requests to other nodes
+            last_log_index, last_log_term = self.get_last_log_info()
+            
+            logging.info(f"Node {self.node_id}: Starting election for term {self.current_term} " +
+                        f"(previous term: {old_term}, known nodes: {len(self.known_nodes)})")
+            
+            # Start election timeout for this election
+            self.reset_election_timeout()
+            
+            if hasattr(self, 'consensus_manager') and self.consensus_manager is not None:
+                self.consensus_manager.broadcast_vote_request(
+                    candidate_id=self.node_id,
+                    term=self.current_term,
+                    last_log_index=last_log_index,
+                    last_log_term=last_log_term
+                )
+            
+            return True
+            
+        except Exception as e:
+            logging.error(f"Node {self.node_id}: Error proceeding to election from prevote: {e}")
+            # Reset to FOLLOWER state on error
+            self.state = RaftState.FOLLOWER
+            self.prevote_requested = False
+            self.prevotes_received.clear()
+            self.prevote_term = 0
+            return False
