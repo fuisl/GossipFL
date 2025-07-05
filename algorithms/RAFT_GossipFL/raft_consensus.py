@@ -108,11 +108,13 @@ class RaftConsensus:
         self.replication_interval = getattr(args, "replication_interval", self.raft_node.heartbeat_interval)
         
         # Initialize discovery hint sender if discovery service is configured
+        # DISABLED: HTTP-based hints don't work with gRPC service discovery
         self.discovery_hint_sender = None
         discovery_host = getattr(args, "discovery_host", None)
         discovery_port = getattr(args, "discovery_port", None)
         
-        if discovery_host and discovery_port:
+        # Temporarily disable HTTP-based discovery hints since we're using gRPC
+        if False and discovery_host and discovery_port:
             self.discovery_hint_sender = DiscoveryHintSender(
                 discovery_host=discovery_host,
                 discovery_port=discovery_port,
@@ -121,7 +123,7 @@ class RaftConsensus:
             )
             logging.info(f"Node {raft_node.node_id}: Discovery hint sender initialized for {discovery_host}:{discovery_port}")
         else:
-            logging.info(f"Node {raft_node.node_id}: No discovery service configured, hints disabled")
+            logging.info(f"Node {raft_node.node_id}: Discovery hints disabled (using gRPC service discovery)")
         
         logging.info(f"RAFT Consensus initialized for node {raft_node.node_id}")
     
