@@ -426,6 +426,10 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
         self.on_node_discovered = on_node_discovered
         self.on_node_lost = on_node_lost
         
+        # Bridge integration support
+        self.service_discovery_bridge = None
+        self.bridge_registered = False
+        
         # Node classification
         self.rank = node_id
         if node_id == 0:
@@ -902,6 +906,15 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
                 
                 logging.debug(f"Received message type: {msg_type}")
                 
+                # Check if this is a RAFT message that should be handled by bridge
+                is_raft_message = (msg_params.get("message_source") == "raft" or 
+                                 msg_type.startswith("MSG_TYPE_RAFT_"))
+                
+                if is_raft_message and self.is_bridge_active():
+                    logging.debug(f"Routing RAFT message to bridge: {msg_type}")
+                    # RAFT messages will be handled through the bridge/consensus layer
+                    # The bridge components will register as observers if needed
+                
                 # Notify observers
                 for observer in self._observers:
                     observer.receive_message(msg_type, msg_params)
@@ -962,6 +975,9 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
             # Stop message handling
             self.is_running = False
             
+            # Unregister service discovery bridge
+            self.unregister_service_discovery_bridge()
+            
             # Unregister from service discovery
             if self.use_service_discovery and self.service_discovery_client:
                 try:
@@ -1004,3 +1020,95 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
             self.cleanup()
         except:
             pass
+    
+    # Bridge Integration Methods
+    
+    def register_service_discovery_bridge(self, bridge):
+        """
+        Register a service discovery bridge to process membership events.
+        
+        The bridge will receive service discovery events and process them
+        through RAFT consensus for dynamic membership management.
+        
+        Args:
+            bridge: RaftServiceDiscoveryBridge instance
+        """
+        try:
+            if self.bridge_registered:
+                logging.warning(f"Service discovery bridge already registered for node {self.node_id}")
+                return False
+            
+            # Set bridge reference
+            self.service_discovery_bridge = bridge
+            
+            # Register bridge with itself (bridge will replace callbacks)
+            bridge.register_with_comm_manager(self)
+            
+            self.bridge_registered = True
+            
+            logging.info(f"Service discovery bridge registered for node {self.node_id}")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Failed to register service discovery bridge: {e}")
+            return False
+    
+    def unregister_service_discovery_bridge(self):
+        """Unregister the service discovery bridge."""
+        try:
+            if not self.bridge_registered or not self.service_discovery_bridge:
+                return
+            
+            # Cleanup bridge
+            self.service_discovery_bridge.cleanup()
+            self.service_discovery_bridge = None
+            self.bridge_registered = False
+            
+            logging.info(f"Service discovery bridge unregistered for node {self.node_id}")
+            
+        except Exception as e:
+            logging.error(f"Error unregistering service discovery bridge: {e}")
+    
+    def get_bridge_statistics(self) -> Optional[Dict]:
+        """
+        Get statistics from the registered bridge.
+        
+        Returns:
+            dict: Bridge statistics or None if no bridge registered
+        """
+        if self.bridge_registered and self.service_discovery_bridge:
+            return self.service_discovery_bridge.get_statistics()
+        return None
+    
+    def send_raft_message(self, msg: Message):
+        """
+        Send RAFT message through the communication layer.
+        
+        This method provides a way for RAFT components to send messages
+        through the existing gRPC infrastructure.
+        
+        Args:
+            msg: RAFT message to send
+        """
+        try:
+            # Add RAFT message identification
+            msg.add_params("message_source", "raft")
+            
+            # Send through normal message sending mechanism
+            self.send_message(msg)
+            
+            logging.debug(f"Sent RAFT message: {msg.get_type()}")
+            
+        except Exception as e:
+            logging.error(f"Failed to send RAFT message: {e}")
+    
+    def is_bridge_active(self) -> bool:
+        """
+        Check if service discovery bridge is active.
+        
+        Returns:
+            bool: True if bridge is registered and active
+        """
+        return (self.bridge_registered and 
+                self.service_discovery_bridge and 
+                self.service_discovery_bridge.state.value == "active")
