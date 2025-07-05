@@ -359,7 +359,7 @@ class ServiceDiscoveryClient:
         logging.info("Service discovery client closed")
 
 
-class RefactoredDynamicGRPCCommManager(BaseCommunicationManager):
+class DynamicGRPCCommManager(BaseCommunicationManager):
     """
     Refactored Dynamic gRPC Communication Manager.
     

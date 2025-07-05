@@ -26,7 +26,7 @@ import random
 # Add the project root to the path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../..')))
 
-from fedml_core.distributed.communication.grpc.grpc_comm_manager import RefactoredDynamicGRPCCommManager
+from fedml_core.distributed.communication.grpc.grpc_comm_manager import DynamicGRPCCommManager
 from fedml_core.distributed.communication.message import Message
 from fedml_core.distributed.communication.observer import Observer
 
@@ -86,7 +86,7 @@ class RefactoredDynamicNode:
         self.log_level = log_level
         
         # Communication manager
-        self.comm_manager: Optional[RefactoredDynamicGRPCCommManager] = None
+        self.comm_manager: Optional[DynamicGRPCCommManager] = None
         self.observer: Optional[TestObserver] = None
         
         # Node state
@@ -124,7 +124,7 @@ class RefactoredDynamicNode:
                 self.logger.info(f"Node {self.node_id} lost connection to node {lost_node_id}")
             
             # Create the refactored communication manager
-            self.comm_manager = RefactoredDynamicGRPCCommManager(
+            self.comm_manager = DynamicGRPCCommManager(
                 host=self.host,
                 port=self.port,
                 node_id=self.node_id,
