@@ -9,7 +9,7 @@ class RaftState(Enum):
 
     INITIAL = 0
     FOLLOWER = 1
-    PREVOTE = 2    # Pre-candidate state for election safety
+    PREVOTE = 2
     CANDIDATE = 3
     LEADER = 4
 
@@ -34,14 +34,13 @@ class RaftNode:
         self.args = args
         
         # RAFT state
-        # Newly started nodes are in INITIAL state until synchronized
-        # [BUG]: This is a temporary fix to set the initial state problem
-        # if self.node_id == 0:
-        #     self.state = RaftState.FOLLOWER
-        # else:
+        # All newly started nodes are in INITIAL state until properly synchronized
+        # They will transition based on service discovery and cluster state
         self.state = RaftState.INITIAL
-        if hasattr(args, "bootstrap") and args.bootstrap:
-            self.state = RaftState.FOLLOWER
+        
+        # Bootstrap mode means this node is starting a new cluster
+        # It will become leader immediately when it discovers it's alone
+        self.is_bootstrap_node = getattr(args, "bootstrap", False)
         
         self.current_term = 0
         self.voted_for = None
@@ -84,9 +83,20 @@ class RaftNode:
         # Callback for state changes (to be set by the manager)
         self.on_state_change = None
         
-        # Track known nodes
+        # Track known nodes - start empty for dynamic discovery
         self.known_nodes = set()
-        self.update_known_nodes(args.client_num_in_total)
+        
+        # For backward compatibility, if a fixed cluster size is provided, use it
+        # But in dynamic mode, we'll update this through service discovery
+        if hasattr(args, 'client_num_in_total') and args.client_num_in_total is not None:
+            # Static cluster mode - initialize with sequential IDs
+            self.update_known_nodes(args.client_num_in_total)
+            logging.info(f"Node {self.node_id}: Initialized in static cluster mode with {args.client_num_in_total} nodes")
+        else:
+            # Dynamic cluster mode - wait for service discovery
+            self.total_nodes = 0
+            self.majority = 1  # Will be updated when nodes are discovered
+            logging.info(f"Node {self.node_id}: Initialized in dynamic cluster mode")
         
         logging.info(
             f"RAFT Node {self.node_id} initialized in {self.state.name} state"
@@ -656,9 +666,17 @@ class RaftNode:
                 
                 # --- Step 1: State validation and updates ---
                 
-                # If the node is uninitialized, accept the leader and convert to follower
+                # Nodes in INITIAL state should not accept AppendEntries unless they're ready
                 if self.state == RaftState.INITIAL:
-                    logging.info(f"Node {self.node_id}: Converting from INITIAL to FOLLOWER on receiving AppendEntries")
+                    # Only accept AppendEntries if:
+                    # 1. We have proper cluster information, AND
+                    # 2. We have been synchronized (or this is a bootstrap scenario)
+                    if not self._can_accept_leader_messages():
+                        logging.debug(f"Node {self.node_id}: Rejecting AppendEntries in INITIAL state - not ready")
+                        return self.current_term, False
+                    
+                    # We're ready to accept leadership - transition to follower
+                    logging.info(f"Node {self.node_id}: Converting from INITIAL to FOLLOWER on receiving AppendEntries from leader {leader_id}")
                     self.become_follower(term)
 
                 # If term < currentTerm, reject
@@ -1077,7 +1095,7 @@ class RaftNode:
     
     def _apply_membership_change(self, command):
         """
-        Apply a membership change command.
+        Apply a membership change command with connection information.
         
         Args:
             command (dict): The membership change command
@@ -1086,7 +1104,9 @@ class RaftNode:
             try:
                 action = command.get('action')
                 node_id = command.get('node_id')
+                node_info = command.get('node_info', {})
                 current_nodes = command.get('current_nodes')
+                current_nodes_info = command.get('current_nodes_info', {})
                 round_num = command.get('round', 0)
                 
                 old_known_nodes = set(self.known_nodes)  # Copy for change detection
@@ -1096,21 +1116,41 @@ class RaftNode:
                     if node_id not in self.known_nodes:
                         self.known_nodes.add(node_id)
                         logging.info(f"Node {self.node_id}: Added node {node_id} to known nodes at round {round_num}")
+                        
+                        # Store connection information
+                        if node_info and ('ip_address' in node_info or 'port' in node_info):
+                            if not hasattr(self, 'node_connection_info'):
+                                self.node_connection_info = {}
+                            self.node_connection_info[node_id] = node_info
+                            logging.debug(f"Node {self.node_id}: Stored connection info for node {node_id}")
+                            
                 elif action == 'remove':
                     # Remove the node from known nodes if present
                     if node_id in self.known_nodes:
                         self.known_nodes.remove(node_id)
                         logging.info(f"Node {self.node_id}: Removed node {node_id} from known nodes at round {round_num}")
+                        
+                        # Clean up connection information
+                        if hasattr(self, 'node_connection_info') and node_id in self.node_connection_info:
+                            del self.node_connection_info[node_id]
+                            logging.debug(f"Node {self.node_id}: Removed connection info for node {node_id}")
                 
                 # If current_nodes is provided, use it to update known nodes
                 if current_nodes is not None:
                     self.known_nodes = set(current_nodes)
                     logging.info(f"Node {self.node_id}: Updated known nodes to {current_nodes} at round {round_num}")
                 
+                # Update connection info for all nodes if provided
+                if current_nodes_info:
+                    if not hasattr(self, 'node_connection_info'):
+                        self.node_connection_info = {}
+                    self.node_connection_info.update(current_nodes_info)
+                    logging.debug(f"Node {self.node_id}: Updated connection info for {len(current_nodes_info)} nodes")
+                
                 # Only call update if there was actually a change
                 if old_known_nodes != self.known_nodes:
                     # Update known nodes count and notify any monitoring components
-                    self.update_known_nodes(len(self.known_nodes))
+                    self.update_known_nodes(node_ids=list(self.known_nodes))
                     
                     # If we have a manager, notify it about membership change
                     if hasattr(self, 'consensus_manager') and self.consensus_manager is not None:
@@ -1119,6 +1159,17 @@ class RaftNode:
                             logging.debug(f"Node {self.node_id}: Notified consensus manager of membership change")
                         except Exception as e:
                             logging.error(f"Node {self.node_id}: Error notifying consensus manager of membership change: {e}")
+                    
+                    # Notify communication manager to establish/close connections
+                    if hasattr(self, 'comm_manager') and self.comm_manager is not None:
+                        try:
+                            if action == 'add' and node_id in self.node_connection_info:
+                                self.comm_manager.establish_connection(node_id, self.node_connection_info[node_id])
+                            elif action == 'remove':
+                                self.comm_manager.close_connection(node_id)
+                        except Exception as e:
+                            logging.error(f"Node {self.node_id}: Error updating connections: {e}")
+                            
             except Exception as e:
                 logging.error(f"Node {self.node_id}: Error applying membership change: {e}", exc_info=True)
     
@@ -1648,3 +1699,613 @@ class RaftNode:
             except Exception as e:
                 logging.error(f"Node {self.node_id}: Error processing prevote response: {e}")
                 return False
+    
+    def get_cluster_state(self):
+        """
+        Get the current cluster state information.
+        
+        Returns:
+            dict: Current cluster state including known nodes, current term, and leader info
+        """
+        with self.state_lock:
+            return {
+                'known_nodes': sorted(list(self.known_nodes)),
+                'current_term': self.current_term,
+                'leader_id': self.get_leader_id(),
+                'state': self.state.name,
+                'commit_index': self.commit_index,
+                'last_log_index': self.first_log_index + len(self.log) - 1 if len(self.log) > 0 else 0,
+                'total_nodes': self.total_nodes
+            }
+
+    def bootstrap_detection(self, discovered_nodes):
+        """
+        Handle bootstrap detection from service discovery.
+        
+        This method is called when service discovery provides initial cluster information.
+        It determines whether this node should transition from INITIAL to FOLLOWER or LEADER.
+        
+        Args:
+            discovered_nodes (set): Set of discovered node IDs
+            
+        Returns:
+            bool: True if state transition occurred, False otherwise
+        """
+        with self.state_lock:
+            try:
+                # Only process bootstrap detection if we're in INITIAL state
+                if self.state != RaftState.INITIAL:
+                    logging.debug(f"Node {self.node_id}: Ignoring bootstrap detection - not in INITIAL state")
+                    return False
+                
+                if not discovered_nodes:
+                    logging.debug(f"Node {self.node_id}: No nodes discovered for bootstrap")
+                    return False
+                
+                # Update known nodes based on discovery
+                old_known_nodes = set(self.known_nodes)
+                self.known_nodes.update(discovered_nodes)
+                
+                # Only add ourselves if we're not already in the known nodes
+                if self.node_id not in self.known_nodes:
+                    self.known_nodes.add(self.node_id)
+                
+                # Update node count and majority threshold
+                self.total_nodes = len(self.known_nodes)
+                self.majority = self.total_nodes // 2 + 1
+                
+                logging.info(f"Node {self.node_id}: Bootstrap detection - known nodes: {sorted(self.known_nodes)}, "
+                           f"total: {self.total_nodes}, majority: {self.majority}")
+                
+                # Determine state transition based on cluster composition
+                if len(self.known_nodes) == 1 and self.node_id in self.known_nodes:
+                    # Single node cluster - become leader immediately
+                    logging.info(f"Node {self.node_id}: Single node cluster detected - transitioning to LEADER")
+                    
+                    # Initialize as leader directly (bootstrap case)
+                    self.current_term = 1
+                    self.voted_for = self.node_id
+                    self.state = RaftState.LEADER  # Direct transition for bootstrap
+                    
+                    # Initialize leader state (no followers for single node)
+                    self.next_index = {}
+                    self.match_index = {}
+                    
+                    # Reset election state
+                    self.votes_received = set()
+                    
+                    # Add no-op entry for bootstrap (now that we're leader)
+                    no_op_entry = {
+                        'type': 'no-op',
+                        'timestamp': self.get_current_timestamp()
+                    }
+                    # Direct append since we're the only node
+                    entry = {
+                        'term': self.current_term,
+                        'command': no_op_entry,
+                        'index': 1
+                    }
+                    self.log.append(entry)
+                    
+                    # Notify state change
+                    if self.on_state_change:
+                        self.on_state_change(RaftState.LEADER)
+                    
+                    logging.info(f"Node {self.node_id}: Became bootstrap LEADER for term {self.current_term}")
+                    return True
+                    
+                elif len(self.known_nodes) > 1:
+                    # Multi-node cluster - become follower and wait for leader
+                    logging.info(f"Node {self.node_id}: Multi-node cluster detected - transitioning to FOLLOWER")
+                    self.state = RaftState.FOLLOWER
+                    self.reset_election_timeout()
+                    self.update_heartbeat()
+                    
+                    if self.on_state_change:
+                        self.on_state_change(RaftState.FOLLOWER)
+                    
+                    # If we're joining an existing cluster, request state synchronization
+                    if old_known_nodes != self.known_nodes:
+                        self.request_state_sync()
+                    
+                    return True
+                
+                return False
+                
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error in bootstrap detection: {e}")
+                return False
+
+    def request_state_sync(self):
+        """
+        Request state synchronization from the cluster leader.
+        
+        This method is called when a node joins an existing cluster and needs
+        to synchronize its state with the current cluster state.
+        
+        Returns:
+            bool: True if state sync request was sent, False otherwise
+        """
+        with self.state_lock:
+            try:
+                # Only request state sync if we're in FOLLOWER state
+                if self.state != RaftState.FOLLOWER:
+                    logging.debug(f"Node {self.node_id}: Cannot request state sync - not in FOLLOWER state")
+                    return False
+                
+                # Send state sync request via consensus manager if available
+                if hasattr(self, 'consensus_manager') and self.consensus_manager is not None:
+                    logging.info(f"Node {self.node_id}: Requesting state synchronization from cluster")
+                    
+                    # Create state sync request message
+                    state_sync_request = {
+                        'type': 'state_sync_request',
+                        'node_id': self.node_id,
+                        'current_term': self.current_term,
+                        'timestamp': self.get_current_timestamp()
+                    }
+                    
+                    # Send to consensus manager for broadcasting
+                    self.consensus_manager.broadcast_state_sync_request(state_sync_request)
+                    return True
+                else:
+                    logging.warning(f"Node {self.node_id}: No consensus manager available for state sync request")
+                    return False
+                    
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error requesting state sync: {e}")
+                return False
+
+    def handle_state_sync_response(self, response):
+        """
+        Handle state synchronization response from the leader.
+        
+        Args:
+            response (dict): State synchronization response containing cluster state
+            
+        Returns:
+            bool: True if state was successfully synchronized, False otherwise
+        """
+        with self.state_lock:
+            try:
+                # Validate response
+                if not isinstance(response, dict):
+                    logging.error(f"Node {self.node_id}: Invalid state sync response format")
+                    return False
+                
+                leader_id = response.get('leader_id')
+                response_term = response.get('term', 0)
+                known_nodes = response.get('known_nodes', [])
+                commit_index = response.get('commit_index', 0)
+                log_entries = response.get('log_entries', [])
+                
+                logging.info(f"Node {self.node_id}: Received state sync response from leader {leader_id}, "
+                           f"term: {response_term}, known_nodes: {known_nodes}, commit_index: {commit_index}")
+                
+                # Update term if necessary
+                if response_term > self.current_term:
+                    self.current_term = response_term
+                    self.voted_for = None
+                
+                # Update known nodes
+                if known_nodes:
+                    old_known_nodes = set(self.known_nodes)
+                    self.known_nodes = set(known_nodes)
+                    
+                    if old_known_nodes != self.known_nodes:
+                        self.update_known_nodes(node_ids=list(self.known_nodes))
+                        logging.info(f"Node {self.node_id}: Updated known nodes from state sync: {sorted(self.known_nodes)}")
+                
+                # Update log entries if provided
+                if log_entries:
+                    # For simplicity, we'll append the entries (in production, this would be more sophisticated)
+                    for entry in log_entries:
+                        if entry not in self.log:
+                            self.log.append(entry)
+                    
+                    logging.info(f"Node {self.node_id}: Updated log from state sync, new length: {len(self.log)}")
+                
+                # Update commit index
+                if commit_index > self.commit_index:
+                    self.commit_index = commit_index
+                    
+                    # Apply committed entries
+                    while self.last_applied < self.commit_index:
+                        self.last_applied += 1
+                        if self.last_applied <= len(self.log):
+                            entry = self.log[self.last_applied - 1]
+                            self.apply_log_entry(entry)
+                
+                # Mark state synchronization as completed
+                self.set_state_sync_completed(True)
+                
+                # Try to transition to FOLLOWER if we're still in INITIAL state
+                if self.state == RaftState.INITIAL:
+                    self.transition_to_follower_from_initial()
+                
+                logging.info(f"Node {self.node_id}: State synchronization completed successfully")
+                return True
+                
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error handling state sync response: {e}")
+                return False
+
+    def transition_to_follower_from_initial(self):
+        """
+        Transition from INITIAL state to FOLLOWER state.
+        
+        This method handles the specific transition from INITIAL to FOLLOWER
+        when a node has received enough information to participate in the cluster.
+        
+        Requirements for transition:
+        1. Log is replicated (synchronized with leader)
+        2. Model parameters have been received from leader successfully
+        3. Basic cluster information is available
+        
+        Returns:
+            bool: True if transition was successful, False otherwise
+        """
+        with self.state_lock:
+            try:
+                if self.state != RaftState.INITIAL:
+                    logging.debug(f"Node {self.node_id}: Not in INITIAL state for transition to FOLLOWER")
+                    return False
+                
+                # Requirement 1: Ensure we have enough cluster information
+                if not hasattr(self, 'known_nodes') or len(self.known_nodes) == 0:
+                    logging.warning(f"Node {self.node_id}: Cannot transition to FOLLOWER - no known nodes")
+                    return False
+                
+                # Requirement 2: Check if log is properly replicated
+                if not self._is_log_synchronized():
+                    logging.warning(f"Node {self.node_id}: Cannot transition to FOLLOWER - log not synchronized")
+                    return False
+                
+                # Requirement 3: Check if model parameters have been received
+                if not self._has_model_parameters():
+                    logging.warning(f"Node {self.node_id}: Cannot transition to FOLLOWER - model parameters not received")
+                    return False
+                
+                # All requirements met - transition to FOLLOWER
+                self.state = RaftState.FOLLOWER
+                self.reset_election_timeout()
+                self.update_heartbeat()
+                
+                # Notify state change
+                if self.on_state_change:
+                    self.on_state_change(RaftState.FOLLOWER)
+                
+                logging.info(f"Node {self.node_id}: Transitioned from INITIAL to FOLLOWER (log synchronized, model parameters received)")
+                return True
+                
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error transitioning from INITIAL to FOLLOWER: {e}")
+                return False
+
+    def can_participate_in_elections(self):
+        """
+        Check if this node can participate in elections.
+        
+        Returns:
+            bool: True if node can participate in elections, False otherwise
+        """
+        with self.state_lock:
+            # Nodes in INITIAL state cannot participate in elections
+            if self.state == RaftState.INITIAL:
+                return False
+            
+            # Must have valid cluster information
+            if not hasattr(self, 'known_nodes') or len(self.known_nodes) == 0:
+                return False
+            
+            # Must be part of the known nodes
+            if self.node_id not in self.known_nodes:
+                return False
+            
+            return True
+
+    def get_leader_id(self):
+        """
+        Get the current leader ID if known.
+        
+        Returns:
+            int or None: Leader ID if known, None otherwise
+        """
+        with self.state_lock:
+            if self.state == RaftState.LEADER:
+                return self.node_id
+            
+            # For followers, we don't explicitly track leader ID in basic RAFT
+            # But we could track it based on heartbeats received
+            if hasattr(self, 'current_leader_id'):
+                return self.current_leader_id
+            
+            return None
+
+    def set_current_leader(self, leader_id):
+        """
+        Set the current leader ID.
+        
+        Args:
+            leader_id (int): ID of the current leader
+        """
+        with self.state_lock:
+            self.current_leader_id = leader_id
+            logging.debug(f"Node {self.node_id}: Set current leader to {leader_id}")
+
+    def get_current_timestamp(self):
+        """
+        Get current timestamp for log entries.
+        
+        Returns:
+            float: Current timestamp
+        """
+        return time.time()
+
+    # Enhanced method to end the class
+    def _is_log_synchronized(self):
+        """
+        Check if the log is properly synchronized with the leader.
+        
+        For a node joining an existing cluster, this means:
+        1. The log has been replicated from the leader
+        2. The commit index is up-to-date
+        3. All committed entries have been applied
+        
+        Returns:
+            bool: True if log is synchronized, False otherwise
+        """
+        with self.state_lock:
+            try:
+                # For new nodes, we need to have received some log entries
+                # and have our commit index properly set
+                
+                # Check if we have received state synchronization
+                if not hasattr(self, 'state_sync_completed') or not self.state_sync_completed:
+                    logging.debug(f"Node {self.node_id}: State sync not completed")
+                    return False
+                
+                # Check if we have a reasonable commit index
+                if self.commit_index < 0:
+                    logging.debug(f"Node {self.node_id}: Invalid commit index: {self.commit_index}")
+                    return False
+                
+                # Check if last_applied is caught up with commit_index
+                if self.last_applied < self.commit_index:
+                    logging.debug(f"Node {self.node_id}: Last applied ({self.last_applied}) behind commit index ({self.commit_index})")
+                    return False
+                
+                # For joining nodes, we should have received at least the current membership
+                if len(self.log) == 0 and self.commit_index > 0:
+                    logging.debug(f"Node {self.node_id}: Empty log but commit index is {self.commit_index}")
+                    return False
+                
+                logging.debug(f"Node {self.node_id}: Log synchronization check passed")
+                return True
+                
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error checking log synchronization: {e}")
+                return False
+
+    def _has_model_parameters(self):
+        """
+        Check if model parameters have been received from the leader.
+        
+        For federated learning, a node joining the cluster needs to have:
+        1. Received the current model state from the leader
+        2. Model parameters are valid and ready for training
+        3. Model version is synchronized with the cluster
+        
+        Returns:
+            bool: True if model parameters are available, False otherwise
+        """
+        with self.state_lock:
+            try:
+                # Check if we have received model parameters
+                if not hasattr(self, 'model_params_received') or not self.model_params_received:
+                    logging.debug(f"Node {self.node_id}: Model parameters not received")
+                    return False
+                
+                # Check if model parameters are valid
+                if not hasattr(self, 'current_model_version') or self.current_model_version is None:
+                    logging.debug(f"Node {self.node_id}: No current model version")
+                    return False
+                
+                # Check if we have the actual model state
+                if not hasattr(self, 'model_state') or self.model_state is None:
+                    logging.debug(f"Node {self.node_id}: No model state available")
+                    return False
+                
+                # Verify model state is not empty
+                if isinstance(self.model_state, dict) and len(self.model_state) == 0:
+                    logging.debug(f"Node {self.node_id}: Model state is empty")
+                    return False
+                
+                logging.debug(f"Node {self.node_id}: Model parameters check passed - version: {self.current_model_version}")
+                return True
+                
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error checking model parameters: {e}")
+                return False
+
+    def set_state_sync_completed(self, completed=True):
+        """
+        Mark state synchronization as completed.
+        
+        Args:
+            completed (bool): Whether state sync is completed
+        """
+        with self.state_lock:
+            self.state_sync_completed = completed
+            logging.debug(f"Node {self.node_id}: State sync completed set to {completed}")
+
+    def set_model_parameters(self, model_state, model_version):
+        """
+        Set the model parameters received from the leader.
+        
+        Args:
+            model_state (dict): The model state parameters
+            model_version (int): The model version/round number
+        """
+        with self.state_lock:
+            self.model_state = model_state
+            self.current_model_version = model_version
+            self.model_params_received = True
+            logging.info(f"Node {self.node_id}: Received model parameters for version {model_version}")
+            
+            # Check if we can now transition to FOLLOWER (only if log is also synchronized)
+            if self.state == RaftState.INITIAL and self._is_log_synchronized():
+                self.transition_to_follower_from_initial()
+
+    def initialize_from_discovery(self, discovered_nodes, node_info_map=None):
+        """
+        Initialize the RAFT node based on service discovery information.
+        
+        This method is called by the service discovery bridge to provide
+        initial cluster information and trigger appropriate state transitions.
+        
+        Args:
+            discovered_nodes (set): Set of discovered node IDs
+            node_info_map (dict): Optional mapping of node IDs to connection info
+            
+        Returns:
+            bool: True if initialization was successful, False otherwise
+        """
+        with self.state_lock:
+            try:
+                # Only initialize if we're in INITIAL state
+                if self.state != RaftState.INITIAL:
+                    logging.debug(f"Node {self.node_id}: Not in INITIAL state for discovery initialization")
+                    return False
+                
+                logging.info(f"Node {self.node_id}: Initializing from service discovery - discovered nodes: {sorted(discovered_nodes)}")
+                
+                # Store node connection information if provided
+                if node_info_map:
+                    if not hasattr(self, 'node_connection_info'):
+                        self.node_connection_info = {}
+                    self.node_connection_info.update(node_info_map)
+                    logging.debug(f"Node {self.node_id}: Stored connection info for {len(node_info_map)} nodes")
+                
+                # Use the bootstrap detection method to handle state transitions
+                return self.bootstrap_detection(discovered_nodes)
+                
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error initializing from discovery: {e}")
+                return False
+
+    def enhance_add_node_with_connection_info(self, new_node_id, node_info, round_num=0):
+        """
+        Enhanced version of add_node that includes connection information.
+        
+        Args:
+            new_node_id (int): ID of the new node
+            node_info (dict): Connection information including IP, port, capabilities
+            round_num (int): Current training round number
+            
+        Returns:
+            int: Log index of the membership entry, or -1 on failure
+        """
+        with self.state_lock:
+            try:
+                if self.state != RaftState.LEADER:
+                    logging.warning(f"Node {self.node_id}: Cannot add node {new_node_id} - not a leader")
+                    return -1
+                
+                # Validate node_info
+                if not node_info or 'ip_address' not in node_info or 'port' not in node_info:
+                    logging.error(f"Leader {self.node_id}: Cannot add node {new_node_id} - missing connection info")
+                    return -1
+                
+                if new_node_id in self.known_nodes:
+                    logging.debug(f"Leader {self.node_id}: Node {new_node_id} already in cluster")
+                    return -1
+                
+                # Store connection information
+                if not hasattr(self, 'node_connection_info'):
+                    self.node_connection_info = {}
+                self.node_connection_info[new_node_id] = node_info
+                
+                # Create enhanced membership log entry
+                current_nodes = set(self.known_nodes)
+                current_nodes.add(new_node_id)
+                
+                # Get current nodes with their connection info
+                current_nodes_info = {}
+                for node_id in current_nodes:
+                    if node_id in self.node_connection_info:
+                        current_nodes_info[node_id] = self.node_connection_info[node_id]
+                
+                # Add log entry with complete node information
+                log_index = self.add_log_entry({
+                    'type': 'membership',
+                    'action': 'add',
+                    'node_id': new_node_id,
+                    'node_info': node_info,  # Complete connection info
+                    'current_nodes': list(current_nodes),
+                    'current_nodes_info': current_nodes_info,  # All nodes with connection info
+                    'round': round_num
+                })
+                
+                if log_index != -1:
+                    # Initialize leader state for the new node
+                    last_log_index = self.first_log_index + len(self.log) - 1 if len(self.log) > 0 else 0
+                    self.next_index[new_node_id] = last_log_index + 1
+                    self.match_index[new_node_id] = 0
+                    
+                    # Update known nodes
+                    self.known_nodes.add(new_node_id)
+                    self.update_known_nodes(node_ids=list(self.known_nodes))
+                    
+                    logging.info(f"Leader {self.node_id}: Added node {new_node_id} with connection info at {node_info['ip_address']}:{node_info['port']}")
+                
+                return log_index
+                
+            except Exception as e:
+                logging.error(f"Leader {self.node_id}: Error adding node {new_node_id} with connection info: {e}")
+                return -1
+
+    def _can_accept_leader_messages(self):
+        """
+        Check if a node in INITIAL state can accept leader messages.
+        
+        A node can accept leader messages if:
+        1. It has cluster information (knows about other nodes), OR
+        2. It's in bootstrap mode and ready to accept leadership, OR
+        3. It has been properly synchronized through service discovery
+        
+        Returns:
+            bool: True if node can accept leader messages, False otherwise
+        """
+        with self.state_lock:
+            try:
+                # Bootstrap nodes can always accept leadership
+                if hasattr(self, 'is_bootstrap_node') and self.is_bootstrap_node:
+                    logging.debug(f"Node {self.node_id}: Bootstrap node can accept leader messages")
+                    return True
+                
+                # Nodes that have been discovered through service discovery can accept
+                if hasattr(self, 'discovered_through_service_discovery') and self.discovered_through_service_discovery:
+                    logging.debug(f"Node {self.node_id}: Node discovered through service discovery can accept leader messages")
+                    return True
+                
+                # Nodes with cluster information can accept
+                if len(self.known_nodes) > 0:
+                    logging.debug(f"Node {self.node_id}: Node with cluster info can accept leader messages")
+                    return True
+                
+                logging.debug(f"Node {self.node_id}: Node not ready to accept leader messages")
+                return False
+                
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error checking if can accept leader messages: {e}")
+                return False
+
+    def mark_discovered_through_service_discovery(self):
+        """
+        Mark this node as having been discovered through service discovery.
+        This allows it to accept leader messages even without full cluster info.
+        """
+        with self.state_lock:
+            self.discovered_through_service_discovery = True
+            logging.debug(f"Node {self.node_id}: Marked as discovered through service discovery")
