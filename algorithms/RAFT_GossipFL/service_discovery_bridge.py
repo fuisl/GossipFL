@@ -96,6 +96,15 @@ class RaftServiceDiscoveryBridge:
                 self.state = BridgeState.INITIALIZING
                 logging.info(f"Bridge: RAFT consensus manager set for node {self.node_id}")
     
+    def set_consensus_manager(self, consensus_manager):
+        """
+        Set the consensus manager reference (alias for set_raft_consensus).
+        
+        Args:
+            consensus_manager: RAFT consensus manager instance
+        """
+        self.set_raft_consensus(consensus_manager)
+    
     def register_with_comm_manager(self, comm_manager):
         """
         Register the bridge with the communication manager.
@@ -433,10 +442,23 @@ class RaftServiceDiscoveryBridge:
             bool: True if successfully forwarded, False otherwise
         """
         try:
-            # For now, we'll just log and return True
-            # In a full implementation, this would send a message to the leader
-            logging.info(f"Bridge: Would forward {event.event_type} event for node {event.node_id} to leader")
-            return True
+            # Forward to consensus manager if available
+            if self.raft_consensus:
+                hint_data = {
+                    'event_type': event.event_type,
+                    'node_id': event.node_id,
+                    'node_info': event.node_info,
+                    'timestamp': event.timestamp
+                }
+                return self.raft_consensus._forward_to_leader('membership_proposal', {
+                    'action': 'add' if event.event_type == 'discovered' else 'remove',
+                    'node_id': event.node_id,
+                    'node_info': event.node_info if event.event_type == 'discovered' else None,
+                    'timestamp': event.timestamp
+                })
+            else:
+                logging.warning(f"Bridge: No RAFT consensus manager available for forwarding")
+                return False
             
         except Exception as e:
             logging.error(f"Bridge: Error forwarding event to leader: {e}")
@@ -476,7 +498,7 @@ class RaftServiceDiscoveryBridge:
                 return False
             
             # Delegate to RAFT consensus for state synchronization
-            success = self.raft_consensus.coordinate_new_node_sync(node_id, node_info)
+            success = self.raft_consensus.coordinate_new_node_sync(node_id)
             
             if success:
                 logging.info(f"Bridge: State synchronization completed for node {node_id}")
@@ -506,6 +528,16 @@ class RaftServiceDiscoveryBridge:
                 'pending_events': len(self.pending_events),
                 'failed_events': len(self.failed_events)
             }
+    
+    def is_active(self) -> bool:
+        """
+        Check if the bridge is active.
+        
+        Returns:
+            bool: True if bridge is active (ACTIVE or INITIALIZING), False otherwise
+        """
+        with self.lock:
+            return self.state in [BridgeState.ACTIVE, BridgeState.INITIALIZING]
     
     def cleanup(self):
         """Clean up bridge resources."""

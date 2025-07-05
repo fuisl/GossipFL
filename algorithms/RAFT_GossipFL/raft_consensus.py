@@ -1262,3 +1262,457 @@ class RaftConsensus:
         except Exception as e:
             # Don't raise exceptions in destructor
             pass
+
+    # =============================================================================
+    # Service Discovery Bridge Integration
+    # =============================================================================
+    
+    def register_service_discovery_bridge(self, bridge):
+        """
+        Register a service discovery bridge for dynamic membership management.
+        
+        Args:
+            bridge (RaftServiceDiscoveryBridge): The bridge instance to register
+            
+        Returns:
+            bool: True if registration was successful, False otherwise
+        """
+        try:
+            if hasattr(self, 'service_discovery_bridge') and self.service_discovery_bridge is not None:
+                logging.warning(f"Node {self.raft_node.node_id}: Service discovery bridge already registered")
+                return False
+            
+            self.service_discovery_bridge = bridge
+            
+            # Set consensus manager reference in bridge
+            bridge.set_consensus_manager(self)
+            
+            logging.info(f"Node {self.raft_node.node_id}: Service discovery bridge registered successfully")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error registering service discovery bridge: {e}")
+            return False
+    
+    def unregister_service_discovery_bridge(self):
+        """
+        Unregister the service discovery bridge.
+        
+        Returns:
+            bool: True if unregistration was successful, False otherwise
+        """
+        try:
+            if hasattr(self, 'service_discovery_bridge'):
+                if self.service_discovery_bridge is not None:
+                    # Clear consensus manager reference in bridge
+                    self.service_discovery_bridge.set_consensus_manager(None)
+                    self.service_discovery_bridge = None
+                    logging.info(f"Node {self.raft_node.node_id}: Service discovery bridge unregistered")
+                return True
+            return False
+            
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error unregistering service discovery bridge: {e}")
+            return False
+    
+    def handle_service_discovery_hint(self, hint_data):
+        """
+        Process a service discovery hint from the bridge.
+        
+        Args:
+            hint_data (dict): Service discovery hint containing:
+                - event_type: "discovered" or "lost"
+                - node_id: ID of the discovered/lost node
+                - node_info: Connection information (for discovered nodes)
+                - timestamp: Event timestamp
+                
+        Returns:
+            bool: True if hint was processed successfully, False otherwise
+        """
+        try:
+            event_type = hint_data.get('event_type')
+            node_id = hint_data.get('node_id')
+            node_info = hint_data.get('node_info', {})
+            timestamp = hint_data.get('timestamp', time.time())
+            
+            logging.info(f"Node {self.raft_node.node_id}: Processing service discovery hint - "
+                        f"event: {event_type}, node: {node_id}")
+            
+            if event_type == 'discovered':
+                return self._handle_node_discovered(node_id, node_info, timestamp)
+            elif event_type == 'lost':
+                return self._handle_node_lost(node_id, timestamp)
+            else:
+                logging.warning(f"Node {self.raft_node.node_id}: Unknown service discovery event type: {event_type}")
+                return False
+                
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error handling service discovery hint: {e}")
+            return False
+    
+    def _handle_node_discovered(self, node_id, node_info, timestamp):
+        """
+        Handle a node discovery event.
+        
+        Args:
+            node_id (int): ID of the discovered node
+            node_info (dict): Connection information for the node
+            timestamp (float): Discovery timestamp
+            
+        Returns:
+            bool: True if handled successfully, False otherwise
+        """
+        try:
+            # Validate node info
+            if not self._validate_node_capabilities(node_id, node_info):
+                logging.warning(f"Node {self.raft_node.node_id}: Node {node_id} failed capability validation")
+                return False
+            
+            # Check if node is already known
+            if node_id in self.raft_node.known_nodes:
+                logging.debug(f"Node {self.raft_node.node_id}: Node {node_id} already known, updating connection info")
+                # Update connection info if we have it
+                if hasattr(self.raft_node, 'node_connection_info') and node_info:
+                    self.raft_node.node_connection_info[node_id] = node_info
+                return True
+            
+            # Only leaders can propose membership changes
+            if self.raft_node.state == RaftState.LEADER:
+                return self.propose_membership_change('add', node_id, node_info)
+            else:
+                # Forward to leader if we know who it is
+                return self._forward_to_leader('membership_proposal', {
+                    'action': 'add',
+                    'node_id': node_id,
+                    'node_info': node_info,
+                    'timestamp': timestamp
+                })
+                
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error handling node discovered: {e}")
+            return False
+    
+    def _handle_node_lost(self, node_id, timestamp):
+        """
+        Handle a node loss event.
+        
+        Args:
+            node_id (int): ID of the lost node
+            timestamp (float): Loss timestamp
+            
+        Returns:
+            bool: True if handled successfully, False otherwise
+        """
+        try:
+            # Check if node is known
+            if node_id not in self.raft_node.known_nodes:
+                logging.debug(f"Node {self.raft_node.node_id}: Node {node_id} not in known nodes, ignoring loss event")
+                return True
+            
+            # Only leaders can propose membership changes
+            if self.raft_node.state == RaftState.LEADER:
+                return self.propose_membership_change('remove', node_id, reason="service_discovery_lost")
+            else:
+                # Forward to leader if we know who it is
+                return self._forward_to_leader('membership_proposal', {
+                    'action': 'remove',
+                    'node_id': node_id,
+                    'reason': 'service_discovery_lost',
+                    'timestamp': timestamp
+                })
+                
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error handling node lost: {e}")
+            return False
+    
+    def propose_membership_change(self, action, node_id, node_info=None, reason=None):
+        """
+        Propose a membership change through RAFT consensus.
+        
+        Args:
+            action (str): "add" or "remove"
+            node_id (int): ID of the node to add/remove
+            node_info (dict, optional): Connection information for new nodes
+            reason (str, optional): Reason for the change
+            
+        Returns:
+            bool: True if proposal was successfully added to log, False otherwise
+        """
+        try:
+            if self.raft_node.state != RaftState.LEADER:
+                logging.warning(f"Node {self.raft_node.node_id}: Cannot propose membership change - not a leader")
+                return False
+            
+            # Use enhanced add_node method if available and adding a node
+            if action == 'add' and hasattr(self.raft_node, 'enhance_add_node_with_connection_info') and node_info:
+                log_index = self.raft_node.enhance_add_node_with_connection_info(
+                    node_id, node_info, round_num=self._get_current_round()
+                )
+            else:
+                # Use existing membership change method
+                log_index = self.add_membership_change(action, node_id, round_num=self._get_current_round(), reason=reason or "service_discovery")
+            
+            success = log_index != -1
+            if success:
+                logging.info(f"Leader {self.raft_node.node_id}: Proposed membership change - "
+                           f"action: {action}, node: {node_id}, log_index: {log_index}")
+            else:
+                logging.warning(f"Leader {self.raft_node.node_id}: Failed to propose membership change - "
+                              f"action: {action}, node: {node_id}")
+            
+            return success
+            
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error proposing membership change: {e}")
+            return False
+    
+    def coordinate_new_node_sync(self, node_id):
+        """
+        Coordinate state synchronization for a new node joining the cluster.
+        
+        Args:
+            node_id (int): ID of the new node
+            
+        Returns:
+            bool: True if sync coordination was successful, False otherwise
+        """
+        try:
+            if self.raft_node.state != RaftState.LEADER:
+                logging.warning(f"Node {self.raft_node.node_id}: Cannot coordinate sync - not a leader")
+                return False
+            
+            # Create state sync response for the new node
+            sync_response = self._create_state_snapshot(node_id)
+            
+            # Send state sync response to the new node
+            return self._send_state_sync_response(node_id, sync_response)
+            
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error coordinating new node sync: {e}")
+            return False
+    
+    def _create_state_snapshot(self, target_node_id):
+        """
+        Create a complete state snapshot for a new node.
+        
+        Args:
+            target_node_id (int): ID of the node requesting the snapshot
+            
+        Returns:
+            dict: State snapshot containing cluster state
+        """
+        try:
+            # Get current cluster state
+            cluster_state = self.raft_node.get_cluster_state()
+            
+            # Create comprehensive state snapshot
+            snapshot = {
+                'type': 'state_sync_response',
+                'leader_id': self.raft_node.node_id,
+                'term': self.raft_node.current_term,
+                'known_nodes': cluster_state['known_nodes'],
+                'commit_index': self.raft_node.commit_index,
+                'log_entries': self._get_committed_log_entries(),
+                'timestamp': time.time()
+            }
+            
+            # Add connection information if available
+            if hasattr(self.raft_node, 'node_connection_info'):
+                snapshot['node_connection_info'] = dict(self.raft_node.node_connection_info)
+            
+            # Add current model state if available
+            if hasattr(self.raft_node, 'model_state') and self.raft_node.model_state:
+                snapshot['model_state'] = self.raft_node.model_state
+                snapshot['model_version'] = getattr(self.raft_node, 'current_model_version', 0)
+            
+            logging.debug(f"Leader {self.raft_node.node_id}: Created state snapshot for node {target_node_id}")
+            return snapshot
+            
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error creating state snapshot: {e}")
+            return {}
+    
+    def _get_committed_log_entries(self):
+        """
+        Get all committed log entries for state synchronization.
+        
+        Returns:
+            list: List of committed log entries
+        """
+        try:
+            committed_entries = []
+            
+            # Get entries up to commit index
+            for i in range(self.raft_node.commit_index):
+                log_array_index = i + 1 - self.raft_node.first_log_index
+                if 0 <= log_array_index < len(self.raft_node.log):
+                    committed_entries.append(self.raft_node.log[log_array_index])
+            
+            return committed_entries
+            
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error getting committed log entries: {e}")
+            return []
+    
+    def _send_state_sync_response(self, target_node_id, sync_response):
+        """
+        Send state sync response to a specific node.
+        
+        Args:
+            target_node_id (int): ID of the target node
+            sync_response (dict): State sync response data
+            
+        Returns:
+            bool: True if sent successfully, False otherwise
+        """
+        try:
+            if hasattr(self.worker_manager, 'send_message_to_node'):
+                # Send via worker manager
+                self.worker_manager.send_message_to_node(target_node_id, sync_response)
+                logging.info(f"Leader {self.raft_node.node_id}: Sent state sync response to node {target_node_id}")
+                return True
+            else:
+                logging.warning(f"Node {self.raft_node.node_id}: No method available to send state sync response")
+                return False
+                
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error sending state sync response: {e}")
+            return False
+    
+    def broadcast_state_sync_request(self, request_data):
+        """
+        Broadcast a state sync request to find the current leader.
+        
+        Args:
+            request_data (dict): State sync request data
+            
+        Returns:
+            bool: True if broadcast was successful, False otherwise
+        """
+        try:
+            if hasattr(self.worker_manager, 'broadcast_message'):
+                self.worker_manager.broadcast_message(request_data)
+                logging.info(f"Node {self.raft_node.node_id}: Broadcasted state sync request")
+                return True
+            else:
+                logging.warning(f"Node {self.raft_node.node_id}: No method available to broadcast state sync request")
+                return False
+                
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error broadcasting state sync request: {e}")
+            return False
+    
+    def _validate_node_capabilities(self, node_id, node_info):
+        """
+        Validate that a discovered node has the required capabilities.
+        
+        Args:
+            node_id (int): ID of the node to validate
+            node_info (dict): Node information including capabilities
+            
+        Returns:
+            bool: True if node has required capabilities, False otherwise
+        """
+        try:
+            # Basic validation
+            if not isinstance(node_id, int) or node_id < 0:
+                logging.warning(f"Node {self.raft_node.node_id}: Invalid node ID: {node_id}")
+                return False
+            
+            # Check for required connection information
+            if not node_info.get('ip_address') or not node_info.get('port'):
+                logging.warning(f"Node {self.raft_node.node_id}: Node {node_id} missing connection info")
+                return False
+            
+            # Check capabilities if specified
+            capabilities = node_info.get('capabilities', [])
+            required_capabilities = ['grpc', 'fedml']  # Required for GossipFL
+            
+            for required_cap in required_capabilities:
+                if required_cap not in capabilities:
+                    logging.warning(f"Node {self.raft_node.node_id}: Node {node_id} missing capability: {required_cap}")
+                    return False
+            
+            logging.debug(f"Node {self.raft_node.node_id}: Node {node_id} passed capability validation")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error validating node capabilities: {e}")
+            return False
+    
+    def _forward_to_leader(self, message_type, data):
+        """
+        Forward a message to the current leader.
+        
+        Args:
+            message_type (str): Type of message to forward
+            data (dict): Message data
+            
+        Returns:
+            bool: True if forwarded successfully, False otherwise
+        """
+        try:
+            if not self.current_leader_id or self.current_leader_id == self.raft_node.node_id:
+                logging.debug(f"Node {self.raft_node.node_id}: No known leader to forward to")
+                return False
+            
+            # Create forwarding message
+            forward_message = {
+                'type': message_type,
+                'data': data,
+                'forwarded_by': self.raft_node.node_id,
+                'timestamp': time.time()
+            }
+            
+            if hasattr(self.worker_manager, 'send_message_to_node'):
+                self.worker_manager.send_message_to_node(self.current_leader_id, forward_message)
+                logging.debug(f"Node {self.raft_node.node_id}: Forwarded {message_type} to leader {self.current_leader_id}")
+                return True
+            else:
+                logging.warning(f"Node {self.raft_node.node_id}: No method available to forward message to leader")
+                return False
+                
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error forwarding to leader: {e}")
+            return False
+    
+    def _get_current_round(self):
+        """
+        Get the current training round number.
+        
+        Returns:
+            int: Current training round, or 0 if not available
+        """
+        try:
+            if hasattr(self.worker_manager, 'round_idx'):
+                return self.worker_manager.round_idx
+            elif hasattr(self.args, 'current_round'):
+                return self.args.current_round
+            else:
+                return 0
+        except Exception:
+            return 0
+    
+    def get_bridge_status(self):
+        """
+        Get the current status of the service discovery bridge.
+        
+        Returns:
+            dict: Bridge status information
+        """
+        try:
+            if hasattr(self, 'service_discovery_bridge') and self.service_discovery_bridge:
+                return {
+                    'registered': True,
+                    'active': self.service_discovery_bridge.is_active(),
+                    'stats': self.service_discovery_bridge.get_stats() if hasattr(self.service_discovery_bridge, 'get_stats') else {}
+                }
+            else:
+                return {
+                    'registered': False,
+                    'active': False,
+                    'stats': {}
+                }
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error getting bridge status: {e}")
+            return {'registered': False, 'active': False, 'stats': {}}
