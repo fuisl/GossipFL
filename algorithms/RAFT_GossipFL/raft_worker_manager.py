@@ -4,7 +4,7 @@ import time
 import traceback
 import numpy as np
 
-from mpi4py import MPI
+# Note: Migrated from MPI to gRPC-based communication
 from fedml_core.distributed.communication.message import Message
 
 from algorithms.SAPS_FL.decentralized_worker_manager import DecentralizedWorkerManager
@@ -12,26 +12,28 @@ from utils.context import raise_error_without_process, get_lock, raise_MPI_error
 from utils.tracker import get_metric_info
 from .raft_node import RaftState
 from .raft_messages import RaftMessage
+from .service_discovery_bridge import RaftServiceDiscoveryBridge
 
 
 class RaftWorkerManager(DecentralizedWorkerManager):
     """
-    Extends the DecentralizedWorkerManager to integrate with RAFT consensus.
+    Main entry point for RAFT-based federated learning nodes.
     
-    This manager uses RAFT for leader election, topology consensus, and
-    coordination of the federated learning process.
+    This manager integrates RAFT consensus with federated learning, using the
+    service discovery bridge for all dynamic membership management. All node
+    joining, leaving, and cluster coordination flows through RAFT consensus.
     """
     
-    def __init__(self, args, comm, rank, size, worker, topology_manager, 
+    def __init__(self, args, comm, node_id, size, worker, topology_manager, 
                  model_trainer, timer, metrics, raft_consensus, bandwidth_manager=None):
         """
         Initialize the RAFT worker manager.
         
         Args:
             args: Configuration parameters
-            comm: MPI communicator
-            rank: Rank of this process
-            size: Total number of processes
+            comm: Communication manager (gRPC-based)
+            node_id: Unique identifier for this node in the cluster
+            size: Initial cluster size (may change dynamically)
             worker: The worker for training
             topology_manager: The topology manager
             model_trainer: The model trainer
@@ -40,17 +42,36 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             raft_consensus: The RAFT consensus manager
             bandwidth_manager: The bandwidth manager (optional)
         """
-        super().__init__(args, comm, rank, size, worker, topology_manager, model_trainer, timer, metrics)
+        # Call parent with node_id as rank for compatibility
+        super().__init__(args, comm, node_id, size, worker, topology_manager, model_trainer, timer, metrics)
         
+        # Ensure com_manager is available for compatibility with parent classes
+        # In gRPC mode, this may be different from the traditional MPI com_manager
+        if not hasattr(self, 'com_manager'):
+            self.com_manager = comm  # Use the provided comm manager
+        
+        # Store args for later use
+        self.args = args
         self.raft_consensus = raft_consensus
         self.bandwidth_manager = bandwidth_manager
         
-        # Register for leadership changes and state updates if raft_consensus is available
+        # Store node identification for gRPC-based communication
+        self.node_id = node_id
+        self.cluster_size = size  # Initial size, can change dynamically
+        
+        # Initialize service discovery bridge for dynamic membership management
+        self.service_discovery_bridge = RaftServiceDiscoveryBridge(node_id, raft_consensus)
+        
+        # Register the bridge with this worker manager as the communication manager
+        self.service_discovery_bridge.register_with_comm_manager(self)
+        
+        # Register the bridge with consensus for membership change notifications
         if self.raft_consensus is not None:
+            self.raft_consensus.register_service_discovery_bridge(self.service_discovery_bridge)
             self.raft_consensus.on_leadership_change = self.handle_leadership_change
             self.raft_consensus.on_state_commit = self.handle_raft_state_commit
         
-        # State variables for RAFT-SAPS_FL integration
+        # State variables for RAFT-FL integration
         self.is_coordinator = False
         self.coordinator_id = None
         self.current_topology = None
@@ -66,7 +87,15 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         # Override SAPS_FL coordinator detection
         self._override_saps_coordinator_logic()
         
-        logging.info(f"RaftWorkerManager initialized for node {rank}")
+        logging.info(f"RaftWorkerManager initialized for node {node_id} with service discovery bridge")
+    
+    def get_sender_id(self):
+        """Override to use node_id instead of MPI rank for gRPC communication."""
+        return self.node_id
+    
+    def get_comm_manager(self):
+        """Get the communication manager for the service discovery bridge."""
+        return getattr(self, '_comm_manager', None)
     
     def set_raft_consensus(self, raft_consensus):
         """
@@ -83,7 +112,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         if self.raft_consensus is not None:
             self.raft_consensus.on_leadership_change = self.handle_leadership_change
             self.raft_consensus.on_state_commit = self.handle_raft_state_commit
-            logging.info(f"RAFT consensus callbacks registered for node {self.rank}")
+            logging.info(f"RAFT consensus callbacks registered for node {self.node_id}")
     
     def register_message_receive_handlers(self):
         """Register message handlers for RAFT and GossipFL messages."""
@@ -137,18 +166,26 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         self.register_message_receive_handler(
             RaftMessage.MSG_TYPE_RAFT_PARAM_RESPONSE,
             self.handle_param_response)
+        
+        # Join protocol handlers
+        self.register_message_receive_handler(
+            RaftMessage.MSG_TYPE_RAFT_JOIN_REQUEST,
+            self.handle_join_request)
+        self.register_message_receive_handler(
+            RaftMessage.MSG_TYPE_RAFT_JOIN_RESPONSE,
+            self.handle_join_response)
     
     def run(self):
-        """Run the worker manager with RAFT integration."""
+        """Run the worker manager with RAFT integration and service discovery bridge."""
 
         # Start RAFT consensus services
         self.raft_consensus.start()
 
-        # If joining an existing cluster, request state synchronization first
+        # If joining an existing cluster, use the service discovery bridge
         if getattr(self.args, "join_existing_cluster", False):
-            logging.info("Joining existing cluster - requesting state synchronization")
-            self.request_cluster_join()
-
+            logging.info("Joining existing cluster through service discovery bridge")
+            self.service_discovery_bridge.handle_node_discovered(self.node_id)
+            
             # Wait for synchronization to complete (best effort)
             max_wait_time = 30
             wait_start = time.time()
@@ -167,11 +204,12 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         # Start the training thread
         self.training_thread.start()
 
-        # Wait for all peers to be ready
-        logging.debug("Wait for the barrier!")
-        MPI.COMM_WORLD.Barrier()
+        # Wait for all peers to be ready using RAFT consensus
+        logging.debug("Wait for consensus establishment!")
+        # In gRPC mode, we rely on RAFT consensus rather than MPI barriers
+        self.consensus_established_event.wait(timeout=30)
         time.sleep(1)
-        logging.debug("MPI exit barrier!")
+        logging.debug("Consensus established, proceeding!")
 
         # Hand off to the parent run loop
         super().run()
@@ -187,8 +225,8 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         self.coordinator_id = leader_id
         
         # If this node became the leader
-        if leader_id == self.worker_index and not self.is_coordinator:
-            logging.info(f"Node {self.worker_index} is now the COORDINATOR (RAFT leader)")
+        if leader_id == self.node_id and not self.is_coordinator:
+            logging.info(f"Node {self.node_id} is now the COORDINATOR (RAFT leader)")
             self.is_coordinator = True
             
             # Start coordinator duties
@@ -200,8 +238,8 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             self.consensus_established_event.set()
         
         # If this node is no longer the leader
-        elif leader_id != self.worker_index and self.is_coordinator:
-            logging.info(f"Node {self.worker_index} is no longer the COORDINATOR")
+        elif leader_id != self.node_id and self.is_coordinator:
+            logging.info(f"Node {self.node_id} is no longer the COORDINATOR")
             self.is_coordinator = False
             
             # Stop coordinator duties if needed
@@ -218,6 +256,9 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         """
         Handle notification of membership changes from the consensus manager.
         
+        This method is called by the service discovery bridge when membership changes
+        are committed through RAFT consensus.
+        
         Args:
             new_nodes (set): The updated set of known nodes
             round_num (int): The current training round number
@@ -231,7 +272,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                 removed = [n for n in old_nodes if n not in new_nodes]
                 
                 if added or removed:
-                    logging.info(f"Node {self.worker_index}: Membership change at round {round_num}:" +
+                    logging.info(f"Node {self.node_id}: Membership change at round {round_num}:" +
                                 f" Added={added}, Removed={removed}")
                     
                     # Update topology if needed
@@ -241,8 +282,13 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                         # If this node is leader/coordinator, propagate updated topology
                         if self.is_coordinator:
                             self.update_topology_consensus()
+                    
+                    # Notify the service discovery bridge about the membership change
+                    if self.service_discovery_bridge:
+                        self.service_discovery_bridge.on_membership_change(new_nodes)
+                        
             except Exception as e:
-                logging.error(f"Node {self.worker_index}: Error handling membership change: {e}", exc_info=True)
+                logging.error(f"Node {self.node_id}: Error handling membership change: {e}", exc_info=True)
     
     def on_coordinator_change(self, new_coordinator, old_coordinator=None, round_num=0, reason='unspecified'):
         """
@@ -261,7 +307,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                 
                 # Update our tracking
                 self.coordinator_id = new_coordinator
-                logging.info(f"Node {self.worker_index}: Coordinator changed from {old_coordinator} to {new_coordinator} " +
+                logging.info(f"Node {self.node_id}: Coordinator changed from {old_coordinator} to {new_coordinator} " +
                            f"at round {round_num} (reason: {reason})")
                 
                 # Update any dependent components
@@ -271,7 +317,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                 # Signal that consensus is established
                 self.consensus_established_event.set()
             except Exception as e:
-                logging.error(f"Node {self.worker_index}: Error handling coordinator change: {e}", exc_info=True)
+                logging.error(f"Node {self.node_id}: Error handling coordinator change: {e}", exc_info=True)
     
     def on_become_coordinator(self, round_num=0):
         """
@@ -289,9 +335,9 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                     # Update state
                     old_state = self.is_coordinator
                     self.is_coordinator = True
-                    self.coordinator_id = self.worker_index
+                    self.coordinator_id = self.node_id
                     
-                    logging.info(f"Node {self.worker_index}: Becoming coordinator for round {round_num}")
+                    logging.info(f"Node {self.node_id}: Becoming coordinator for round {round_num}")
                     
                     # If not already running the coordinator thread, start it
                     if old_state != self.is_coordinator:
@@ -304,11 +350,11 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                     # Trigger the start of a training round if we're already in training mode
                     if hasattr(self, 'training_thread') and self.training_thread is not None and self.training_thread.is_alive():
                         # Signal to the training thread that it should proceed with the next round
-                        logging.info(f"Node {self.worker_index}: Triggering next training round as coordinator")
+                        logging.info(f"Node {self.node_id}: Triggering next training round as coordinator")
                         if hasattr(self, 'round_start_event'):
                             self.round_start_event.set()
             except Exception as e:
-                logging.error(f"Node {self.worker_index}: Error becoming coordinator: {e}", exc_info=True)
+                logging.error(f"Node {self.node_id}: Error becoming coordinator: {e}", exc_info=True)
     
     def run_sync(self):
         """Run the training process synchronously with RAFT consensus."""
@@ -361,7 +407,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                     # begin to send model
                     logging.debug("Begin send and receive")
                     logging.debug(self.topology_manager.topology)
-                    for neighbor_idx in self.topology_manager.get_out_neighbor_idx_list(self.worker_index):
+                    for neighbor_idx in self.topology_manager.get_out_neighbor_idx_list(self.node_id):
                         if self.compression in ["randomk", "topk"]:
                             self.send_sparse_params_to_neighbors(neighbor_idx, 
                                 sync_buffer["flatten_selected_values"].buffer.cpu(),
@@ -401,7 +447,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                     import numpy as np
                     if self.args.Failure_chance is not None and np.random.rand(1) < self.args.Failure_chance:
                         logging.info("Communication Failure happens on worker: {}, Failure_chance: {}".format(
-                            self.worker_index, self.args.Failure_chance))
+                            self.node_id, self.args.Failure_chance))
                     else:
                         self.lr_schedule(self.epoch, self.iteration, self.global_round_idx,
                                         self.worker.num_iterations, self.args.warmup_epochs)
@@ -430,24 +476,33 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         """
         Wait for initial RAFT consensus to be established.
         
-        Enhanced to use proper RAFT join protocol instead of manual state requests.
+        Uses the service discovery bridge for proper cluster joining.
         """
         # Wait until a leader is elected
         while self.raft_consensus.get_leader_id() is None:
-            logging.debug(f"Node {self.worker_index} waiting for leader election")
+            logging.debug(f"Node {self.node_id} waiting for leader election")
             time.sleep(0.1)
         
         self.coordinator_id = self.raft_consensus.get_leader_id()
         logging.info(f"Initial consensus established, leader is {self.coordinator_id}")
 
-        # If this node has not been initialized and is not the leader, join the cluster properly
+        # If this node needs to join the cluster, use the service discovery bridge
         if (self.raft_consensus.raft_node.state == RaftState.INITIAL and 
-            self.worker_index != self.coordinator_id):
+            self.node_id != self.coordinator_id):
             
-            logging.info(f"Node {self.worker_index} joining cluster through leader {self.coordinator_id}")
+            logging.info(f"Node {self.node_id} joining cluster through service discovery bridge")
             
-            # Use the enhanced cluster join method
-            self.request_cluster_join(self.coordinator_id)
+            # Use the bridge to handle joining
+            node_info = {
+                'node_id': self.node_id,
+                'ip_address': getattr(self.args, 'ip_address', 'localhost'),
+                'port': getattr(self.args, 'port', 8080),
+                'capabilities': ['grpc', 'fedml'],
+                'timestamp': time.time()
+            }
+            
+            if self.service_discovery_bridge:
+                self.service_discovery_bridge.handle_node_discovered(self.node_id, node_info)
             
             # Wait for state synchronization to complete
             max_wait_rounds = 100  # Allow more time for full synchronization
@@ -455,13 +510,13 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                 # Check if we've received and processed the state snapshot
                 if (self.raft_consensus.raft_node.state != RaftState.INITIAL and
                     self.raft_consensus.raft_node.commit_index > 0):
-                    logging.info(f"Node {self.worker_index} successfully synchronized "
+                    logging.info(f"Node {self.node_id} successfully synchronized "
                                f"(state: {self.raft_consensus.raft_node.state}, "
                                f"commit_index: {self.raft_consensus.raft_node.commit_index})")
                     break
                 time.sleep(0.1)
             else:
-                logging.warning(f"Node {self.worker_index} state synchronization may be incomplete")
+                logging.warning(f"Node {self.node_id} state synchronization may be incomplete")
 
         # Ensure topology and bandwidth are also synchronized
         # These should be updated through the state snapshot, but verify
@@ -472,14 +527,14 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                     break
                 time.sleep(0.1)
                 
-        if self.bandwidth_manager.get_bandwidth() is None:
+        if self.bandwidth_manager and self.bandwidth_manager.get_bandwidth() is None:
             logging.info("Bandwidth not yet available, waiting...")
             for _ in range(50):
                 if self.bandwidth_manager.get_bandwidth() is not None:
                     break
                 time.sleep(0.1)
 
-        logging.info(f"Node {self.worker_index} is ready to start training")
+        logging.info(f"Node {self.node_id} is ready to start training")
     
     # RAFT message handlers
     
@@ -642,7 +697,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         logging.info(f"Received leader redirect from {sender_id}, leader is {leader_id}")
         
         # Update our knowledge of the current leader and request state from them
-        if leader_id is not None and leader_id != self.worker_index:
+        if leader_id is not None and leader_id != self.node_id:
             self.coordinator_id = leader_id
             self.send_state_request(leader_id)
 
@@ -697,7 +752,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             raft_metadata = {
                 'term': self.raft_consensus.raft_node.current_term,
                 'commit_index': self.raft_consensus.raft_node.commit_index,
-                'leader_id': self.worker_index
+                'leader_id': self.node_id
             }
             self.send_model_params_with_metadata(sender_id, params, raft_metadata)
 
@@ -727,6 +782,86 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                 if leader_id is not None:
                     self.send_state_request(leader_id)
     
+    # Join protocol handlers
+    
+    def handle_join_request(self, msg_params):
+        """
+        Handle join request messages from new nodes.
+        
+        Args:
+            msg_params: Message parameters containing join request data
+        """
+        try:
+            # Extract sender ID from message parameters using standardized method
+            sender_id = self._extract_sender_id(msg_params)
+            node_info = msg_params.get('node_info', {})
+            
+            logging.info(f"Received join request from node {sender_id}")
+            
+            # Forward to the service discovery bridge
+            if self.service_discovery_bridge:
+                success = self.service_discovery_bridge.handle_join_request(sender_id, node_info)
+                
+                # Send join response back to the requesting node
+                if sender_id is not None:
+                    leader_id = self.node_id if self.is_coordinator else self.coordinator_id
+                    self.send_join_response(sender_id, success, leader_id)
+        
+        except Exception as e:
+            logging.error(f"Error handling join request: {e}")
+    
+    def handle_join_response(self, msg_params):
+        """
+        Handle a join response from the cluster.
+        
+        This method processes join responses and initiates proper state synchronization.
+        """
+        sender_id = self._extract_sender_id(msg_params)
+        success = msg_params.get(RaftMessage.MSG_ARG_SUCCESS, False)
+        leader_id = msg_params.get(RaftMessage.MSG_ARG_LEADER_ID)
+        error_msg = msg_params.get(RaftMessage.MSG_ARG_ERROR_MSG)
+        
+        if success and leader_id is not None:
+            logging.info(f"Join request accepted, leader is {leader_id}")
+            self.coordinator_id = leader_id
+            
+            # Request state synchronization from leader
+            if leader_id != self.node_id:
+                self.send_state_request(leader_id)
+        else:
+            logging.error(f"Join request rejected by {sender_id}: {error_msg}")
+            # Could implement retry logic here
+    
+    def _extract_sender_id(self, msg_params):
+        """
+        Extract sender ID from message parameters using standardized logic.
+        
+        Args:
+            msg_params: Message parameters (dict or message object)
+            
+        Returns:
+            int: Sender ID if found, None otherwise
+        """
+        if not isinstance(msg_params, dict):
+            return None
+            
+        # Try the standard FedML message framework key first
+        sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
+        
+        # If not found, try common alternatives
+        if sender_id is None:
+            sender_id = msg_params.get('sender_id')
+            
+        # If still not found, try to get from message object
+        if sender_id is None:
+            message = msg_params.get('message')
+            if message and hasattr(message, 'sender'):
+                sender_id = message.sender
+            elif message and hasattr(message, 'get_sender'):
+                sender_id = message.get_sender()
+        
+        return sender_id
+
     # RAFT message sending methods
     
     def send_vote_request(self, receiver_id, term, last_log_index, last_log_term):
@@ -741,7 +876,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         """
         message = Message(RaftMessage.MSG_TYPE_RAFT_REQUEST_VOTE, self.get_sender_id(), receiver_id)
         message.add_params(RaftMessage.MSG_ARG_TERM, term)
-        message.add_params(RaftMessage.MSG_ARG_CANDIDATE_ID, self.worker_index)
+        message.add_params(RaftMessage.MSG_ARG_CANDIDATE_ID, self.node_id)
         message.add_params(RaftMessage.MSG_ARG_LAST_LOG_INDEX, last_log_index)
         message.add_params(RaftMessage.MSG_ARG_LAST_LOG_TERM, last_log_term)
         
@@ -751,7 +886,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         """Send a RAFT PreVote request message."""
         message = Message(RaftMessage.MSG_TYPE_RAFT_PREVOTE_REQUEST, self.get_sender_id(), receiver_id)
         message.add_params(RaftMessage.MSG_ARG_TERM, term)
-        message.add_params(RaftMessage.MSG_ARG_CANDIDATE_ID, self.worker_index)
+        message.add_params(RaftMessage.MSG_ARG_CANDIDATE_ID, self.node_id)
         message.add_params(RaftMessage.MSG_ARG_LAST_LOG_INDEX, last_log_index)
         message.add_params(RaftMessage.MSG_ARG_LAST_LOG_TERM, last_log_term)
 
@@ -888,6 +1023,37 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         message.add_params(RaftMessage.MSG_ARG_MODEL_PARAMS, params)
         self.send_message(message)
     
+    def send_join_request(self, receiver_id, node_info=None):
+        """
+        Send a join request to a node in the cluster.
+        
+        Args:
+            receiver_id (int): ID of the receiver
+            node_info (dict): Optional node information
+        """
+        message = Message(RaftMessage.MSG_TYPE_RAFT_JOIN_REQUEST, self.get_sender_id(), receiver_id)
+        if node_info:
+            message.add_params(RaftMessage.MSG_ARG_NODE_INFO, node_info)
+        self.send_message(message)
+    
+    def send_join_response(self, receiver_id, success, leader_id=None, error_msg=None):
+        """
+        Send a join response to a requesting node.
+        
+        Args:
+            receiver_id (int): ID of the receiver
+            success (bool): Whether the join was successful
+            leader_id (int): ID of the current leader (if known)
+            error_msg (str): Error message if join failed
+        """
+        message = Message(RaftMessage.MSG_TYPE_RAFT_JOIN_RESPONSE, self.get_sender_id(), receiver_id)
+        message.add_params(RaftMessage.MSG_ARG_SUCCESS, success)
+        if leader_id is not None:
+            message.add_params(RaftMessage.MSG_ARG_LEADER_ID, leader_id)
+        if error_msg:
+            message.add_params(RaftMessage.MSG_ARG_ERROR_MSG, error_msg)
+        self.send_message(message)
+    
     # Enhanced RAFT state synchronization methods
     
     def send_comprehensive_state_snapshot(self, receiver_id, term, log, commit_index):
@@ -925,7 +1091,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             'topology': topology.tolist() if topology is not None else None,
             'bandwidth': bandwidth.tolist() if bandwidth is not None else None,
             'current_round': getattr(self, 'epoch', 0),
-            'leader_id': self.worker_index,
+            'leader_id': self.node_id,
             'timestamp': time.time()
         }
         
@@ -1051,28 +1217,46 @@ class RaftWorkerManager(DecentralizedWorkerManager):
 
     def request_cluster_join(self, leader_id=None):
         """
-        Request to join the cluster using proper RAFT protocol.
+        Request to join the cluster using the service discovery bridge.
         
-        This method should be called by new nodes that want to join the cluster.
-        It follows the RAFT join protocol to ensure proper state synchronization.
+        This method uses the service discovery bridge to properly join the cluster
+        through RAFT consensus rather than direct state requests.
         
         Args:
             leader_id (int, optional): ID of the known leader. If None, will discover.
         """
-        if leader_id is None:
-            # Try to discover the leader
-            leader_id = self.raft_consensus.get_leader_id()
-        
-        if leader_id is None:
-            # If no leader is known, request state from all known nodes
-            logging.info("No leader known, requesting state from all peers")
-            for peer_id in range(self.worker_num):
-                if peer_id != self.worker_index:
-                    self.send_state_request(peer_id)
+        if self.service_discovery_bridge:
+            # Use the bridge to handle joining
+            node_info = {
+                'node_id': self.node_id,
+                'ip_address': getattr(self.args, 'ip_address', 'localhost'),
+                'port': getattr(self.args, 'port', 8080),
+                'capabilities': ['grpc', 'fedml'],
+                'timestamp': time.time()
+            }
+            
+            # The bridge will handle the join request and state synchronization
+            self.service_discovery_bridge.handle_node_discovered(self.node_id, node_info)
+            
+            logging.info(f"Requested cluster join through service discovery bridge")
+            return True
         else:
-            # Request comprehensive state from the leader
-            logging.info(f"Requesting cluster join from leader {leader_id}")
-            self.send_state_request(leader_id)
+            # Fallback to direct join request
+            if leader_id is None:
+                leader_id = self.raft_consensus.get_leader_id()
+            
+            if leader_id is None:
+                # Broadcast join request to all known nodes
+                logging.info("Broadcasting join request to all peers")
+                for peer_id in range(self.worker_num):
+                    if peer_id != self.node_id:
+                        self.send_join_request(peer_id)
+            else:
+                # Send join request to the leader
+                logging.info(f"Sending join request to leader {leader_id}")
+                self.send_join_request(leader_id)
+            
+            return True
 
     def _override_saps_coordinator_logic(self):
         """
@@ -1091,11 +1275,12 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             # Start training thread
             self.training_thread.start()
             
-            # MPI barrier for synchronization
-            logging.debug("Wait for the barrier!")
-            MPI.COMM_WORLD.Barrier()
+            # gRPC-based synchronization using RAFT consensus
+            logging.debug("Wait for consensus establishment!")
+            # In gRPC mode, we rely on RAFT consensus rather than MPI barriers  
+            self.consensus_established_event.wait(timeout=30)
             time.sleep(1)
-            logging.debug("MPI exit barrier!")
+            logging.debug("Consensus established, proceeding!")
             
             # If this node is the RAFT leader, start coordinator duties
             if self.is_coordinator:
@@ -1174,7 +1359,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
     def refresh_gossip_info(self):
         """Refresh local gossip information from the topology manager."""
         self.neighbors_info = self.topology_manager.topology
-        self.gossip_info = self.topology_manager.topology[self.worker_index]
+        self.gossip_info = self.topology_manager.topology[self.node_id]
 
     def lr_schedule(self, epoch, iteration, round_idx, num_iterations, warmup_epochs):
         """Delegate learning rate scheduling to the parent implementation."""
@@ -1186,3 +1371,74 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             receive_id = self.coordinator_id if self.coordinator_id is not None else 0
         super().send_notify_to_coordinator(receive_id, train_metric_info, test_metric_info)
 
+    def cleanup(self):
+        """Clean up resources when shutting down."""
+        try:
+            # Stop the service discovery bridge
+            if self.service_discovery_bridge:
+                self.service_discovery_bridge.stop()
+                logging.info("Service discovery bridge stopped")
+            
+            # Unregister the bridge from consensus
+            if self.raft_consensus:
+                self.raft_consensus.unregister_service_discovery_bridge()
+                logging.info("Service discovery bridge unregistered")
+                
+            # Stop RAFT consensus
+            if self.raft_consensus:
+                self.raft_consensus.stop()
+                logging.info("RAFT consensus stopped")
+                
+        except Exception as e:
+            logging.error(f"Error during cleanup: {e}")
+    
+    def __del__(self):
+        """Destructor to ensure cleanup."""
+        try:
+            self.cleanup()
+        except Exception:
+            pass  # Don't raise exceptions in destructor
+    
+    def send_message_to_node(self, node_id, message):
+        """
+        Send a message to a specific node.
+        
+        This method is used by the service discovery bridge to communicate with nodes.
+        
+        Args:
+            node_id (int): ID of the target node
+            message (dict): Message to send
+        """
+        try:
+            # Convert dict message to fedml Message format
+            msg_type = message.get('type', 'unknown')
+            fedml_msg = Message(msg_type, self.get_sender_id(), node_id)
+            
+            # Add all message parameters
+            for key, value in message.items():
+                if key != 'type':
+                    fedml_msg.add_params(key, value)
+            
+            self.send_message(fedml_msg)
+            logging.debug(f"Sent message {msg_type} to node {node_id}")
+            
+        except Exception as e:
+            logging.error(f"Error sending message to node {node_id}: {e}")
+    
+    def broadcast_message(self, message):
+        """
+        Broadcast a message to all known nodes.
+        
+        This method is used by the service discovery bridge.
+        
+        Args:
+            message (dict): Message to broadcast
+        """
+        try:
+            known_nodes = self.raft_consensus.get_known_nodes()
+            for node_id in known_nodes:
+                if node_id != self.node_id:
+                    self.send_message_to_node(node_id, message)
+            
+        except Exception as e:
+            logging.error(f"Error broadcasting message: {e}")

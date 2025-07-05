@@ -74,6 +74,9 @@ class RaftConsensus:
         # Allow the raft_node to access consensus callbacks
         self.raft_node.consensus_manager = self
         
+        # Service discovery bridge (will be set later)
+        self.service_discovery_bridge = None
+        
         # Set callback for state changes
         self.raft_node.on_state_change = self.handle_state_change
         
