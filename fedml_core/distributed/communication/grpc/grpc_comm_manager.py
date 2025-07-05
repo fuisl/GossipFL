@@ -907,8 +907,10 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
                 logging.debug(f"Received message type: {msg_type}")
                 
                 # Check if this is a RAFT message that should be handled by bridge
+                # Convert msg_type to string to handle cases where it's an integer
+                msg_type_str = str(msg_type)
                 is_raft_message = (msg_params.get("message_source") == "raft" or 
-                                 msg_type.startswith("MSG_TYPE_RAFT_"))
+                                 msg_type_str.startswith("MSG_TYPE_RAFT_"))
                 
                 if is_raft_message and self.is_bridge_active():
                     logging.debug(f"Routing RAFT message to bridge: {msg_type}")
