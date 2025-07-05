@@ -1,376 +1,489 @@
 #!/usr/bin/env python3
-"""
-Dynamic Communication Node
 
-This script creates a node that can join/leave the network dynamically.
-Each node can send messages to other nodes and receive messages.
+"""
+Dynamic Node for Manual Testing
+
+This script creates a dynamic node using the refactored communication manager
+that integrates with the pure service discovery system.
 
 Usage:
-    python dynamic_node.py [--node-id ID] [--port PORT] [--gateway-host HOST] [--gateway-port PORT]
-    
-Commands (once running):
-    - 'list' or 'l': List all nodes in the network
-    - 'send <node_id> <message>': Send a message to a specific node
-    - 'broadcast <message>': Send a message to all nodes
-    - 'leader': Show current leader
-    - 'status': Show node status
-    - 'quit' or 'q': Exit the node
-    - 'help' or 'h': Show help
+    python refactored_dynamic_node.py [--node-id ID] [--host HOST] [--port PORT] [--discovery-host HOST] [--discovery-port PORT]
+
+Example:
+    python refactored_dynamic_node.py --node-id 1 --host localhost --port 8891 --discovery-host localhost --discovery-port 8090
 """
 
+import sys
+import os
 import argparse
 import logging
 import signal
-import sys
 import time
 import threading
+from typing import Optional, List
 import random
-import os
-from typing import Dict, List
 
-# Add paths
-sys.path.insert(0, '/home/fuisloy/data1tb/GossipFL')
-sys.path.insert(0, '/home/fuisloy/data1tb/GossipFL/algorithms/RAFT_GossipFL')
+# Add the project root to the path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../..')))
 
-# Direct imports to avoid __init__.py issues
-from fedml_core.distributed.communication.grpc.dynamic_grpc_comm_manager import DynamicGRPCCommManager
+from fedml_core.distributed.communication.grpc.grpc_comm_manager import RefactoredDynamicGRPCCommManager
 from fedml_core.distributed.communication.message import Message
 from fedml_core.distributed.communication.observer import Observer
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
-class NodeObserver(Observer):
-    """Observer for handling received messages."""
+class TestObserver(Observer):
+    """Test observer for demonstration purposes."""
     
     def __init__(self, node_id: int):
         self.node_id = node_id
-        self.received_messages = []
-        self.connection_ready = False
+        self.logger = logging.getLogger(f"TestObserver-{node_id}")
     
-    def receive_message(self, msg_type: str, msg: Message):
+    def receive_message(self, msg_type, msg_params):
         """Handle received messages."""
-        if msg_type == "CONNECTION_IS_READY":
-            self.connection_ready = True
-            print(f"🔗 Node {self.node_id} connection is ready")
-        else:
-            self.received_messages.append((msg_type, msg))
-            sender = msg.sender_id
-            content = msg.get_content()
-            print(f"📨 [Node {self.node_id}] Received from Node {sender}: {content}")
-
-class DynamicNode:
-    """A dynamic node that can join/leave the network."""
+        self.logger.info(f"Node {self.node_id} received message: type={msg_type}")
+        
+        # Echo back the message type for testing
+        if hasattr(msg_params, 'get_type'):
+            self.logger.info(f"Message details: {msg_params.get_type()}")
     
-    def __init__(self, node_id: int, port: int, gateway_host: str, gateway_port: int):
+    def connection_ready(self):
+        """Handle connection ready event."""
+        self.logger.info(f"Node {self.node_id} connection is ready")
+
+
+class RefactoredDynamicNode:
+    """
+    Dynamic node for testing the refactored communication manager.
+    
+    This demonstrates how to use the new pure service discovery architecture.
+    """
+    
+    def __init__(
+        self,
+        node_id: int,
+        host: str = "localhost",
+        port: int = 8891,
+        discovery_host: str = "localhost",
+        discovery_port: int = 8090,
+        log_level: str = "INFO"
+    ):
+        """
+        Initialize the dynamic node.
+        
+        Args:
+            node_id: Unique node identifier
+            host: Local host address
+            port: Local port
+            discovery_host: Service discovery server host
+            discovery_port: Service discovery server port
+            log_level: Logging level
+        """
         self.node_id = node_id
+        self.host = host
         self.port = port
-        self.gateway_host = gateway_host
-        self.gateway_port = gateway_port
+        self.discovery_host = discovery_host
+        self.discovery_port = discovery_port
+        self.log_level = log_level
         
         # Communication manager
-        self.comm_manager = None
-        self.observer = None
-        self.message_handler_thread = None
-        self.running = False
-        self.interactive_mode = True
+        self.comm_manager: Optional[RefactoredDynamicGRPCCommManager] = None
+        self.observer: Optional[TestObserver] = None
         
-        # Node info
-        self.capabilities = ['grpc', 'fedml', 'dynamic_test']
-        self.metadata = {
-            'role': 'test_node',
-            'started_at': str(time.time()),
-            'version': '1.0.0'
-        }
+        # Node state
+        self.running = False
+        self.message_sender_thread = None
+        
+        # Configure logging - Fix duplicate logging by configuring only once
+        self.logger = logging.getLogger(f"RefactoredDynamicNode-{node_id}")
+        
+        # Only configure if root logger has no handlers (prevents duplicate logging)
+        if not logging.root.handlers:
+            logging.basicConfig(
+                level=getattr(logging, log_level.upper()),
+                format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                handlers=[
+                    logging.StreamHandler(sys.stdout),
+                    logging.FileHandler(f'refactored_dynamic_node_{node_id}.log')
+                ]
+            )
+        
+        self.logger = logging.getLogger(f"RefactoredDynamicNode-{node_id}")
+        self.logger.info(f"Refactored dynamic node {node_id} initialized")
     
     def start(self):
-        """Start the node and join the network."""
-        logger.info("="*60)
-        logger.info(f"🚀 Starting Node {self.node_id}")
-        logger.info("="*60)
-        
+        """Start the dynamic node."""
         try:
-            # Create communication manager
-            self.comm_manager = DynamicGRPCCommManager(
-                host='127.0.0.1',
+            self.logger.info(f"Starting refactored dynamic node {self.node_id}")
+            
+            # Define callbacks for node discovery events
+            def on_node_discovered(discovered_node_id, node_info):
+                self.logger.info(f"Node {self.node_id} discovered new node {discovered_node_id}: "
+                               f"{node_info.ip_address}:{node_info.port}")
+            
+            def on_node_lost(lost_node_id):
+                self.logger.info(f"Node {self.node_id} lost connection to node {lost_node_id}")
+            
+            # Create the refactored communication manager
+            self.comm_manager = RefactoredDynamicGRPCCommManager(
+                host=self.host,
                 port=self.port,
                 node_id=self.node_id,
-                client_num=10,  # Support up to 10 nodes
-                gateway_host=self.gateway_host,
-                gateway_port=self.gateway_port,
-                capabilities=self.capabilities,
-                metadata=self.metadata
+                client_num=10,  # Support up to 10 clients
+                service_discovery_host=self.discovery_host,
+                service_discovery_port=self.discovery_port,
+                capabilities=['grpc', 'fedml', 'gossip'],
+                metadata={
+                    'type': 'test_node',
+                    'version': '1.0.0',
+                    'started_at': str(time.time())
+                },
+                use_service_discovery=True,
+                on_node_discovered=on_node_discovered,
+                on_node_lost=on_node_lost
             )
             
-            # Create observer
-            self.observer = NodeObserver(self.node_id)
+            # Create and add observer
+            self.observer = TestObserver(self.node_id)
             self.comm_manager.add_observer(self.observer)
             
-            # Start message handling
+            # Start message handling in a separate thread
+            import threading
             self.message_handler_thread = threading.Thread(
                 target=self.comm_manager.handle_receive_message,
                 daemon=True
             )
             self.message_handler_thread.start()
             
-            # Wait for initialization
-            time.sleep(2)
-            
             self.running = True
             
-            # Show initial status
-            self.show_status()
+            self.logger.info(f"Refactored dynamic node {self.node_id} started successfully")
+            self.logger.info(f"Node type: {'Bootstrap' if self.comm_manager.is_bootstrap_node() else 'Regular'}")
+            self.logger.info(f"Cluster size: {self.comm_manager.get_cluster_size()}")
             
-            logger.info("✅ Node started successfully")
-            logger.info("💡 Type 'help' for available commands")
+            # Print node information
+            self._print_node_info()
             
-            if self.interactive_mode:
-                self.run_interactive()
-            else:
-                self.run_background()
-                
+            # Start periodic message sending for testing
+            self._start_message_sender()
+            
         except Exception as e:
-            logger.error(f"❌ Failed to start node: {e}")
-            self.stop()
+            self.logger.error(f"Failed to start refactored dynamic node {self.node_id}: {e}")
+            raise
     
     def stop(self):
-        """Stop the node and leave the network."""
-        logger.info(f"🔄 Stopping Node {self.node_id}...")
-        self.running = False
+        """Stop the dynamic node (idempotent)."""
+        # Use a class-level flag to prevent multiple cleanup attempts
+        if not hasattr(self, '_stop_called'):
+            self._stop_called = threading.Event()
+        
+        if self._stop_called.is_set():
+            self.logger.debug(f"Stop already called for node {self.node_id}, skipping...")
+            return
+        
+        # Set the flag to prevent re-entry
+        self._stop_called.set()
+        
+        try:
+            if self.running:
+                self.logger.info(f"Stopping refactored dynamic node {self.node_id}")
+                self.running = False
+                
+                # Clean up communication manager
+                if self.comm_manager:
+                    try:
+                        self.comm_manager.cleanup()
+                    except Exception as e:
+                        self.logger.error(f"Error during cleanup: {e}")
+                        import traceback
+                        traceback.print_exc()
+                    finally:
+                        self.comm_manager = None
+                
+                self.logger.info(f"Refactored dynamic node {self.node_id} stopped")
+            else:
+                self.logger.debug(f"Node {self.node_id} was already stopped")
+        except Exception as e:
+            self.logger.error(f"Error during stop: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _print_node_info(self):
+        """Print node information."""
+        print("\n" + "="*60)
+        print(f"REFACTORED DYNAMIC NODE {self.node_id} STARTED")
+        print("="*60)
+        print(f"Node ID: {self.node_id}")
+        print(f"Host: {self.host}")
+        print(f"Port: {self.port}")
+        print(f"Discovery Server: {self.discovery_host}:{self.discovery_port}")
+        print(f"Log Level: {self.log_level}")
         
         if self.comm_manager:
-            self.comm_manager.cleanup()
-            self.comm_manager.stop_receive_message()
-        
-        logger.info("✅ Node stopped")
-        logger.info("👋 Goodbye!")
-    
-    def show_status(self):
-        """Show current node status."""
-        if not self.comm_manager:
-            print("❌ Node not initialized")
-            return
+            print(f"Bootstrap Node: {self.comm_manager.is_bootstrap_node()}")
+            print(f"Cluster Size: {self.comm_manager.get_cluster_size()}")
             
-        is_bootstrap = self.comm_manager.is_bootstrap_node_local()
-        leader_id = self.comm_manager.get_cluster_leader()
-        nodes = self.comm_manager.get_cluster_nodes_info()
+            # Print peer nodes
+            cluster_info = self.comm_manager.get_cluster_nodes_info()
+            peer_nodes = [nid for nid in cluster_info.keys() if nid != self.node_id]
+            if peer_nodes:
+                print(f"Peer Nodes: {peer_nodes}")
+            else:
+                print("Peer Nodes: None (first node or isolated)")
         
-        print("\n" + "="*40)
-        print(f"📊 Node {self.node_id} Status")
-        print("="*40)
-        print(f"🏠 Address: 127.0.0.1:{self.port}")
-        print(f"🎯 Gateway: {self.gateway_host}:{self.gateway_port}")
-        print(f"👑 Bootstrap: {'Yes' if is_bootstrap else 'No'}")
-        print(f"🎪 Leader: Node {leader_id}" if leader_id else "🎪 Leader: None")
-        print(f"🌐 Connected nodes: {len(nodes)}")
-        print(f"📋 Node IDs: {sorted(nodes.keys())}")
-        print("="*40)
+        print("\nThis node uses the REFACTORED architecture:")
+        print("- No polling mechanisms")
+        print("- Direct gRPC calls to pure service discovery")
+        print("- Event-driven registration and discovery")
+        print("- Robust fault tolerance and graceful degradation")
+        print("\nNode will:")
+        print("- Send test messages to other nodes periodically")
+        print("- Respond to messages from other nodes")
+        print("- Maintain connection with service discovery")
+        print("\nTo stop the node, press Ctrl+C")
+        print("="*60)
+        print()
     
-    def list_nodes(self):
-        """List all nodes in the network."""
-        if not self.comm_manager:
-            print("❌ Node not initialized")
-            return
+    def _start_message_sender(self):
+        """Start periodic message sending for testing."""
+        def message_sender():
+            message_counter = 0
             
-        nodes = self.comm_manager.get_cluster_nodes_info()
+            while self.running:
+                try:
+                    time.sleep(10 + random.uniform(0, 5))  # Send every 10-15 seconds
+                    
+                    if not self.running:
+                        break
+                    
+                    # Get available peer nodes
+                    cluster_info = self.comm_manager.get_cluster_nodes_info()
+                    peer_nodes = [nid for nid in cluster_info.keys() if nid != self.node_id]
+                    
+                    if peer_nodes:
+                        # Choose a random peer to send message to
+                        target_node = random.choice(peer_nodes)
+                        
+                        # Create test message
+                        message_counter += 1
+                        test_message = Message(
+                            type="test_message",
+                            sender_id=self.node_id,
+                            receiver_id=target_node
+                        )
+                        test_message.add_params("counter", message_counter)
+                        test_message.add_params("timestamp", time.time())
+                        test_message.add_params("data", f"Hello from refactored node {self.node_id}!")
+                        
+                        # Send the message
+                        self.logger.info(f"Sending test message #{message_counter} to node {target_node}")
+                        self.comm_manager.send_message(test_message)
+                        
+                    else:
+                        self.logger.debug(f"No peer nodes available for messaging")
+                        
+                except Exception as e:
+                    if self.running:
+                        self.logger.error(f"Error in message sender: {e}")
+                    time.sleep(5)  # Wait before retry
         
-        print("\n" + "="*50)
-        print("🌐 Network Nodes")
-        print("="*50)
-        
-        if not nodes:
-            print("No nodes found")
-            return
-        
-        for node_id, node_info in sorted(nodes.items()):
-            status = "🟢" if node_info.is_reachable else "🔴"
-            bootstrap = "👑" if node_id == self.node_id and self.comm_manager.is_bootstrap_node_local() else "  "
-            print(f"{status} {bootstrap} Node {node_id:2d} - {node_info.ip_address}:{node_info.port}")
-        
-        print("="*50)
+        self.message_sender_thread = threading.Thread(target=message_sender, daemon=True)
+        self.message_sender_thread.start()
+        self.logger.info("Periodic message sender started")
     
-    def send_message(self, target_node_id: int, message_content: str):
-        """Send a message to a specific node."""
+    def send_manual_message(self, target_node_id: int, message_content: str):
+        """Send a manual message to another node."""
         if not self.comm_manager:
-            print("❌ Node not initialized")
+            self.logger.error("Communication manager not initialized")
             return
-            
+        
         try:
-            # Create message
-            msg = Message()
-            msg.sender_id = self.node_id
-            msg.receiver_id = target_node_id
-            msg.set_type("USER_MESSAGE")
-            msg.set_content({
-                "text": message_content,
-                "timestamp": time.time(),
-                "sender_name": f"Node-{self.node_id}"
-            })
+            # Create manual message using correct Message API
+            manual_message = Message(
+                type="manual_message",
+                sender_id=self.node_id,
+                receiver_id=target_node_id
+            )
+            manual_message.add_params("content", message_content)
+            manual_message.add_params("timestamp", time.time())
             
-            # Send message
-            self.comm_manager.send_message(msg)
-            print(f"📤 Sent to Node {target_node_id}: {message_content}")
+            # Send the message
+            self.comm_manager.send_message(manual_message)
+            self.logger.info(f"Sent manual message to node {target_node_id}: {message_content}")
             
         except Exception as e:
-            print(f"❌ Failed to send message: {e}")
+            self.logger.error(f"Failed to send manual message: {e}")
     
-    def broadcast_message(self, message_content: str):
-        """Broadcast a message to all nodes."""
+    def get_status(self):
+        """Get node status information."""
         if not self.comm_manager:
-            print("❌ Node not initialized")
-            return
-            
-        nodes = self.comm_manager.get_cluster_nodes_info()
-        sent_count = 0
+            return {"status": "not_started"}
         
-        for node_id in nodes.keys():
-            if node_id != self.node_id:  # Don't send to self
-                try:
-                    self.send_message(node_id, message_content)
-                    sent_count += 1
-                except Exception as e:
-                    print(f"❌ Failed to send to Node {node_id}: {e}")
-        
-        print(f"📡 Broadcast sent to {sent_count} nodes")
+        return {
+            "node_id": self.node_id,
+            "running": self.running,
+            "is_bootstrap": self.comm_manager.is_bootstrap_node(),
+            "cluster_size": self.comm_manager.get_cluster_size(),
+            "reachable_nodes": self.comm_manager.get_reachable_nodes(),
+            "peer_nodes": [nid for nid in self.comm_manager.get_cluster_nodes_info().keys() if nid != self.node_id]
+        }
     
-    def run_interactive(self):
-        """Run in interactive mode."""
-        print("\n💬 Interactive mode - Type commands:")
-        
-        while self.running:
-            try:
-                command = input(f"Node-{self.node_id}> ").strip()
-                
-                if not command:
-                    continue
-                
-                parts = command.split()
-                cmd = parts[0].lower()
-                
-                if cmd in ['quit', 'q', 'exit']:
-                    break
-                elif cmd in ['help', 'h']:
-                    self.show_help()
-                elif cmd in ['list', 'l']:
-                    self.list_nodes()
-                elif cmd in ['status', 's']:
-                    self.show_status()
-                elif cmd == 'leader':
-                    leader_id = self.comm_manager.get_cluster_leader()
-                    print(f"👑 Current leader: Node {leader_id}" if leader_id else "👑 No leader")
-                elif cmd == 'send' and len(parts) >= 3:
-                    try:
-                        target_id = int(parts[1])
-                        message = ' '.join(parts[2:])
-                        self.send_message(target_id, message)
-                    except ValueError:
-                        print("❌ Invalid node ID")
-                elif cmd == 'broadcast' and len(parts) >= 2:
-                    message = ' '.join(parts[1:])
-                    self.broadcast_message(message)
-                elif cmd == 'refresh':
-                    if self.comm_manager:
-                        self.comm_manager.refresh_node_registry()
-                        print("🔄 Node registry refreshed")
-                else:
-                    print(f"❌ Unknown command: {command}")
-                    print("💡 Type 'help' for available commands")
-                    
-            except KeyboardInterrupt:
-                print("\n🛑 Shutdown requested")
-                break
-            except EOFError:
-                print("\n🛑 EOF received")
-                break
-            except Exception as e:
-                print(f"❌ Error: {e}")
-    
-    def run_background(self):
-        """Run in background mode."""
-        try:
-            while self.running:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            logger.info("\n🛑 Shutdown requested")
-    
-    def show_help(self):
-        """Show help message."""
-        print("\n" + "="*50)
-        print("💡 Available Commands")
-        print("="*50)
-        print("  help, h           - Show this help")
-        print("  list, l           - List all nodes")
-        print("  status, s         - Show node status")
-        print("  leader            - Show current leader")
-        print("  send <id> <msg>   - Send message to node")
-        print("  broadcast <msg>   - Broadcast to all nodes")
-        print("  refresh           - Refresh node registry")
-        print("  quit, q           - Exit node")
-        print("="*50)
-        print("Examples:")
-        print("  send 2 Hello Node 2!")
-        print("  broadcast Hello everyone!")
-        print("="*50)
+    def discover_new_nodes(self):
+        """Manually trigger node discovery."""
+        if self.comm_manager:
+            new_nodes = self.comm_manager.discover_new_nodes()
+            self.logger.info(f"Manual discovery found {len(new_nodes)} new nodes")
+            return new_nodes
+        return []
 
-def setup_signal_handlers(node):
-    """Setup signal handlers for graceful shutdown."""
+
+def setup_signal_handlers(node: RefactoredDynamicNode):
+    """Set up signal handlers for graceful shutdown."""
     def signal_handler(signum, frame):
-        logger.info(f"\n🔔 Received signal {signum}")
-        node.stop()
+        print(f"\nReceived signal {signum}, shutting down...")
+        
+        # Simple, idempotent cleanup
+        try:
+            node.stop()
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
+        
+        # Exit cleanly
         sys.exit(0)
     
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
+
+def print_status_periodically(node: RefactoredDynamicNode, interval: int):
+    """Print node status periodically."""
+    while node.running:
+        try:
+            time.sleep(interval)
+            if not node.running:
+                break
+                
+            status = node.get_status()
+            
+            print(f"\n--- Refactored Node {status['node_id']} Status ---")
+            print(f"Running: {status['running']}")
+            print(f"Bootstrap: {status['is_bootstrap']}")
+            print(f"Cluster Size: {status['cluster_size']}")
+            print(f"Peer Nodes: {status['peer_nodes']}")
+            print(f"Reachable Nodes: {status['reachable_nodes']}")
+            print("--------------------------------------\n")
+            
+        except Exception as e:
+            if node.running:
+                print(f"Error getting status: {e}")
+
+
 def main():
     """Main function."""
-    parser = argparse.ArgumentParser(description='Dynamic Communication Node')
-    parser.add_argument('--node-id', type=int, help='Node ID (auto-generated if not provided)')
-    parser.add_argument('--port', type=int, help='Port to bind to (auto-generated if not provided)')
-    parser.add_argument('--gateway-host', default='localhost', help='Gateway host (default: localhost)')
-    parser.add_argument('--gateway-port', type=int, default=8090, help='Gateway port (default: 8090)')
-    parser.add_argument('--background', action='store_true', help='Run in background mode (no interactive)')
-    parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
+    parser = argparse.ArgumentParser(
+        description="Refactored Dynamic Node for Manual Testing",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python refactored_dynamic_node.py --node-id 1
+  python refactored_dynamic_node.py --node-id 2 --port 8892
+  python refactored_dynamic_node.py --node-id 3 --host 192.168.1.100 --port 8893 --discovery-host 192.168.1.50
+        """
+    )
+    
+    parser.add_argument(
+        "--node-id",
+        type=int,
+        required=True,
+        help="Unique node identifier"
+    )
+    
+    parser.add_argument(
+        "--host",
+        default="localhost",
+        help="Node host address (default: localhost)"
+    )
+    
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Node port (default: 8890 + node_id)"
+    )
+    
+    parser.add_argument(
+        "--discovery-host",
+        default="localhost",
+        help="Service discovery server host (default: localhost)"
+    )
+    
+    parser.add_argument(
+        "--discovery-port",
+        type=int,
+        default=8090,
+        help="Service discovery server port (default: 8090)"
+    )
+    
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level (default: INFO)"
+    )
+    
+    parser.add_argument(
+        "--status-interval",
+        type=int,
+        default=60,
+        help="Interval in seconds to print node status (default: 60, 0 to disable)"
+    )
     
     args = parser.parse_args()
     
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-    
-    # Generate node ID if not provided
-    if args.node_id is None:
-        args.node_id = random.randint(1, 9999)
-        print(f"🎲 Generated Node ID: {args.node_id}")
-    
-    # Generate port if not provided
+    # Default port calculation
     if args.port is None:
-        args.port = 8900 + (args.node_id % 100)
-        print(f"🎲 Generated Port: {args.port}")
+        args.port = 8890 + args.node_id
     
-    # Create and start node
-    node = DynamicNode(
+    # Create and start the node
+    node = RefactoredDynamicNode(
         node_id=args.node_id,
+        host=args.host,
         port=args.port,
-        gateway_host=args.gateway_host,
-        gateway_port=args.gateway_port
+        discovery_host=args.discovery_host,
+        discovery_port=args.discovery_port,
+        log_level=args.log_level
     )
     
-    if args.background:
-        node.interactive_mode = False
-    
-    setup_signal_handlers(node)
-    
     try:
+        # Set up signal handlers for graceful shutdown
+        setup_signal_handlers(node)
+        
+        # Start the node
         node.start()
-    except Exception as e:
-        logger.error(f"❌ Failed to start node: {e}")
-        sys.exit(1)
-    finally:
+        
+        # Optional: Print status periodically
+        if args.status_interval > 0:
+            status_thread = threading.Thread(
+                target=print_status_periodically,
+                args=(node, args.status_interval),
+                daemon=True
+            )
+            status_thread.start()
+        
+        # Keep the main thread alive
+        while node.running:
+            time.sleep(1)
+        
+    except KeyboardInterrupt:
+        print("\nShutdown signal received...")
         node.stop()
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        node.stop()
+    finally:
+        # Ensure cleanup happens
+        node.stop()
+        print("Node shutdown complete.")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
