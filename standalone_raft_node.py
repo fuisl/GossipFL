@@ -305,8 +305,9 @@ class StandaloneRaftNode:
         
         # Register the service discovery bridge with the communication manager
         if hasattr(self.worker_manager, 'service_discovery_bridge'):
+            self.raft_consensus.register_service_discovery_bridge(self.worker_manager.service_discovery_bridge)
             self.worker_manager.service_discovery_bridge.register_with_comm_manager(self.comm_manager)
-            self.logger.info("Service discovery bridge registered with communication manager")
+            self.logger.info("Service discovery bridge registered with consensus and communication manager")
         
         # Setup monitoring
         self.status_monitor = StatusMonitor(self)

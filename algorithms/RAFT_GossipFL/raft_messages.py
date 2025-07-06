@@ -39,6 +39,7 @@ class RaftMessage:
     MSG_ARG_MATCH_INDEX = "match_index"
     MSG_ARG_LOG = "log"
     MSG_ARG_COMMIT_INDEX = "commit_index"
+    MSG_ARG_ERROR_MSG = "error_msg"
 
     # Install snapshot arguments
     MSG_ARG_LAST_INCLUDED_INDEX = "last_included_index"

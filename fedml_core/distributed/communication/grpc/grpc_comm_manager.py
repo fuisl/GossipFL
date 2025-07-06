@@ -754,7 +754,7 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
     
     def send_message(self, msg: Message):
         """Send message using node registry information."""
-        logging.info(f"Sending message: {msg.to_string()}")
+        logging.debug(f"Sending message: {msg.to_string()}")
 
         # Serialize message
         pickle_dump_start_time = time.time()
@@ -773,9 +773,13 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
         if receiver_id not in self.node_registry:
             # In bridge mode, we don't manually refresh - the leader will notify us
             if self.bridge_registered and self.service_discovery_bridge:
-                logging.warning(f"Receiver node {receiver_id} not in registry. "
-                            f"Waiting for leader to notify about new nodes.")
-                raise ValueError(f"Receiver node {receiver_id} not found in registry")
+                logging.info(f"Receiver node {receiver_id} not in registry. Attempting discovery...")
+                # Try a single refresh, but don't trigger duplicate join requests
+                self.refresh_node_registry()
+                
+                if receiver_id not in self.node_registry:
+                    logging.error(f"Receiver node {receiver_id} not found in registry and discovery failed")
+                    raise ValueError(f"Receiver node {receiver_id} not found in registry and discovery failed")
             else:
                 # Non-bridge mode: try manual refresh
                 logging.info(f"Receiver node {receiver_id} not in registry, attempting discovery")

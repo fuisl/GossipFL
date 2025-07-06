@@ -639,25 +639,35 @@ class RaftWorkerManager(DecentralizedWorkerManager):
     def handle_state_snapshot(self, msg_params):
         """
         Handle a RAFT StateSnapshot message.
-        
-        Enhanced to process comprehensive state packages for proper node joining.
-        
-        Args:
-            msg_params (dict): Message parameters
+
+        Enhanced to drive the RaftNode’s high‐level state sync callback
+        and then process any comprehensive state_package for FL.
         """
-        sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
-        term = msg_params.get(RaftMessage.MSG_ARG_TERM)
-        log = msg_params.get(RaftMessage.MSG_ARG_LOG)
-        commit_index = msg_params.get(RaftMessage.MSG_ARG_COMMIT_INDEX)
+        sender_id     = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
+        term          = msg_params.get(RaftMessage.MSG_ARG_TERM)
+        log_entries   = msg_params.get(RaftMessage.MSG_ARG_LOG, [])
+        commit_index  = msg_params.get(RaftMessage.MSG_ARG_COMMIT_INDEX, 0)
         state_package = msg_params.get(RaftMessage.MSG_ARG_STATE_PACKAGE)
-        
-        logging.debug(f"Received StateSnapshot from {sender_id}, term={term}, "
-                     f"log_size={len(log) if log else 0}, commit_index={commit_index}")
-        
-        # First, process the basic RAFT state snapshot
-        self.raft_consensus.handle_state_snapshot(term, log, commit_index)
-        
-        # If there's a comprehensive state package, initialize from it
+
+        logging.debug(
+            f"Received StateSnapshot from {sender_id}, "
+            f"term={term}, log_size={len(log_entries)}, commit_index={commit_index}"
+        )
+
+        self.raft_consensus.handle_state_snapshot(term, log_entries, commit_index)
+
+        sync_payload = {
+            'leader_id':    sender_id,
+            'term':         term,
+            'known_nodes':  list(self.raft_consensus.get_known_nodes()),
+            'commit_index': commit_index,
+            'log_entries':  list(log_entries),
+            'timestamp':    time.time(),
+        }
+
+        self.raft_consensus.raft_node.handle_state_sync_response(sync_payload)
+
+        # 3) If there was a full “comprehensive” package, apply that too
         if state_package is not None:
             logging.info(f"Processing comprehensive state package from {sender_id}")
             success = self.initialize_from_state_snapshot(state_package)
@@ -665,6 +675,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                 logging.info(f"Successfully joined cluster via state snapshot from {sender_id}")
             else:
                 logging.error(f"Failed to process state package from {sender_id}")
+
 
     def handle_install_snapshot(self, msg_params):
         """Handle an InstallSnapshot message from the leader."""
@@ -1012,12 +1023,12 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             node_info (dict): Optional node information
         """
         message = Message(RaftMessage.MSG_TYPE_RAFT_JOIN_REQUEST, sender_id=self.node_id, receiver_id=receiver_id)
-        logging.debug(f"Node {self.node_id} sending join request to {receiver_id} with message: {message.to_string()}")
+        # logging.debug(f"Node {self.node_id} sending join request to {receiver_id} with message: {message.to_string()}")
         if node_info:
             message.add_params(RaftMessage.MSG_ARG_NODE_INFO, node_info)
 
         logging.debug(f"Node {self.node_id} sending join request to {receiver_id}")
-        logging.debug(f"Node info: {node_info}")
+        # logging.debug(f"Node info: {node_info}")
         self.send_message(message)
     
     def send_join_response(self, receiver_id, success, leader_id=None, error_msg=None):
@@ -1072,8 +1083,8 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             'raft_log': log,
             'raft_commit_index': commit_index,
             'model_params': model_params,
-            'topology': topology.tolist() if topology is not None else None,
-            'bandwidth': bandwidth.tolist() if bandwidth is not None else None,
+            'topology': topology.tolist() if hasattr(topology, 'tolist') else topology,
+            'bandwidth': bandwidth.tolist() if hasattr(bandwidth, 'tolist') else bandwidth,
             'current_round': getattr(self, 'epoch', 0),
             'leader_id': self.node_id,
             'timestamp': time.time()

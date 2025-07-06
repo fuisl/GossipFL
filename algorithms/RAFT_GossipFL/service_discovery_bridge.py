@@ -229,6 +229,10 @@ class RaftServiceDiscoveryBridge:
                 else:
                     logging.error(f"Bridge: No worker manager available to send join request")
                     return False
+        
+            else:
+                logging.info(f"Bridge: Node {node_id} discovered - connection info: {node_info}")
+                return True
                     
         except Exception as e:
             logging.error(f"Bridge: Error handling node discovered event for {node_id}: {e}")

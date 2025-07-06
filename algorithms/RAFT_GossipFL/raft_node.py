@@ -103,45 +103,47 @@ class RaftNode:
         )
     
     def update_known_nodes(self, total_nodes=None, node_ids=None):
-        """
-        Update the set of known nodes.
-        
-        Args:
-            total_nodes (int, optional): Total number of nodes in the network
-            node_ids (list, optional): Explicit list of node IDs to use
-        """
-        with self.state_lock:
-            # Update the known_nodes set based on provided information
-            if node_ids is not None:
-                # Use explicitly provided node IDs
-                self.known_nodes = set(node_ids)
-            elif total_nodes is not None and not self.known_nodes:
-                # Only use range if we don't have any nodes yet and no explicit IDs provided
-                # This maintains backward compatibility with existing code
-                self.known_nodes = set(range(total_nodes))
-                logging.debug(f"Node {self.node_id}: Initializing with sequential IDs (0-{total_nodes-1})")
-            # Otherwise, keep the existing known_nodes
-                
-            # Update node count and majority threshold
-            self.total_nodes = len(self.known_nodes)
-            self.majority = self.total_nodes // 2 + 1
+        """Update the known nodes set and notify components."""
+        try:
+            old_known_nodes = set(self.known_nodes)
+            new_known_nodes = set(node_ids)
             
-            # Update leader state if we're the leader
+            logging.debug(f"Node {self.node_id}: update_known_nodes called with {node_ids}")
+            logging.debug(f"Node {self.node_id}: old_known_nodes={old_known_nodes}, new_known_nodes={new_known_nodes}")
+            
+            # Update the known nodes
+            self.known_nodes = new_known_nodes
+            
+            # Update majority calculation
+            self.majority = len(self.known_nodes) // 2 + 1
+            
+            # Log the change
+            added_nodes = new_known_nodes - old_known_nodes
+            removed_nodes = old_known_nodes - new_known_nodes
+            
+            if added_nodes or removed_nodes:
+                logging.info(f"Node {self.node_id}: Known nodes updated, total={len(self.known_nodes)}, "
+                            f"majority={self.majority}, nodes={sorted(list(self.known_nodes))}")
+                
+                if added_nodes:
+                    logging.info(f"Node {self.node_id}: Added nodes: {added_nodes}")
+                if removed_nodes:
+                    logging.info(f"Node {self.node_id}: Removed nodes: {removed_nodes}")
+            
+            # If this is the leader, initialize state for new nodes
             if self.state == RaftState.LEADER:
-                # Update next_index and match_index for any new nodes
-                for node_id in self.known_nodes:
-                    if node_id != self.node_id and node_id not in self.next_index:
-                        self.next_index[node_id] = len(self.log) + 1
+                for node_id in added_nodes:
+                    if node_id != self.node_id:
+                        self.next_index[node_id] = len(self.log)
                         self.match_index[node_id] = 0
-                
-                # Remove any nodes that are no longer in the cluster
-                for node_id in list(self.next_index.keys()):
-                    if node_id not in self.known_nodes:
-                        del self.next_index[node_id]
-                        if node_id in self.match_index:
-                            del self.match_index[node_id]
+                        logging.debug(f"Node {self.node_id}: Initialized leader state for new node {node_id}")
             
-            logging.info(f"Node {self.node_id}: Known nodes updated, total={self.total_nodes}, majority={self.majority}, nodes={sorted(self.known_nodes)}")
+            # Notify callback if set
+            if hasattr(self, 'on_membership_change') and self.on_membership_change:
+                self.on_membership_change(new_known_nodes)
+                
+        except Exception as e:
+            logging.error(f"Node {self.node_id}: Error updating known nodes: {e}")
     
     def reset_election_timeout(self):
         """Reset the election timeout with a random value and clear prevote state."""
@@ -578,6 +580,7 @@ class RaftNode:
                     self.on_state_change(RaftState.LEADER)
                 
                 logging.info(f"Node {self.node_id}: Became LEADER for term {self.current_term}")
+                logging.info(f"Node {self.node_id}: Initialized leader state for nodes: {list(self.known_nodes)}")
                 
                 # Note: Heartbeats will be sent by the manager's heartbeat thread
                 # which regularly calls send_heartbeats for the leader
@@ -1347,6 +1350,12 @@ class RaftNode:
                     logging.warning(f"Node {self.node_id}: Cannot add node - not a leader")
                     return -1
                 
+                # if node already known or already pending, skip
+                node_id, _ = self._extract_node_info(new_node_info)
+                if node_id in self.known_nodes or (hasattr(self, 'pending_node_connection_info') and node_id in self.pending_node_connection_info):
+                    logging.debug(f"Leader {self.node_id}: Node {node_id} already known or pending, skipping add")
+                    return -1
+                
                 # Extract and validate node information
                 node_id, connection_info = self._extract_node_info(new_node_info)
                 if node_id is None:
@@ -1969,119 +1978,119 @@ class RaftNode:
                 logging.error(f"Node {self.node_id}: Error in bootstrap detection: {e}")
                 return False
 
-    def request_state_sync(self):
-        """
-        Request state synchronization from the cluster leader.
+    # def request_state_sync(self):
+    #     """
+    #     Request state synchronization from the cluster leader.
         
-        This method is called when a node joins an existing cluster and needs
-        to synchronize its state with the current cluster state.
+    #     This method is called when a node joins an existing cluster and needs
+    #     to synchronize its state with the current cluster state.
         
-        Returns:
-            bool: True if state sync request was sent, False otherwise
-        """
-        with self.state_lock:
-            try:
-                # Only request state sync if we're in FOLLOWER state
-                if self.state != RaftState.FOLLOWER:
-                    logging.debug(f"Node {self.node_id}: Cannot request state sync - not in FOLLOWER state")
-                    return False
+    #     Returns:
+    #         bool: True if state sync request was sent, False otherwise
+    #     """
+    #     with self.state_lock:
+    #         try:
+    #             # Only request state sync if we're in FOLLOWER state
+    #             if self.state not in (RaftState.FOLLOWER, RaftState.INITIAL):
+    #                 logging.debug(f"Node {self.node_id}: Cannot request state sync - not in FOLLOWER or INITIAL state")
+    #                 return False
                 
-                # Send state sync request via consensus manager if available
-                if hasattr(self, 'consensus_manager') and self.consensus_manager is not None:
-                    logging.info(f"Node {self.node_id}: Requesting state synchronization from cluster")
+    #             # Send state sync request via consensus manager if available
+    #             if hasattr(self, 'consensus_manager') and self.consensus_manager is not None:
+    #                 logging.info(f"Node {self.node_id}: Requesting state synchronization from cluster")
                     
-                    # Create state sync request message
-                    state_sync_request = {
-                        'type': 'state_sync_request',
-                        'node_id': self.node_id,
-                        'current_term': self.current_term,
-                        'timestamp': self.get_current_timestamp()
-                    }
+    #                 # Create state sync request message
+    #                 state_sync_request = {
+    #                     'type': 'state_sync_request',
+    #                     'node_id': self.node_id,
+    #                     'current_term': self.current_term,
+    #                     'timestamp': self.get_current_timestamp()
+    #                 }
                     
-                    # Send to consensus manager for broadcasting
-                    self.consensus_manager.broadcast_state_sync_request(state_sync_request)
-                    return True
-                else:
-                    logging.warning(f"Node {self.node_id}: No consensus manager available for state sync request")
-                    return False
+    #                 # Send to consensus manager for broadcasting
+    #                 self.consensus_manager.broadcast_state_sync_request(state_sync_request)
+    #                 return True
+    #             else:
+    #                 logging.warning(f"Node {self.node_id}: No consensus manager available for state sync request")
+    #                 return False
                     
-            except Exception as e:
-                logging.error(f"Node {self.node_id}: Error requesting state sync: {e}")
-                return False
+    #         except Exception as e:
+    #             logging.error(f"Node {self.node_id}: Error requesting state sync: {e}")
+    #             return False
 
-    def handle_state_sync_response(self, response):
-        """
-        Handle state synchronization response from the leader.
+    # def handle_state_sync_response(self, response):
+    #     """
+    #     Handle state synchronization response from the leader.
         
-        Args:
-            response (dict): State synchronization response containing cluster state
+    #     Args:
+    #         response (dict): State synchronization response containing cluster state
             
-        Returns:
-            bool: True if state was successfully synchronized, False otherwise
-        """
-        with self.state_lock:
-            try:
-                # Validate response
-                if not isinstance(response, dict):
-                    logging.error(f"Node {self.node_id}: Invalid state sync response format")
-                    return False
+    #     Returns:
+    #         bool: True if state was successfully synchronized, False otherwise
+    #     """
+    #     with self.state_lock:
+    #         try:
+    #             # Validate response
+    #             if not isinstance(response, dict):
+    #                 logging.error(f"Node {self.node_id}: Invalid state sync response format")
+    #                 return False
                 
-                leader_id = response.get('leader_id')
-                response_term = response.get('term', 0)
-                known_nodes = response.get('known_nodes', [])
-                commit_index = response.get('commit_index', 0)
-                log_entries = response.get('log_entries', [])
+    #             leader_id = response.get('leader_id')
+    #             response_term = response.get('term', 0)
+    #             known_nodes = response.get('known_nodes', [])
+    #             commit_index = response.get('commit_index', 0)
+    #             log_entries = response.get('log_entries', [])
                 
-                logging.info(f"Node {self.node_id}: Received state sync response from leader {leader_id}, "
-                           f"term: {response_term}, known_nodes: {known_nodes}, commit_index: {commit_index}")
+    #             logging.info(f"Node {self.node_id}: Received state sync response from leader {leader_id}, "
+    #                        f"term: {response_term}, known_nodes: {known_nodes}, commit_index: {commit_index}")
                 
-                # Update term if necessary
-                if response_term > self.current_term:
-                    self.current_term = response_term
-                    self.voted_for = None
+    #             # Update term if necessary
+    #             if response_term > self.current_term:
+    #                 self.current_term = response_term
+    #                 self.voted_for = None
                 
-                # Update known nodes
-                if known_nodes:
-                    old_known_nodes = set(self.known_nodes)
-                    self.known_nodes = set(known_nodes)
+    #             # Update known nodes
+    #             if known_nodes:
+    #                 old_known_nodes = set(self.known_nodes)
+    #                 self.known_nodes = set(known_nodes)
                     
-                    if old_known_nodes != self.known_nodes:
-                        self.update_known_nodes(node_ids=list(self.known_nodes))
-                        logging.info(f"Node {self.node_id}: Updated known nodes from state sync: {sorted(self.known_nodes)}")
+    #                 if old_known_nodes != self.known_nodes:
+    #                     self.update_known_nodes(node_ids=list(self.known_nodes))
+    #                     logging.info(f"Node {self.node_id}: Updated known nodes from state sync: {sorted(self.known_nodes)}")
                 
-                # Update log entries if provided
-                if log_entries:
-                    # For simplicity, we'll append the entries (in production, this would be more sophisticated)
-                    for entry in log_entries:
-                        if entry not in self.log:
-                            self.log.append(entry)
+    #             # Update log entries if provided
+    #             if log_entries:
+    #                 # For simplicity, we'll append the entries (in production, this would be more sophisticated)
+    #                 for entry in log_entries:
+    #                     if entry not in self.log:
+    #                         self.log.append(entry)
                     
-                    logging.info(f"Node {self.node_id}: Updated log from state sync, new length: {len(self.log)}")
+    #                 logging.info(f"Node {self.node_id}: Updated log from state sync, new length: {len(self.log)}")
                 
-                # Update commit index
-                if commit_index > self.commit_index:
-                    self.commit_index = commit_index
+    #             # Update commit index
+    #             if commit_index > self.commit_index:
+    #                 self.commit_index = commit_index
                     
-                    # Apply committed entries
-                    while self.last_applied < self.commit_index:
-                        self.last_applied += 1
-                        if self.last_applied <= len(self.log):
-                            entry = self.log[self.last_applied - 1]
-                            self.apply_log_entry(entry)
+    #                 # Apply committed entries
+    #                 while self.last_applied < self.commit_index:
+    #                     self.last_applied += 1
+    #                     if self.last_applied <= len(self.log):
+    #                         entry = self.log[self.last_applied - 1]
+    #                         self.apply_log_entry(entry)
                 
-                # Mark state synchronization as completed
-                self.set_state_sync_completed(True)
+    #             # Mark state synchronization as completed
+    #             self.set_state_sync_completed(True)
                 
-                # Try to transition to FOLLOWER if we're still in INITIAL state
-                if self.state == RaftState.INITIAL:
-                    self.transition_to_follower_from_initial()
+    #             # Try to transition to FOLLOWER if we're still in INITIAL state
+    #             if self.state == RaftState.INITIAL:
+    #                 self.transition_to_follower_from_initial()
                 
-                logging.info(f"Node {self.node_id}: State synchronization completed successfully")
-                return True
+    #             logging.info(f"Node {self.node_id}: State synchronization completed successfully")
+    #             return True
                 
-            except Exception as e:
-                logging.error(f"Node {self.node_id}: Error handling state sync response: {e}")
-                return False
+    #         except Exception as e:
+    #             logging.error(f"Node {self.node_id}: Error handling state sync response: {e}")
+    #             return False
 
     def transition_to_follower_from_initial(self):
         """

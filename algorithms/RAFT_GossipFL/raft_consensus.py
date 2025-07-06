@@ -1053,12 +1053,12 @@ class RaftConsensus:
     def handle_state_snapshot(self, term, log, commit_index):
         """
         Handle a state snapshot from the leader.
-        
+
         Args:
             term (int): Leader's term
             log (list): Complete log from leader
             commit_index (int): Leader's commit index
-            
+
         Returns:
             bool: True if snapshot was applied, False otherwise
         """
@@ -1068,16 +1068,27 @@ class RaftConsensus:
                 self.raft_node.become_follower(term)
             elif self.raft_node.state == RaftState.INITIAL:
                 self.raft_node.become_follower(term)
-            
-            # Replace log with snapshot
-            self.raft_node.log = log
-            
-            # Update commit index and apply committed entries
+
+            # Replace the in‐memory log
+            self.raft_node.log = list(log)  # make a copy to be safe
+
+            # Advance commit index and apply entries
             if commit_index > self.raft_node.commit_index:
                 self.raft_node.commit_index = commit_index
                 self.raft_node.apply_committed_entries()
-            
-            return True
+
+        sync_payload = {
+            'leader_id':    self.current_leader_id,
+            'term':         term,
+            'known_nodes':  list(self.raft_node.known_nodes),
+            'commit_index': commit_index,
+            'log_entries':  list(log),
+            'timestamp':    time.time(),
+        }
+        # call directly into your node’s handler
+        self.raft_node.handle_state_sync_response(sync_payload)
+
+        return True
     
     def is_leader(self):
         """
@@ -1388,7 +1399,7 @@ class RaftConsensus:
                 return False
             
             # Check if node is already known
-            if node_id in self.raft_node.known_nodes:
+            if node_id in self.raft_node.known_nodes or (hasattr(self.raft_node, 'pending_node_connection_info') and node_id in self.raft_node.pending_node_connection_info):
                 logging.debug(f"Node {self.raft_node.node_id}: Node {node_id} already known, updating connection info")
                 # Update connection info if we have it
                 if hasattr(self.raft_node, 'node_connection_info') and node_info:
