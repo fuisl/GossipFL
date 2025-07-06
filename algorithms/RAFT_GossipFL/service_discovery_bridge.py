@@ -143,6 +143,15 @@ class RaftServiceDiscoveryBridge:
             })
         # full update
         self.comm_manager._on_bridge_node_registry_update(node_list)
+        
+        # Chain to the worker manager's on_membership_change if it exists
+        # This ensures both comm registry and FL topology get updated
+        worker_manager = getattr(self.comm_manager, 'worker_manager', None)
+        if worker_manager and hasattr(worker_manager, 'on_membership_change'):
+            try:
+                worker_manager.on_membership_change(new_nodes, round_num)
+            except Exception as e:
+                logging.error(f"Error calling worker_manager.on_membership_change: {e}", exc_info=True)
 
     def _on_commit_any(self, entry):
         # if it's a coordinator entry, notify worker manager, etc.
