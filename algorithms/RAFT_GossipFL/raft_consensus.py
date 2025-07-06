@@ -696,17 +696,9 @@ class RaftConsensus:
             log_index = self.raft_node.add_log_entry(command)
             
             if log_index > 0:
-                if action == 'add':
-                    # Call RaftNode's add_node after the log entry is added
-                    if complete_node_info:
-                        idx = self.raft_node.add_node(complete_node_info, round_num)
-                    else:
-                        idx = self.raft_node.add_node(node_id, round_num)
-                    logging.info(f"Leader {self.raft_node.node_id}: Added membership change (add node {node_id}) at index {log_index}")
-                elif action == 'remove':
-                    idx = self.raft_node.remove_node(node_id, round_num, reason)
-                    logging.info(f"Leader {self.raft_node.node_id}: Added membership change (remove node {node_id}) at index {log_index}")
-                
+                logging.info(f"Leader {self.raft_node.node_id}: Added membership change ({action} node {node_id}) at index {log_index}")
+                # NOTE: Do NOT apply membership change here - it will be applied when committed
+                # This prevents duplicate application of membership changes
                 return log_index
             else:
                 logging.error(f"Leader {self.raft_node.node_id}: Failed to add membership change to log")

@@ -1345,28 +1345,31 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             self.is_coordinator = True
             logging.info(f"Node {self.node_id} is the RAFT leader and will act as coordinator")
         
-        # Step 2: If this node is not the coordinator or explicitly joining, handle join process
-        should_join = (
-            self.node_id != self.coordinator_id or 
-            getattr(self.args, "join_existing_cluster", False) or
-            self.raft_consensus.raft_node.state == RaftState.INITIAL
-        )
+        # Step 2: Handle initial joining and ensure proper state transitions
+        # New nodes must stay in INITIAL state until they receive proper join approval
+        if self.raft_consensus.raft_node.state == RaftState.INITIAL:
+            logging.info(f"Node {self.node_id}: In INITIAL state, will join existing cluster")
+            should_join = True
+        else:
+            # For nodes that are already synchronized, check if explicit join is needed
+            should_join = (
+                self.node_id != self.coordinator_id or 
+                getattr(self.args, "join_existing_cluster", False)
+            )
         
         if should_join:
             logging.info(f"Node {self.node_id}: Joining cluster through service discovery bridge")
             
-            # Prepare node information for joining
-            node_info = {
-                'node_id': self.node_id,
-                'ip_address': getattr(self.args, 'ip_address', 'localhost'),
-                'port': getattr(self.args, 'port', 8080),
-                'capabilities': ['grpc', 'fedml'],
-                'timestamp': time.time()
-            }
+            # Get discovered nodes from communication manager
+            cluster_nodes = self.get_comm_manager().get_cluster_nodes_info()
+            discovered_nodes = list(cluster_nodes.keys())
+            leader_hint = self.get_comm_manager().get_leader_hint()
             
-            # Let the bridge handle the joining process
-            if self.service_discovery_bridge:
-                self.service_discovery_bridge.handle_node_discovered(self.node_id, node_info)
+            # Send join request through bridge
+            if self.service_discovery_bridge and discovered_nodes:
+                self.service_discovery_bridge.send_join_request_to_cluster(discovered_nodes, leader_hint)
+            else:
+                logging.warning(f"Node {self.node_id}: Cannot send join request - no bridge or discovered nodes")
         
         # Step 3: Wait for state synchronization to complete
         max_wait_time = 30

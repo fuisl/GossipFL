@@ -37,6 +37,11 @@ class RaftServiceDiscoveryBridge:
         # Complete initialization in a deterministic order
         self._init_bridge()
         
+        # Register commit callback for event-driven responses
+        if hasattr(consensus, 'register_commit_callback'):
+            consensus.register_commit_callback(self.on_commit)
+            logging.info("Bridge: Registered commit callback for event-driven responses")
+        
         logging.info(f"RaftServiceDiscoveryBridge initialized for node {self.consensus.raft_node.node_id}")
     
     def _init_bridge(self):
@@ -361,16 +366,29 @@ class RaftServiceDiscoveryBridge:
             if self.consensus.raft_node.state == RaftState.LEADER:
                 logging.info(f"Bridge: Processing join request as leader for node {sender_id}")
                 
+                # Store pending join request - response will be sent after commit
+                pending_join_key = f"join_{sender_id}"
+                if not hasattr(self, 'pending_join_responses'):
+                    self.pending_join_responses = {}
+                
+                self.pending_join_responses[pending_join_key] = {
+                    'node_id': sender_id,
+                    'node_info': node_info,
+                    'timestamp': time.time()
+                }
+                
                 # Propose membership change to add the node through RAFT consensus
-                self.consensus.propose_membership_change(
+                success = self.consensus.propose_membership_change(
                     action='add',
                     node_id=sender_id,
                     node_info=node_info,
                     reason='join_request'
                 )
                 
-                # Send positive response
-                self._send_join_response(sender_id, True, "Join request accepted by leader")
+                if not success:
+                    # Clean up pending response and send immediate rejection
+                    del self.pending_join_responses[pending_join_key]
+                    self._send_join_response(sender_id, False, "Failed to add to RAFT log")
                 
             else:
                 # We're not the leader - redirect to current leader
@@ -405,19 +423,31 @@ class RaftServiceDiscoveryBridge:
             
             if join_approved:
                 logging.info(f"Join request approved by node {sender_id}")
+                # Clear the join progress flag since we were accepted
+                if hasattr(self, '_join_in_progress'):
+                    self._join_in_progress = False
                 # The membership change will be propagated through RAFT consensus
-                # and handled by _on_commit_membership when committed
+                # and handled by the commit callback when committed
                 
             elif redirect_leader:
                 logging.info(f"Join request redirected to leader {redirect_leader}")
+                # Clear progress flag and retry with the actual leader
+                if hasattr(self, '_join_in_progress'):
+                    self._join_in_progress = False
                 # Send join request to the actual leader
                 self._send_join_request_to_leader(redirect_leader)
                 
             else:
                 logging.warning(f"Join request rejected by {sender_id}: {message}")
+                # Clear progress flag on rejection
+                if hasattr(self, '_join_in_progress'):
+                    self._join_in_progress = False
                 
         except Exception as e:
             logging.error(f"Error handling join response from {sender_id}: {e}", exc_info=True)
+            # Clear progress flag on error
+            if hasattr(self, '_join_in_progress'):
+                self._join_in_progress = False
 
     def _send_join_request_to_leader(self, leader_id: int):
         """
@@ -528,7 +558,15 @@ class RaftServiceDiscoveryBridge:
             if not other_nodes:
                 logging.info("Bridge: No other nodes to send join request to")
                 return
+            
+            # Check if we're already in the process of joining
+            if hasattr(self, '_join_in_progress') and self._join_in_progress:
+                logging.debug("Bridge: Join already in progress, skipping duplicate request")
+                return
                 
+            # Mark join as in progress to prevent duplicates
+            self._join_in_progress = True
+            
             # Try to determine who the leader is from multiple sources
             current_leader = self.consensus.raft_node.current_leader_id
             
@@ -551,6 +589,9 @@ class RaftServiceDiscoveryBridge:
                 
         except Exception as e:
             logging.error(f"Error sending join request to cluster: {e}", exc_info=True)
+            # Reset join progress flag on error
+            if hasattr(self, '_join_in_progress'):
+                self._join_in_progress = False
 
     def set_comm_manager_callbacks(self, on_membership_change=None, on_node_registry_update=None):
         """
@@ -655,6 +696,62 @@ class RaftServiceDiscoveryBridge:
         except Exception as e:
             logging.error(f"Error during bridge cleanup: {e}", exc_info=True)
 
+    def on_commit(self, log_entry: Dict[str, Any], log_index: int):
+        """
+        Handle committed log entries - this is where join responses should be sent.
+        
+        This method is called by the consensus manager when log entries are committed.
+        It handles event-driven responses for join requests and registry updates.
+        
+        Args:
+            log_entry: The committed log entry
+            log_index: The index of the committed entry
+        """
+        try:
+            if log_entry.get('command', {}).get('type') == 'membership':
+                command = log_entry.get('command', {})
+                action = command.get('action')
+                node_id = command.get('node_id')
+                
+                if action == 'add' and node_id:
+                    # Check if this was a pending join request
+                    if not hasattr(self, 'pending_join_responses'):
+                        self.pending_join_responses = {}
+                        
+                    pending_join_key = f"join_{node_id}"
+                    if pending_join_key in self.pending_join_responses:
+                        # Now send the join response after consensus is reached
+                        self._send_join_response(node_id, True, "Join request accepted by leader")
+                        del self.pending_join_responses[pending_join_key]
+                        logging.info(f"Bridge: Sent join response to {node_id} after commit")
+                    
+                    # Update registry with new node
+                    node_info = command.get('node_info', {})
+                    if node_info:
+                        self._update_registry_for_node(node_id, node_info)
+                        logging.info(f"Bridge: Updated registry for node {node_id} after commit")
+                        
+        except Exception as e:
+            logging.error(f"Bridge: Error in commit callback: {e}", exc_info=True)
+
+    def _update_registry_for_node(self, node_id: int, node_info: Dict[str, Any]):
+        """
+        Update communication manager registry with new node info.
+        
+        Args:
+            node_id: ID of the node to register
+            node_info: Connection information for the node
+        """
+        if hasattr(self.comm_manager, 'register_node'):
+            try:
+                self.comm_manager.register_node(
+                    node_id=node_id,
+                    host=node_info.get('ip_address', 'localhost'),
+                    port=node_info.get('port', 9000 + node_id)
+                )
+                logging.info(f"Bridge: Registered node {node_id} in communication registry")
+            except Exception as e:
+                logging.error(f"Bridge: Failed to register node {node_id}: {e}")
 def _msg(msg_type: int, receiver=None, **kwargs):
     """
     Create a message envelope for RAFT messages.
