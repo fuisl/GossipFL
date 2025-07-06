@@ -50,6 +50,9 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         if not hasattr(self, 'com_manager'):
             self.com_manager = comm  # Use the provided comm manager
         
+        # Also store it as _comm_manager for consistent access through get_comm_manager()
+        self._comm_manager = comm
+        
         # Store args for later use
         self.args = args
         self.raft_consensus = raft_consensus
@@ -57,7 +60,8 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         
         # Store node identification for gRPC-based communication
         self.node_id = node_id
-        self.cluster_size = size  # Initial size, can change dynamically
+        # Note: cluster_size is initial size, actual size tracked in known_nodes
+        # and will be updated dynamically through RAFT membership changes
         
         # Initialize service discovery bridge for dynamic membership management
         self.service_discovery_bridge = RaftServiceDiscoveryBridge(node_id, raft_consensus, self)
@@ -68,23 +72,9 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         # Register the bridge with consensus for membership change notifications
         if self.raft_consensus is not None:
             self.raft_consensus.register_service_discovery_bridge(self.service_discovery_bridge)
-            self.raft_consensus.on_leadership_change = self.handle_leadership_change
-            self.raft_consensus.on_state_commit = self.handle_raft_state_commit
             
-            # Register all callbacks for pure state machine operation
-            if hasattr(self.raft_consensus, 'raft_node') and self.raft_consensus.raft_node is not None:
-                raft_node = self.raft_consensus.raft_node
-                
-                # Application-specific callbacks
-                raft_node.on_commit = self.handle_committed_entry
-                raft_node.on_membership_change = self.handle_membership_change
-                
-                # Communication callbacks
-                raft_node.on_send_prevote = self.broadcast_prevote_request
-                raft_node.on_send_vote = self.broadcast_vote_request
-                raft_node.on_send_append = self.broadcast_append_entries
-                
-                logging.info(f"All RAFT node callbacks registered for node {node_id}")
+            # Register all callbacks for RAFT consensus
+            self._register_raft_callbacks()
         
         # State variables for RAFT-FL integration
         self.is_coordinator = False
@@ -96,7 +86,9 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         # Thread synchronization
         self.consensus_established_event = threading.Event()
         self.topology_ready_event = threading.Event()
+        # Signals when a round is authorized to start by RAFT consensus
         self.round_start_authorized = threading.Event()
+        # Used to trigger next training round - should be integrated with round_start_authorized
         self.round_start_event = threading.Event()  # Used to trigger next training round
         
         # Override SAPS_FL coordinator detection
@@ -214,11 +206,12 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         # Step 4: If this node is the RAFT leader, start coordinator duties
         if self.is_coordinator:
             logging.info(f"Node {self.node_id} is the initial coordinator (RAFT leader)")
-            self.coodinator_thread = threading.Thread(
+            self.coordinator_thread = threading.Thread(
                 name="coordinator", 
-                target=self.run_coordinator
+                target=self.run_coordinator,
+                daemon=True
             )
-            self.coodinator_thread.start()
+            self.coordinator_thread.start()
             self.notify_clients()
         else:
             logging.info(f"Node {self.node_id} is a follower, coordinator is node {self.coordinator_id}")
@@ -235,6 +228,8 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         """
         Handle a change in RAFT leadership.
         
+        This method ensures proper coordination of training when leadership changes.
+        
         Args:
             leader_id (int): ID of the new leader
         """
@@ -246,27 +241,44 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             logging.info(f"Node {self.node_id} is now the COORDINATOR (RAFT leader)")
             self.is_coordinator = True
             
-            # Start coordinator duties
-            self.coodinator_thread = threading.Thread(name="coordinator", target=self.run_coordinator)
-            self.coodinator_thread.start()
+            # Start coordinator duties if not already running
+            if not hasattr(self, 'coordinator_thread') or not self.coordinator_thread.is_alive():
+                self.coordinator_thread = threading.Thread(
+                    name="coordinator", 
+                    target=self.run_coordinator,
+                    daemon=True  # Make thread daemon so it exits when main thread exits
+                )
+                self.coordinator_thread.start()
+                logging.info(f"Node {self.node_id}: Started coordinator thread")
+                
+            # Notify clients about the new coordinator
             self.notify_clients()
             
             # Signal that consensus is established
             self.consensus_established_event.set()
+            
+            # Signal that a new round can start under this coordinator
+            self.round_start_authorized.set()
         
         # If this node is no longer the leader
         elif leader_id != self.node_id and self.is_coordinator:
             logging.info(f"Node {self.node_id} is no longer the COORDINATOR")
             self.is_coordinator = False
             
-            # Stop coordinator duties if needed
-            # This will happen naturally in the coordinator thread
+            # No need to explicitly stop the coordinator thread
+            # It will check self.is_coordinator in its loop and exit naturally
+            
+            # Clear round start authorization since we're no longer coordinator
+            self.round_start_authorized.clear()
         
         # If the leader changed but this node was not involved
         elif old_coordinator != leader_id:
             logging.info(f"COORDINATOR changed from {old_coordinator} to {leader_id}")
             
-            # Signal that consensus is established
+            # Clear any existing round authorization and wait for new coordinator
+            self.round_start_authorized.clear()
+            
+            # Signal that consensus is established with the new leader
             self.consensus_established_event.set()
     
     def on_membership_change(self, new_nodes, round_num=0):
@@ -358,8 +370,8 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                     
                     # If not already running the coordinator thread, start it
                     if old_state != self.is_coordinator:
-                        self.coodinator_thread = threading.Thread(name="coordinator", target=self.run_coordinator)
-                        self.coodinator_thread.start()
+                        self.coordinator_thread = threading.Thread(name="coordinator", target=self.run_coordinator, daemon=True)
+                        self.coordinator_thread.start()
                     
                     # Notify clients about the new coordinator
                     self.notify_clients()
@@ -400,10 +412,11 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                 
                 for iteration in range(self.worker.num_iterations):
                     self.iteration = iteration
-                    logging.debug("wait start_epoch_event")
+                    logging.debug("Waiting for RAFT authorization to start round")
                     
-                    self.start_epoch_event.wait()
-                    logging.debug("Begin iteration")
+                    # Wait for RAFT consensus to authorize the round start
+                    self.round_start_authorized.wait()
+                    logging.debug("RAFT authorized round start, beginning iteration")
                     
                     # Get model params
                     from utils.data_utils import get_data
@@ -473,13 +486,20 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                             = self.worker.train_one_step(self.epoch, self.iteration,
                                                             self.train_tracker, self.metrics)
 
-                    self.start_epoch_event.clear()
+                    # Clear events for next iteration
+                    self.round_start_authorized.clear()
                     self.sync_receive_all_event.clear()
 
                     """
                         Before send msg to coordinator,
-                        generate topology firstly through RAFT consensus.
+                        wait for latest RAFT-committed topology.
                     """
+                    # Wait for the latest topology to be ready through RAFT consensus
+                    logging.debug(f"Node {self.node_id}: Waiting for latest RAFT-committed topology")
+                    self.topology_ready_event.wait()
+                    self.topology_ready_event.clear()  # Reset for next iteration
+                    
+                    # Now update topology through RAFT-committed data
                     self.topology_manager.generate_topology(t=self.global_round_idx)
                     self.worker.refresh_gossip_info()
                     self.refresh_gossip_info()
@@ -639,7 +659,12 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                 logging.error(f"Failed to process state package from {sender_id}")
 
     def handle_install_snapshot(self, msg_params):
-        """Handle an InstallSnapshot message from the leader."""
+        """
+        Handle an InstallSnapshot message from the leader.
+        
+        This method accumulates snapshot chunks and applies the complete snapshot
+        once all chunks are received.
+        """
         sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
         term = msg_params.get(RaftMessage.MSG_ARG_TERM)
         last_idx = msg_params.get(RaftMessage.MSG_ARG_LAST_INCLUDED_INDEX)
@@ -649,12 +674,26 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         done = msg_params.get(RaftMessage.MSG_ARG_DONE)
 
         logging.debug(
-            f"Received InstallSnapshot from {sender_id}, term={term}, index={last_idx}, offset={offset}"
+            f"Received InstallSnapshot from {sender_id}, term={term}, index={last_idx}, offset={offset}, done={done}"
         )
 
+        # First, pass the snapshot chunk to the RAFT consensus manager
         self.raft_consensus.handle_install_snapshot(
             sender_id, term, last_idx, last_term, offset, data, done
         )
+        
+        # If this is the final chunk, apply the complete state package
+        if done and data and isinstance(data, dict) and RaftMessage.MSG_ARG_STATE_PACKAGE in data:
+            state_package = data.get(RaftMessage.MSG_ARG_STATE_PACKAGE)
+            if state_package:
+                logging.info(f"Applying complete state package from snapshot")
+                success = self.initialize_from_state_snapshot(state_package)
+                if success:
+                    logging.info(f"Successfully applied snapshot from {sender_id}")
+                else:
+                    logging.error(f"Failed to apply snapshot from {sender_id}")
+            else:
+                logging.warning(f"Snapshot marked as done but no state package found")
 
     def handle_leader_redirect(self, msg_params):
         """
@@ -875,18 +914,6 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             logging.error(f"Failed to initialize from state snapshot: {str(e)}")
             traceback.print_exc()
             return False
-
-    def _override_saps_coordinator_logic(self):
-        """
-        Override SAPS_FL's hardcoded coordinator logic to use RAFT leader election.
-        
-        This method is maintained for backward compatibility but now simply
-        references our unified run() method.
-        """
-        # No longer needs to patch the parent class's run method
-        # as we've already overridden it properly in our unified run method
-        logging.info(f"Node {self.node_id}: SAPS coordinator logic overridden by RAFT-based implementation")
-        # No-op as the actual override happens in our run() method
     
     def handle_raft_state_commit(self, log_entry):
         """
@@ -1477,3 +1504,40 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                 if leader_id is not None and leader_id != self.node_id and leader_id != sender_id:
                     logging.info(f"Redirecting node {sender_id} to leader {leader_id}")
                     self.send_leader_redirect(sender_id, leader_id)
+    
+    def finish(self):
+        """
+        Perform a clean shutdown of the RAFT worker manager.
+        
+        This method ensures that all threads are properly terminated
+        and resources are released.
+        """
+        logging.info(f"Node {self.node_id}: Beginning clean shutdown")
+        
+        # Set flags to signal threads to exit
+        if hasattr(self, 'running') and self.running:
+            self.running = False
+            
+        # Signal any waiting threads to proceed and then exit
+        if hasattr(self, 'round_start_authorized'):
+            self.round_start_authorized.set()
+        if hasattr(self, 'topology_ready_event'):
+            self.topology_ready_event.set()
+        if hasattr(self, 'consensus_established_event'):
+            self.consensus_established_event.set()
+        if hasattr(self, 'sync_receive_all_event'):
+            self.sync_receive_all_event.set()
+            
+        # Give threads a moment to notice the exit flags
+        time.sleep(0.5)
+        
+        # Shut down RAFT consensus
+        if hasattr(self, 'raft_consensus') and self.raft_consensus is not None:
+            logging.info(f"Node {self.node_id}: Shutting down RAFT consensus")
+            if hasattr(self.raft_consensus, 'stop'):
+                self.raft_consensus.stop()
+                
+        # Call the parent class's finish method
+        super().finish()
+        
+        logging.info(f"Node {self.node_id}: Shutdown complete")
