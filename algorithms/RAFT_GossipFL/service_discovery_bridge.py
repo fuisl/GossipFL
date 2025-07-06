@@ -152,22 +152,37 @@ class RaftServiceDiscoveryBridge:
                 
             cm = self.comm_manager
             
+            # Helper function to filter out envelope parameters before calling consensus methods
+            def _filter_params(params):
+                """Filter out message envelope parameters that consensus methods don't expect."""
+                filtered = {}
+                envelope_keys = {
+                    RaftMessage.ARG_TYPE, 
+                    RaftMessage.ARG_SENDER, 
+                    RaftMessage.ARG_RECEIVER,
+                    'message_source'
+                }
+                for key, value in params.items():
+                    if key not in envelope_keys:
+                        filtered[key] = value
+                return filtered
+            
             # Register handlers for each RAFT message type
             handler_map = {
                 RaftMessage.MSG_TYPE_PREVOTE_REQUEST: 
-                    lambda p: self.consensus.handle_prevote_request(**p),
+                    lambda p: self.consensus.handle_prevote_request(**_filter_params(p)),
                 RaftMessage.MSG_TYPE_PREVOTE_RESPONSE: 
-                    lambda p: self.consensus.handle_prevote_response(**p),
+                    lambda p: self.consensus.handle_prevote_response(**_filter_params(p)),
                 RaftMessage.MSG_TYPE_REQUEST_VOTE: 
-                    lambda p: self.consensus.handle_vote_request(**p),
+                    lambda p: self.consensus.handle_vote_request(**_filter_params(p)),
                 RaftMessage.MSG_TYPE_VOTE_RESPONSE: 
-                    lambda p: self.consensus.handle_vote_response(**p),
+                    lambda p: self.consensus.handle_vote_response(**_filter_params(p)),
                 RaftMessage.MSG_TYPE_APPEND_ENTRIES: 
-                    lambda p: self.consensus.handle_append_entries(**p),
+                    lambda p: self.consensus.handle_append_entries(**_filter_params(p)),
                 RaftMessage.MSG_TYPE_APPEND_RESPONSE: 
-                    lambda p: self.consensus.handle_append_response(**p),
+                    lambda p: self.consensus.handle_append_response(**_filter_params(p)),
                 RaftMessage.MSG_TYPE_INSTALL_SNAPSHOT: 
-                    lambda p: self.consensus.handle_install_snapshot(**p)
+                    lambda p: self.consensus.handle_install_snapshot(**_filter_params(p))
             }
             
             # Register all handlers
