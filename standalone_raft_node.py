@@ -30,20 +30,20 @@ import argparse
 import logging
 import time
 import threading
-import json
 import signal
+import socket
+import traceback
 from typing import Dict, List, Optional, Any
 from unittest.mock import Mock, MagicMock
 from dataclasses import dataclass
-import grpc
-import traceback
 
 # Add the project root to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from algorithms.RAFT_GossipFL.raft_worker_manager import RaftWorkerManager
 from algorithms.RAFT_GossipFL.raft_consensus import RaftConsensus
-from algorithms.RAFT_GossipFL.raft_node import RaftNode
+from algorithms.RAFT_GossipFL.raft_node import RaftNode, RaftState
+from algorithms.RAFT_GossipFL.service_discovery_bridge import RaftServiceDiscoveryBridge
 from fedml_core.distributed.communication.grpc.grpc_comm_manager import DynamicGRPCCommManager
 
 
@@ -140,6 +140,13 @@ class MockTopologyManager:
     def get_neighbor_list(self) -> set:
         """Get neighbor list."""
         return self.neighbors
+    
+    def update_nodes(self, new_nodes: set):
+        """Update topology with new node set."""
+        self.neighbors = new_nodes - {self.node_id}  # Exclude self from neighbors
+        # Create a simple star topology with all nodes connected
+        self.topology = {node_id: list(new_nodes - {node_id}) for node_id in new_nodes}
+        logging.info(f"Node {self.node_id}: Updated topology with {len(self.neighbors)} neighbors from {len(new_nodes)} nodes")
     
     def update_topology(self, new_topology: Dict[int, List[int]]):
         """Update topology."""
@@ -338,12 +345,8 @@ class StandaloneRaftNode:
             self.logger.info(f"Starting RAFT node {self.node_id}")
             
             # Start gRPC communication manager
-            self.comm_thread = threading.Thread(
-                target=self.worker_manager.com_manager.handle_receive_message,
-                daemon=True,
-                name=f"CommHandler-{self.node_id}"
-            )
-            self.comm_thread.start()
+            self.logger.info("Starting communication manager...")
+            self.comm_manager.start_message_handling()
             
             # Start status monitoring
             self.status_monitor.start()
@@ -362,7 +365,6 @@ class StandaloneRaftNode:
                 
         except Exception as e:
             self.logger.error(f"Error starting node: {e}")
-            import traceback
             traceback.print_exc()
             raise
     
@@ -386,18 +388,7 @@ class StandaloneRaftNode:
             # Stop gRPC communication manager
             if hasattr(self, 'comm_manager'):
                 self.logger.info("Stopping communication manager...")
-                if hasattr(self.comm_manager, 'stop_receive_message'):
-                    self.comm_manager.stop_receive_message()
-                # Force close gRPC connections
-                if hasattr(self.comm_manager, 'close_all_connections'):
-                    self.comm_manager.close_all_connections()
-            
-            # Wait for threads to finish with timeout
-            if hasattr(self, 'comm_thread') and self.comm_thread.is_alive():
-                self.logger.info("Waiting for communication thread to finish...")
-                self.comm_thread.join(timeout=2)
-                if self.comm_thread.is_alive():
-                    self.logger.warning("Communication thread did not finish gracefully")
+                self.comm_manager.cleanup()
                     
         except Exception as e:
             self.logger.error(f"Error during shutdown: {e}")
@@ -411,8 +402,9 @@ class StandaloneRaftNode:
             
             # Get connected nodes from the gRPC comm manager
             connected_nodes = []
-            if hasattr(self.comm_manager, 'node_registry'):
-                connected_nodes = list(self.comm_manager.node_registry.keys())
+            if hasattr(self.comm_manager, 'get_cluster_nodes_info'):
+                cluster_info = self.comm_manager.get_cluster_nodes_info()
+                connected_nodes = list(cluster_info.keys())
             
             return {
                 'node_id': self.node_id,
@@ -450,37 +442,38 @@ class StandaloneRaftNode:
             discovered_nodes = [self.node_id]
         
         # Update known nodes in RAFT
-        self.raft_node.update_known_nodes(node_ids=discovered_nodes)
+        self.raft_node.update_known_nodes(discovered_nodes)
         self.logger.info(f"Discovered nodes: {discovered_nodes}")
         
-        # Simple logic: if only this node exists, it's the bootstrap node
+        # Simple logic: if only this node exists or bootstrap flag is set, become leader
         other_nodes = [n for n in discovered_nodes if n != self.node_id]
         
-        if len(other_nodes) == 0:
-            # Bootstrap node: become leader immediately
-            self.logger.info("Bootstrap node detected - becoming leader")
-            result = self.raft_node.bootstrap_detection(set(discovered_nodes))
-            if result:
-                self.logger.info("Bootstrap successful - node is now leader")
-            else:
-                self.logger.error("Bootstrap failed")
+        if len(other_nodes) == 0 or self.args.bootstrap:
+            # Bootstrap node: transition to leader state
+            self.logger.info("Bootstrap node detected - transitioning to leader state")
+            with self.raft_node.state_lock:
+                # Increment term and become leader via proper state transitions
+                self.raft_node.current_term += 1
+                self.raft_node.voted_for = self.node_id
+                
+                # Transition INITIAL -> FOLLOWER -> CANDIDATE -> LEADER for bootstrap
+                if self.raft_node.state == RaftState.INITIAL:
+                    self.raft_node.become_follower(self.raft_node.current_term)
+                    self.logger.debug(f"Bootstrap node transitioned to FOLLOWER in term {self.raft_node.current_term}")
+                
+                # Now transition FOLLOWER -> CANDIDATE
+                self.raft_node.state = RaftState.CANDIDATE
+                self.logger.debug(f"Bootstrap node transitioned to CANDIDATE in term {self.raft_node.current_term}")
+                
+                # Finally CANDIDATE -> LEADER
+                self.raft_node.become_leader()
+                self.logger.info(f"Node is now leader in term {self.raft_node.current_term}")
         else:
-            # Joining node: actively initiate join protocol
+            # Joining node: stay in INITIAL/FOLLOWER state and wait for leader contact
             self.logger.info(f"Joining existing cluster with nodes: {other_nodes}")
-            self.logger.info("Initiating cluster join via request_cluster_join...")
-            
-            try:
-                # Use the worker manager's request_cluster_join to initiate handshake
-                join_result = self.worker_manager.request_cluster_join()
-                if join_result:
-                    self.logger.info("Cluster join request sent successfully")
-                    self.logger.info("Waiting for leader to process join and sync state...")
-                else:
-                    self.logger.error("Failed to send cluster join request")
-                    self.logger.info("Will stay in INITIAL state and wait for leader contact")
-            except Exception as e:
-                self.logger.error(f"Error during cluster join: {e}")
-                self.logger.info("Will stay in INITIAL state and wait for leader contact")
+            with self.raft_node.state_lock:
+                self.raft_node.become_follower(0)  # Start as follower with term 0
+            self.logger.info("Node will wait for leader contact to sync state")
 
 
 class StatusMonitor:

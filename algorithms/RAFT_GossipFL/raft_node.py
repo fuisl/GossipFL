@@ -1789,7 +1789,7 @@ class RaftNode:
     
     def send_heartbeats(self):
         """Send heartbeat messages to all followers via callbacks."""
-        with self.lock:
+        with self.state_lock:
             if self.state != RaftState.LEADER:
                 return
             
@@ -1835,7 +1835,7 @@ class RaftNode:
     
     def replicate_logs(self):
         """Replicate log entries to followers via callbacks."""
-        with self.lock:
+        with self.state_lock:
             if self.state != RaftState.LEADER:
                 return
             
@@ -1886,7 +1886,7 @@ class RaftNode:
     
     def request_votes_from_all(self):
         """Request votes from all known nodes via callbacks."""
-        with self.lock:
+        with self.state_lock:
             if self.state != RaftState.CANDIDATE:
                 return
             
@@ -1912,7 +1912,7 @@ class RaftNode:
     
     def should_replicate_logs(self):
         """Check if there are logs to replicate."""
-        with self.lock:
+        with self.state_lock:
             if self.state != RaftState.LEADER:
                 return False
             

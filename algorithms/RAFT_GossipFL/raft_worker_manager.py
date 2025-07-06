@@ -162,12 +162,6 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         self.register_message_receive_handler(
             RaftMessage.MSG_TYPE_STATE_REQUEST,
             self.handle_state_request)
-        self.register_message_receive_handler(
-            RaftMessage.MSG_TYPE_PARAM_REQUEST,
-            self.handle_param_request)
-        self.register_message_receive_handler(
-            RaftMessage.MSG_TYPE_PARAM_RESPONSE,
-            self.handle_param_response)
         
         # Join protocol handlers
         self.register_message_receive_handler(
@@ -311,8 +305,9 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                             self.update_topology_consensus()
                     
                     # Notify the service discovery bridge about the membership change
-                    if self.service_discovery_bridge:
-                        self.service_discovery_bridge.on_membership_change(new_nodes)
+                    if self.service_discovery_bridge and hasattr(self.service_discovery_bridge, 'on_membership_change_callback'):
+                        if self.service_discovery_bridge.on_membership_change_callback:
+                            self.service_discovery_bridge.on_membership_change_callback('update', list(new_nodes))
                         
             except Exception as e:
                 logging.error(f"Node {self.node_id}: Error handling membership change: {e}", exc_info=True)
@@ -1539,3 +1534,49 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         super().finish()
         
         logging.info(f"Node {self.node_id}: Shutdown complete")
+    
+    def handle_join_request(self, msg_params):
+        """
+        Handle join request from another node.
+        Delegates to the service discovery bridge for processing.
+        
+        Args:
+            msg_params: Message parameters containing sender and node info
+        """
+        try:
+            sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
+            node_info = msg_params.get('node_info', {})
+            
+            logging.info(f"Node {self.node_id}: Received join request from node {sender_id}")
+            
+            # Delegate to the service discovery bridge if available
+            if self.service_discovery_bridge:
+                self.service_discovery_bridge.handle_join_request(sender_id, node_info)
+            else:
+                logging.warning(f"Node {self.node_id}: No service discovery bridge available to handle join request")
+                
+        except Exception as e:
+            logging.error(f"Node {self.node_id}: Error handling join request: {e}", exc_info=True)
+    
+    def handle_join_response(self, msg_params):
+        """
+        Handle join response from another node.
+        Delegates to the service discovery bridge for processing.
+        
+        Args:
+            msg_params: Message parameters containing response details
+        """
+        try:
+            sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
+            status = msg_params.get('status', 'unknown')
+            
+            logging.info(f"Node {self.node_id}: Received join response from node {sender_id}, status: {status}")
+            
+            # Delegate to the service discovery bridge if available
+            if self.service_discovery_bridge:
+                self.service_discovery_bridge.handle_join_response(sender_id, msg_params)
+            else:
+                logging.warning(f"Node {self.node_id}: No service discovery bridge available to handle join response")
+                
+        except Exception as e:
+            logging.error(f"Node {self.node_id}: Error handling join response: {e}", exc_info=True)

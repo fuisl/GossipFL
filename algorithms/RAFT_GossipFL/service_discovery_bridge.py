@@ -1,9 +1,10 @@
 import logging
 import threading
 import time
-from typing import Set, Dict, Any, Optional, Callable
+from typing import Set, Dict, Any, Optional, Callable, List
 from .raft_messages import RaftMessage
 from .raft_consensus import RaftConsensus
+from .raft_node import RaftState
 
 class RaftServiceDiscoveryBridge:
     """
@@ -171,7 +172,8 @@ class RaftServiceDiscoveryBridge:
             
             # Register all handlers
             for msg_type, handler in handler_map.items():
-                cm.add_raft_handler(msg_type, lambda _, params, h=handler: h(params))
+                # Use default parameter to capture handler by value, not reference
+                cm.add_raft_handler(msg_type, (lambda params, h=handler: h(params)))
                 
             logging.info(f"RAFT message handlers registered with comm manager")
         except Exception as e:
@@ -318,7 +320,194 @@ class RaftServiceDiscoveryBridge:
             # Currently no general handling, but this could be extended
             pass
         except Exception as e:
-            logging.error(f"Error handling commit: {e}", exc_info=True)
+            logging.error(f"Error handling log entry commit: {e}", exc_info=True)
+
+    def handle_join_request(self, sender_id: int, node_info: Dict):
+        """
+        Handle join request from another node.
+        
+        This method is called when a node wants to join the cluster.
+        If this node is the leader, it will propose membership change through RAFT.
+        If not the leader, it will redirect the request to the current leader.
+        
+        Args:
+            sender_id: ID of the node requesting to join
+            node_info: Connection information for the joining node
+        """
+        try:
+            logging.info(f"Bridge: Received join request from node {sender_id}")
+            
+            # Skip if this is our own node
+            if sender_id == self.consensus.raft_node.node_id:
+                logging.debug(f"Ignoring join request from self")
+                return
+            
+            # Check if we're the leader
+            if self.consensus.raft_node.state == RaftState.LEADER:
+                logging.info(f"Bridge: Processing join request as leader for node {sender_id}")
+                
+                # Propose membership change to add the node through RAFT consensus
+                self.consensus.propose_membership_change(
+                    action='add',
+                    node_id=sender_id,
+                    node_info=node_info,
+                    reason='join_request'
+                )
+                
+                # Send positive response
+                self._send_join_response(sender_id, True, "Join request accepted by leader")
+                
+            else:
+                # We're not the leader - redirect to current leader
+                current_leader = self.consensus.raft_node.leader_id
+                if current_leader and current_leader != sender_id:
+                    logging.info(f"Bridge: Redirecting join request from {sender_id} to leader {current_leader}")
+                    self._send_join_response(sender_id, False, f"Not leader, redirect to {current_leader}", current_leader)
+                else:
+                    logging.warning(f"Bridge: No known leader to redirect join request from {sender_id}")
+                    self._send_join_response(sender_id, False, "No current leader known")
+                    
+        except Exception as e:
+            logging.error(f"Error handling join request from {sender_id}: {e}", exc_info=True)
+            self._send_join_response(sender_id, False, f"Error processing join request: {e}")
+
+    def handle_join_response(self, sender_id: int, response_params: Dict):
+        """
+        Handle join response from another node.
+        
+        This method is called when we receive a response to our join request.
+        
+        Args:
+            sender_id: ID of the node sending the response
+            response_params: Response parameters including status and message
+        """
+        try:
+            join_approved = response_params.get(RaftMessage.ARG_JOIN_APPROVED, False)
+            message = response_params.get('message', 'No message')
+            redirect_leader = response_params.get(RaftMessage.ARG_LEADER_ID)
+            
+            logging.info(f"Bridge: Received join response from {sender_id}: approved={join_approved}, message='{message}'")
+            
+            if join_approved:
+                logging.info(f"Join request approved by node {sender_id}")
+                # The membership change will be propagated through RAFT consensus
+                # and handled by _on_commit_membership when committed
+                
+            elif redirect_leader:
+                logging.info(f"Join request redirected to leader {redirect_leader}")
+                # Send join request to the actual leader
+                self._send_join_request_to_leader(redirect_leader)
+                
+            else:
+                logging.warning(f"Join request rejected by {sender_id}: {message}")
+                
+        except Exception as e:
+            logging.error(f"Error handling join response from {sender_id}: {e}", exc_info=True)
+
+    def _send_join_request_to_leader(self, leader_id: int):
+        """
+        Send join request to the cluster leader.
+        
+        Args:
+            leader_id: ID of the current cluster leader
+        """
+        try:
+            # Get our node information
+            node_info = {
+                'ip_address': getattr(self.comm_manager, 'ip_address', 'localhost'),
+                'port': getattr(self.comm_manager, 'port', 9000 + self.consensus.raft_node.node_id),
+                'capabilities': ['grpc', 'fedml', 'raft'],
+                'timestamp': time.time()
+            }
+            
+            # Prepare join request message
+            message_params = {
+                RaftMessage.ARG_SENDER: self.consensus.raft_node.node_id,
+                RaftMessage.ARG_RECEIVER: leader_id,
+                RaftMessage.ARG_TYPE: RaftMessage.MSG_TYPE_JOIN_REQUEST,
+                RaftMessage.ARG_NODE_INFO: node_info,
+                RaftMessage.ARG_TIMESTAMP: time.time()
+            }
+            
+            logging.info(f"Bridge: Sending join request to leader {leader_id}")
+            
+            # Send via communication manager
+            if hasattr(self.comm_manager, 'send_message'):
+                self.comm_manager.send_message(leader_id, message_params)
+            else:
+                logging.error("Communication manager does not support send_message")
+                
+        except Exception as e:
+            logging.error(f"Error sending join request to leader {leader_id}: {e}", exc_info=True)
+
+    def _send_join_response(self, receiver_id: int, approved: bool, message: str, redirect_leader: int = None):
+        """
+        Send join response to a requesting node.
+        
+        Args:
+            receiver_id: ID of the node to send response to
+            approved: Whether the join request was approved
+            message: Response message
+            redirect_leader: ID of leader to redirect to (if not approved)
+        """
+        try:
+            # Prepare join response message
+            message_params = {
+                RaftMessage.ARG_SENDER: self.consensus.raft_node.node_id,
+                RaftMessage.ARG_RECEIVER: receiver_id,
+                RaftMessage.ARG_TYPE: RaftMessage.MSG_TYPE_JOIN_RESPONSE,
+                RaftMessage.ARG_JOIN_APPROVED: approved,
+                'message': message,
+                RaftMessage.ARG_TIMESTAMP: time.time()
+            }
+            
+            if redirect_leader:
+                message_params[RaftMessage.ARG_LEADER_ID] = redirect_leader
+            
+            logging.info(f"Bridge: Sending join response to {receiver_id}: approved={approved}")
+            
+            # Send via communication manager
+            if hasattr(self.comm_manager, 'send_message'):
+                self.comm_manager.send_message(receiver_id, message_params)
+            else:
+                logging.error("Communication manager does not support send_message")
+                
+        except Exception as e:
+            logging.error(f"Error sending join response to {receiver_id}: {e}", exc_info=True)
+
+    def send_join_request_to_cluster(self, discovered_nodes: List[int]):
+        """
+        Send join requests to discovered nodes to join an existing cluster.
+        
+        This method implements the event-driven join protocol where a new node
+        actively requests to join the cluster rather than relying on periodic discovery.
+        
+        Args:
+            discovered_nodes: List of node IDs discovered from service discovery
+        """
+        try:
+            # Filter out ourselves
+            other_nodes = [nid for nid in discovered_nodes if nid != self.consensus.raft_node.node_id]
+            
+            if not other_nodes:
+                logging.info("Bridge: No other nodes to send join request to")
+                return
+                
+            # Try to determine who the leader is from our knowledge
+            current_leader = self.consensus.raft_node.leader_id
+            
+            if current_leader and current_leader in other_nodes:
+                # We know who the leader is, send directly
+                logging.info(f"Bridge: Sending join request directly to known leader {current_leader}")
+                self._send_join_request_to_leader(current_leader)
+            else:
+                # Don't know the leader, send to first discovered node (it will redirect if needed)
+                target_node = other_nodes[0]
+                logging.info(f"Bridge: Sending join request to {target_node} (will redirect if not leader)")
+                self._send_join_request_to_leader(target_node)
+                
+        except Exception as e:
+            logging.error(f"Error sending join request to cluster: {e}", exc_info=True)
 
     def set_comm_manager_callbacks(self, on_membership_change=None, on_node_registry_update=None):
         """
@@ -412,7 +601,6 @@ class RaftServiceDiscoveryBridge:
         except Exception as e:
             logging.error(f"Error during bridge cleanup: {e}", exc_info=True)
 
-
 def _msg(msg_type: int, receiver=None, **kwargs):
     """
     Create a message envelope for RAFT messages.
@@ -436,4 +624,3 @@ def _msg(msg_type: int, receiver=None, **kwargs):
         envelope[RaftMessage.ARG_RECEIVER] = receiver
         
     return envelope
-

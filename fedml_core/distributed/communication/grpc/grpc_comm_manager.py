@@ -34,6 +34,25 @@ from ..constants import CommunicationConstants
 from .grpc_server import GRPCCOMMServicer
 from fedml_core.mlops.mlops_profiler_event import MLOpsProfilerEvent
 
+# Import RAFT message constants
+try:
+    from algorithms.RAFT_GossipFL.raft_messages import RaftMessage
+except ImportError:
+    # Create a dummy RaftMessage class if import fails
+    class RaftMessage:
+        MSG_TYPE_REQUEST_VOTE = 101
+        MSG_TYPE_VOTE_RESPONSE = 102
+        MSG_TYPE_APPEND_ENTRIES = 103
+        MSG_TYPE_APPEND_RESPONSE = 104
+        MSG_TYPE_PREVOTE_REQUEST = 110
+        MSG_TYPE_PREVOTE_RESPONSE = 111
+        MSG_TYPE_INSTALL_SNAPSHOT = 112
+        MSG_TYPE_STATE_SNAPSHOT = 105
+        MSG_TYPE_LEADER_REDIRECT = 109
+        MSG_TYPE_STATE_REQUEST = 106
+        MSG_TYPE_JOIN_REQUEST = 120
+        MSG_TYPE_JOIN_RESPONSE = 121
+
 # Thread-safe locks
 config_lock = threading.RLock()
 message_lock = threading.Lock()
@@ -912,9 +931,18 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
             self._observers.remove(observer)
 
     def start_message_handling(self):
-        """Start message handling."""
+        """Start message handling in a dedicated thread."""
         # Note: _notify_connection_ready() is already called by _handle_discovery_success()
-        self.message_handling_subroutine()
+        
+        # Start message handling in a separate thread to avoid blocking
+        self.message_handling_thread = threading.Thread(
+            target=self.message_handling_subroutine,
+            name=f"MessageHandler-{self.node_id}",
+            daemon=True  # Daemon thread so it exits when main thread exits
+        )
+        self.message_handling_thread.start()
+        
+        logging.info(f"Message handling thread started for node {self.node_id}")
     
     def _notify_connection_ready(self):
         """Notify observers that connection is ready."""
@@ -934,8 +962,12 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
         """Handle incoming messages."""
         while self.is_running:
             try:
-                # Check for messages in the gRPC servicer queue
-                msg_bytes = self.grpc_servicer.message_q.get()
+                # Check for messages in the gRPC servicer queue with timeout
+                try:
+                    msg_bytes = self.grpc_servicer.message_q.get(timeout=1.0)  # 1 second timeout
+                except:
+                    # Timeout or queue empty - continue to check is_running
+                    continue
 
                 # Deserialize the message
                 try:
@@ -948,9 +980,22 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
                 logging.debug(f"Received message type: {msg_type}")
 
                 # Check if this is a RAFT message that should be handled by bridge/handler
-                msg_type_str = str(msg_type)
+                raft_message_types = {
+                    RaftMessage.MSG_TYPE_REQUEST_VOTE,
+                    RaftMessage.MSG_TYPE_VOTE_RESPONSE,
+                    RaftMessage.MSG_TYPE_APPEND_ENTRIES,
+                    RaftMessage.MSG_TYPE_APPEND_RESPONSE,
+                    RaftMessage.MSG_TYPE_PREVOTE_REQUEST,
+                    RaftMessage.MSG_TYPE_PREVOTE_RESPONSE,
+                    RaftMessage.MSG_TYPE_INSTALL_SNAPSHOT,
+                    RaftMessage.MSG_TYPE_STATE_SNAPSHOT,
+                    RaftMessage.MSG_TYPE_LEADER_REDIRECT,
+                    RaftMessage.MSG_TYPE_STATE_REQUEST,
+                    RaftMessage.MSG_TYPE_JOIN_REQUEST,
+                    RaftMessage.MSG_TYPE_JOIN_RESPONSE
+                }
                 is_raft_message = (msg_params.get("message_source") == "raft" or 
-                                 msg_type_str.startswith("MSG_TYPE_RAFT_"))
+                                 msg_type in raft_message_types)
 
                 handled_by_raft = False
                 if is_raft_message:
@@ -960,7 +1005,13 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
                         if handler:
                             logging.debug(f"Dispatching RAFT message to handler for type {msg_type}")
                             try:
-                                handler(msg_type, msg_params)
+                                # Extract parameters from Message object for RAFT handlers
+                                if hasattr(msg_params, 'get_params'):
+                                    params_dict = msg_params.get_params()
+                                else:
+                                    # Fallback: assume msg_params is already a dict
+                                    params_dict = msg_params
+                                handler(params_dict)  # Call handler with just the parameters dict
                                 handled_by_raft = True
                             except Exception as e:
                                 logging.error(f"RAFT handler error: {e}")
