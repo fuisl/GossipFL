@@ -469,11 +469,23 @@ class StandaloneRaftNode:
                 self.raft_node.become_leader()
                 self.logger.info(f"Node is now leader in term {self.raft_node.current_term}")
         else:
-            # Joining node: stay in INITIAL/FOLLOWER state and wait for leader contact
+            # Joining node: stay in INITIAL/FOLLOWER state and send join request
             self.logger.info(f"Joining existing cluster with nodes: {other_nodes}")
             with self.raft_node.state_lock:
                 self.raft_node.become_follower(0)  # Start as follower with term 0
-            self.logger.info("Node will wait for leader contact to sync state")
+            
+            # Send join request to the cluster through the service discovery bridge
+            if hasattr(self.worker_manager, 'service_discovery_bridge'):
+                self.logger.info("Sending join request to existing cluster...")
+                # Get leader hint from communication manager
+                leader_hint = self.comm_manager.get_leader_hint()
+                if leader_hint:
+                    self.logger.info(f"Using leader hint from service discovery: {leader_hint}")
+                self.worker_manager.service_discovery_bridge.send_join_request_to_cluster(discovered_nodes, leader_hint)
+            else:
+                self.logger.warning("No service discovery bridge available to send join request")
+            
+            self.logger.info("Node will wait for join response and leader contact to sync state")
 
 
 class StatusMonitor:

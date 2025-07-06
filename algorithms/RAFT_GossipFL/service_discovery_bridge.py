@@ -374,7 +374,7 @@ class RaftServiceDiscoveryBridge:
                 
             else:
                 # We're not the leader - redirect to current leader
-                current_leader = self.consensus.raft_node.leader_id
+                current_leader = self.consensus.raft_node.current_leader_id
                 if current_leader and current_leader != sender_id:
                     logging.info(f"Bridge: Redirecting join request from {sender_id} to leader {current_leader}")
                     self._send_join_response(sender_id, False, f"Not leader, redirect to {current_leader}", current_leader)
@@ -435,22 +435,32 @@ class RaftServiceDiscoveryBridge:
                 'timestamp': time.time()
             }
             
-            # Prepare join request message
-            message_params = {
-                RaftMessage.ARG_SENDER: self.consensus.raft_node.node_id,
-                RaftMessage.ARG_RECEIVER: leader_id,
-                RaftMessage.ARG_TYPE: RaftMessage.MSG_TYPE_JOIN_REQUEST,
+            # Prepare join request content
+            content = {
                 RaftMessage.ARG_NODE_INFO: node_info,
                 RaftMessage.ARG_TIMESTAMP: time.time()
             }
             
             logging.info(f"Bridge: Sending join request to leader {leader_id}")
             
-            # Send via communication manager
-            if hasattr(self.comm_manager, 'send_message'):
-                self.comm_manager.send_message(leader_id, message_params)
+            # Send via worker manager's RAFT message system
+            if (hasattr(self, 'worker_manager') and self.worker_manager and 
+                hasattr(self.worker_manager, 'send_raft_message') and
+                hasattr(self.worker_manager, 'raft_consensus')):  # Verify it's actually a worker manager
+                
+                logging.debug(f"Bridge: Using worker manager to send join request: {type(self.worker_manager).__name__}")
+                self.worker_manager.send_raft_message(
+                    RaftMessage.MSG_TYPE_JOIN_REQUEST, 
+                    leader_id, 
+                    content
+                )
             else:
-                logging.error("Communication manager does not support send_message")
+                logging.error("Worker manager not available or does not support RAFT message sending")
+                logging.debug(f"Bridge: worker_manager = {getattr(self, 'worker_manager', None)}")
+                if hasattr(self, 'worker_manager') and self.worker_manager:
+                    logging.debug(f"Bridge: worker_manager type = {type(self.worker_manager).__name__}")
+                    logging.debug(f"Bridge: worker_manager has send_raft_message = {hasattr(self.worker_manager, 'send_raft_message')}")
+                    logging.debug(f"Bridge: worker_manager has raft_consensus = {hasattr(self.worker_manager, 'raft_consensus')}")
                 
         except Exception as e:
             logging.error(f"Error sending join request to leader {leader_id}: {e}", exc_info=True)
@@ -466,31 +476,41 @@ class RaftServiceDiscoveryBridge:
             redirect_leader: ID of leader to redirect to (if not approved)
         """
         try:
-            # Prepare join response message
-            message_params = {
-                RaftMessage.ARG_SENDER: self.consensus.raft_node.node_id,
-                RaftMessage.ARG_RECEIVER: receiver_id,
-                RaftMessage.ARG_TYPE: RaftMessage.MSG_TYPE_JOIN_RESPONSE,
+            # Prepare join response content
+            content = {
                 RaftMessage.ARG_JOIN_APPROVED: approved,
                 'message': message,
                 RaftMessage.ARG_TIMESTAMP: time.time()
             }
             
             if redirect_leader:
-                message_params[RaftMessage.ARG_LEADER_ID] = redirect_leader
+                content[RaftMessage.ARG_LEADER_ID] = redirect_leader
             
             logging.info(f"Bridge: Sending join response to {receiver_id}: approved={approved}")
             
-            # Send via communication manager
-            if hasattr(self.comm_manager, 'send_message'):
-                self.comm_manager.send_message(receiver_id, message_params)
+            # Send via worker manager's RAFT message system
+            if (hasattr(self, 'worker_manager') and self.worker_manager and 
+                hasattr(self.worker_manager, 'send_raft_message') and
+                hasattr(self.worker_manager, 'raft_consensus')):  # Verify it's actually a worker manager
+                
+                logging.debug(f"Bridge: Using worker manager to send join response: {type(self.worker_manager).__name__}")
+                self.worker_manager.send_raft_message(
+                    RaftMessage.MSG_TYPE_JOIN_RESPONSE, 
+                    receiver_id, 
+                    content
+                )
             else:
-                logging.error("Communication manager does not support send_message")
+                logging.error("Worker manager not available or does not support RAFT message sending")
+                logging.debug(f"Bridge: worker_manager = {getattr(self, 'worker_manager', None)}")
+                if hasattr(self, 'worker_manager') and self.worker_manager:
+                    logging.debug(f"Bridge: worker_manager type = {type(self.worker_manager).__name__}")
+                    logging.debug(f"Bridge: worker_manager has send_raft_message = {hasattr(self.worker_manager, 'send_raft_message')}")
+                    logging.debug(f"Bridge: worker_manager has raft_consensus = {hasattr(self.worker_manager, 'raft_consensus')}")
                 
         except Exception as e:
             logging.error(f"Error sending join response to {receiver_id}: {e}", exc_info=True)
 
-    def send_join_request_to_cluster(self, discovered_nodes: List[int]):
+    def send_join_request_to_cluster(self, discovered_nodes: List[int], leader_hint: int = None):
         """
         Send join requests to discovered nodes to join an existing cluster.
         
@@ -499,6 +519,7 @@ class RaftServiceDiscoveryBridge:
         
         Args:
             discovered_nodes: List of node IDs discovered from service discovery
+            leader_hint: Hint about who the current leader might be (from service discovery)
         """
         try:
             # Filter out ourselves
@@ -508,18 +529,25 @@ class RaftServiceDiscoveryBridge:
                 logging.info("Bridge: No other nodes to send join request to")
                 return
                 
-            # Try to determine who the leader is from our knowledge
-            current_leader = self.consensus.raft_node.leader_id
+            # Try to determine who the leader is from multiple sources
+            current_leader = self.consensus.raft_node.current_leader_id
             
+            # Prioritize sources: our RAFT knowledge > service discovery hint > first discovered node
+            target_node = None
             if current_leader and current_leader in other_nodes:
-                # We know who the leader is, send directly
-                logging.info(f"Bridge: Sending join request directly to known leader {current_leader}")
-                self._send_join_request_to_leader(current_leader)
+                # We know who the leader is from RAFT state, send directly
+                target_node = current_leader
+                logging.info(f"Bridge: Sending join request directly to known RAFT leader {target_node}")
+            elif leader_hint and leader_hint in other_nodes:
+                # Use service discovery hint
+                target_node = leader_hint
+                logging.info(f"Bridge: Sending join request to service discovery leader hint {target_node}")
             else:
                 # Don't know the leader, send to first discovered node (it will redirect if needed)
                 target_node = other_nodes[0]
                 logging.info(f"Bridge: Sending join request to {target_node} (will redirect if not leader)")
-                self._send_join_request_to_leader(target_node)
+            
+            self._send_join_request_to_leader(target_node)
                 
         except Exception as e:
             logging.error(f"Error sending join request to cluster: {e}", exc_info=True)
@@ -550,6 +578,17 @@ class RaftServiceDiscoveryBridge:
         # Store a reference to the communication manager if not already set
         if not hasattr(self, 'comm_manager') or self.comm_manager is None:
             self.comm_manager = comm_manager
+            
+        # If this is a worker manager (has send_raft_message), store it separately
+        # Check for worker manager by looking for RaftWorkerManager-specific methods
+        if (hasattr(comm_manager, 'send_raft_message') and 
+            hasattr(comm_manager, 'raft_consensus') and
+            hasattr(comm_manager, 'topology_manager')):
+            self.worker_manager = comm_manager
+            logging.info(f"Bridge: Stored worker manager reference for RAFT message sending")
+        elif hasattr(comm_manager, 'send_raft_message'):
+            # This is likely the communication manager, don't overwrite worker manager
+            logging.debug(f"Bridge: Communication manager also has send_raft_message, keeping existing worker manager")
         
         # Register callbacks for service discovery events
         if hasattr(comm_manager, 'on_node_discovered'):

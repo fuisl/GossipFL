@@ -621,8 +621,8 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         """
         sender_id     = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
         term          = msg_params.get(RaftMessage.ARG_TERM)
-        log_entries   = msg_params.get(RaftMessage.ARG_ENTRIES, [])
-        commit_index  = msg_params.get(RaftMessage.ARG_COMMIT_INDEX, 0)
+        log_entries   = msg_params.get(RaftMessage.ARG_ENTRIES)
+        commit_index  = msg_params.get(RaftMessage.ARG_COMMIT_INDEX)
         state_package = msg_params.get(RaftMessage.ARG_STATE_PACKAGE)
 
         logging.debug(
@@ -1545,7 +1545,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         """
         try:
             sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
-            node_info = msg_params.get('node_info', {})
+            node_info = msg_params.get('node_info')
             
             logging.info(f"Node {self.node_id}: Received join request from node {sender_id}")
             
@@ -1568,7 +1568,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         """
         try:
             sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
-            status = msg_params.get('status', 'unknown')
+            status = msg_params.get('status')
             
             logging.info(f"Node {self.node_id}: Received join response from node {sender_id}, status: {status}")
             

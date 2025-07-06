@@ -285,8 +285,12 @@ class ServiceDiscoveryClient:
                 cluster_info = {
                     'nodes': nodes,
                     'total_nodes': len(nodes),
-                    'bootstrap_node': response.node_id if response.is_bootstrap else None
+                    'bootstrap_node': response.node_id if response.is_bootstrap else None,
+                    'leader_node': response.leader.node_id if response.leader else None
                 }
+                
+                # Store leader hint for future use
+                self._set_leader_hint(response.leader.node_id if response.leader else None)
                 
                 logging.info(f"Cluster discovery successful: {len(nodes)} nodes, bootstrap: {response.is_bootstrap}")
                 return response.is_bootstrap, cluster_info
@@ -371,6 +375,33 @@ class ServiceDiscoveryClient:
         """Close the client connection."""
         # Don't close connection here - let cleanup handle it
         logging.debug("Service discovery client close requested")
+    
+    def _set_leader_hint(self, leader_node):
+        """
+        Store the leader hint received from service discovery.
+        
+        Args:
+            leader_node: Leader node information from discovery service
+        """
+        try:
+            if leader_node and hasattr(leader_node, 'node_id'):
+                self.leader_hint = leader_node.node_id
+                logging.debug(f"Service discovery client: Set leader hint to {self.leader_hint}")
+            else:
+                self.leader_hint = None
+                logging.debug("Service discovery client: Cleared leader hint")
+        except Exception as e:
+            logging.error(f"Service discovery client: Error setting leader hint: {e}")
+            self.leader_hint = None
+    
+    def get_leader_hint(self):
+        """
+        Get the stored leader hint.
+        
+        Returns:
+            int or None: Leader node ID hint, or None if not available
+        """
+        return getattr(self, 'leader_hint', None)
     
     def force_close(self):
         """Force close the client connection."""
@@ -1063,6 +1094,14 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
         """Get the current size of the cluster."""
         with config_lock:
             return len(self.node_registry)
+    
+    def get_leader_hint(self) -> Optional[int]:
+        """Get the leader node ID hint from service discovery."""
+        return getattr(self, '_leader_hint', None)
+    
+    def _set_leader_hint(self, leader_id: Optional[int]):
+        """Set the leader hint from service discovery."""
+        self._leader_hint = leader_id
     
     def is_bootstrap_node(self) -> bool:
         """Check if this node is the bootstrap node."""
