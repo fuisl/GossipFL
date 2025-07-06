@@ -58,6 +58,130 @@ config_lock = threading.RLock()
 message_lock = threading.Lock()
 
 
+class ConnectionFailureHandler:
+    """Handles connection failures and automatic node removal."""
+    
+    def __init__(self, comm_manager):
+        self.comm_manager = comm_manager
+        self.failure_counts = {}  # Track failure counts per node
+        self.failure_lock = threading.RLock()
+        self.max_failures_before_removal = 3  # Remove after 3 consecutive failures
+        
+    def is_connection_failure(self, error: Exception) -> bool:
+        """Check if the error indicates a connection failure that should trigger node removal."""
+        if isinstance(error, grpc.RpcError):
+            if error.code() == grpc.StatusCode.UNAVAILABLE:
+                details = error.details() or ""
+                # Check for specific connection failure patterns
+                connection_failure_patterns = [
+                    "connection refused",
+                    "failed to connect",
+                    "unavailable",
+                    "no route to host",
+                    "network is unreachable",
+                    "connection timed out"
+                ]
+                return any(pattern in details.lower() for pattern in connection_failure_patterns)
+        elif isinstance(error, ConnectionError):
+            return True
+        return False
+    
+    def handle_connection_failure(self, node_id: int, error: Exception) -> bool:
+        """
+        Handle connection failure and potentially remove node.
+        
+        Args:
+            node_id: ID of the failed node
+            error: The connection error
+            
+        Returns:
+            bool: True if node was removed, False otherwise
+        """
+        if not self.is_connection_failure(error):
+            return False
+            
+        with self.failure_lock:
+            # Increment failure count
+            self.failure_counts[node_id] = self.failure_counts.get(node_id, 0) + 1
+            failure_count = self.failure_counts[node_id]
+            
+            logging.warning(f"Connection failure to node {node_id} (attempt {failure_count}): {error}")
+            
+            # Check if we should remove the node
+            if failure_count >= self.max_failures_before_removal:
+                logging.error(f"Node {node_id} failed {failure_count} times, removing from cluster")
+                return self._remove_failed_node(node_id, str(error))
+                
+        return False
+    
+    def reset_failure_count(self, node_id: int):
+        """Reset failure count for a node (called on successful connection)."""
+        with self.failure_lock:
+            if node_id in self.failure_counts:
+                del self.failure_counts[node_id]
+    
+    def _remove_failed_node(self, node_id: int, reason: str) -> bool:
+        """Remove a failed node from the cluster."""
+        try:
+            # Remove from local registry immediately
+            self.comm_manager._remove_node_from_registry(node_id)
+            
+            # If we have a service discovery bridge, propose membership change through RAFT
+            if (self.comm_manager.bridge_registered and 
+                self.comm_manager.service_discovery_bridge):
+                
+                # Propose membership change through RAFT consensus
+                success = self.comm_manager.service_discovery_bridge.propose_membership_change(
+                    action="remove",
+                    node_id=node_id,
+                    reason=f"Connection failure: {reason}"
+                )
+                
+                if success:
+                    logging.info(f"Proposed RAFT membership change to remove node {node_id}")
+                else:
+                    logging.warning(f"Failed to propose RAFT membership change for node {node_id}")
+                    # If we're not the leader, try to notify the leader about the failure
+                    self._notify_leader_of_failure(node_id, reason)
+                
+                return success
+            else:
+                # In non-bridge mode, try to notify service discovery directly
+                if (self.comm_manager.use_service_discovery and 
+                    self.comm_manager.service_discovery_client):
+                    
+                    success = self.comm_manager.service_discovery_client.unregister_node(node_id)
+                    if success:
+                        logging.info(f"Unregistered failed node {node_id} from service discovery")
+                    else:
+                        logging.warning(f"Failed to unregister node {node_id} from service discovery")
+                    
+                    return success
+                
+            return True  # Local removal was successful
+            
+        except Exception as e:
+            logging.error(f"Error removing failed node {node_id}: {e}")
+            return False
+    
+    def _notify_leader_of_failure(self, node_id: int, reason: str):
+        """Notify the current leader about a node failure if we're not the leader."""
+        try:
+            if (self.comm_manager.service_discovery_bridge and 
+                hasattr(self.comm_manager.service_discovery_bridge, 'get_leader_id')):
+                
+                leader_id = self.comm_manager.service_discovery_bridge.get_leader_id()
+                if leader_id and leader_id != self.comm_manager.node_id:
+                    # Create a failure notification message
+                    # This would typically be sent through the normal message system
+                    logging.info(f"Notifying leader {leader_id} about failed node {node_id}: {reason}")
+                    # Note: Implementation would depend on your specific message protocol
+                    # for communicating failures to the leader
+                    
+        except Exception as e:
+            logging.error(f"Error notifying leader of node failure: {e}")
+
+
 class NodeInfo:
     """Information about a node in the cluster."""
     
@@ -545,6 +669,11 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
         
         logging.info(f"gRPC server started. Listening on port {port}")
         
+        # Initialize connection failure handler  
+        self.connection_failure_handler = ConnectionFailureHandler(self)
+        # Allow configuration of max failures (can be set later by calling code)
+        self.connection_failure_handler.max_failures_before_removal = 3  # default value
+        
         # Initialize discovery and registration
         if use_service_discovery:
             self._initialize_service_discovery(
@@ -564,6 +693,17 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
             self.is_bootstrap_node_flag = True
             self._add_self_to_registry(capabilities, metadata)
             logging.warning("No service discovery or static configuration provided - assuming bootstrap mode")
+    
+    def configure_failure_detection(self, max_failures_before_removal: int = 3):
+        """
+        Configure connection failure detection parameters.
+        
+        Args:
+            max_failures_before_removal: Number of consecutive failures before removing a node
+        """
+        if hasattr(self, 'connection_failure_handler'):
+            self.connection_failure_handler.max_failures_before_removal = max_failures_before_removal
+            logging.info(f"Updated failure detection: max_failures={max_failures_before_removal}")
     
     def _initialize_service_discovery(self, service_host: str, service_port: int, 
                                     capabilities: List[str], metadata: Dict):
@@ -908,15 +1048,27 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
                 
             logging.debug("Message sent successfully")
             
+            # Reset failure count on successful send
+            self.connection_failure_handler.reset_failure_count(receiver_id)
+            
             # Update node reachability
             self._update_node_reachability(receiver_id, True)
             
         except Exception as e:
             logging.error(f"Failed to send message to {channel_url}: {e}")
             
+            # Handle connection failure - this may remove the node if it's persistently unreachable
+            node_removed = self.connection_failure_handler.handle_connection_failure(receiver_id, e)
+            
             # Update node reachability
             self._update_node_reachability(receiver_id, False)
             
+            if node_removed:
+                logging.warning(f"Node {receiver_id} was removed due to persistent connection failures")
+                # Re-raise the exception since the node was removed
+                raise
+            
+            # If node wasn't removed, try recovery strategies
             # In bridge mode, don't retry with manual refresh - let RAFT handle it
             if not (self.bridge_registered and self.service_discovery_bridge):
                 # Non-bridge mode: try manual refresh and retry once
@@ -940,11 +1092,16 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
                             stub.sendMessage(request)
                             logging.info("Message sent successfully on retry")
                             
+                            # Reset failure count on successful retry
+                            self.connection_failure_handler.reset_failure_count(receiver_id)
+                            
                             # Update node reachability
                             self._update_node_reachability(receiver_id, True)
                             
                         except Exception as retry_e:
                             logging.error(f"Retry also failed: {retry_e}")
+                            # Handle retry failure as well
+                            self.connection_failure_handler.handle_connection_failure(receiver_id, retry_e)
                             raise
                     else:
                         raise
@@ -980,6 +1137,38 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
                 # Notify about node loss if it becomes unreachable
                 if not is_reachable and self.on_node_lost:
                     self.on_node_lost(node_id)
+    
+    def _remove_node_from_registry(self, node_id: int):
+        """Remove a node from the local registry and clean up connections."""
+        with config_lock:
+            if node_id in self.node_registry:
+                try:
+                    # Get node info before removal for logging
+                    node_info = self.node_registry[node_id]
+                    address = f"{node_info.ip_address}:{node_info.port}"
+                    
+                    # Remove from registry
+                    del self.node_registry[node_id]
+                    
+                    # Rebuild IP config
+                    self._rebuild_ip_config()
+                    
+                    # Reset failure count
+                    self.connection_failure_handler.reset_failure_count(node_id)
+                    
+                    # Notify RAFT system about node removal
+                    self._notify_raft_about_node_removal(node_id)
+                    
+                    logging.info(f"Removed node {node_id} ({address}) from local registry")
+                    
+                    # Notify callbacks
+                    if self.on_node_lost:
+                        self.on_node_lost(node_id)
+                        
+                except Exception as e:
+                    logging.error(f"Error removing node {node_id} from registry: {e}")
+            else:
+                logging.debug(f"Node {node_id} not found in registry for removal")
     
     def add_observer(self, observer: Observer):
         """Add message observer."""
@@ -1269,6 +1458,9 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
                         )
                         self._rebuild_ip_config()
                         
+                        # Notify RAFT system about the updated node list
+                        self._notify_raft_about_membership_change()
+                        
                         # Notify original callback if it exists
                         if self._original_on_node_discovered:
                             self._original_on_node_discovered(node_id, self.node_registry[node_id])
@@ -1281,6 +1473,9 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
                     if node_id in self.node_registry:
                         del self.node_registry[node_id]
                         self._rebuild_ip_config()
+                        
+                        # Notify RAFT system about the updated node list
+                        self._notify_raft_about_membership_change()
                         
                         # Notify original callback if it exists
                         if self._original_on_node_lost:
@@ -1375,26 +1570,40 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
         return None
     
     def send_raft_message(self, msg: Message):
-        """
-        Send RAFT message through the communication layer.
+        """Send RAFT message through the communication manager."""
+        # Handle RAFT message types that may need special handling
+        if hasattr(self, '_raft_handlers') and msg.get_type() in self._raft_handlers:
+            try:
+                self._raft_handlers[msg.get_type()](msg.get_type(), msg.get_params())
+            except Exception as e:
+                logging.error(f"Error in RAFT handler for message type {msg.get_type()}: {e}")
         
-        This method provides a way for RAFT components to send messages
-        through the existing gRPC infrastructure.
-        
-        Args:
-            msg: RAFT message to send
-        """
+        # Send the message normally
+        self.send_message(msg)
+    
+    def handle_node_failure_notification(self, sender_id: int, failed_node_id: int, reason: str):
+        """Handle notification from another node about a connection failure."""
         try:
-            # Add RAFT message identification
-            msg.add_params("message_source", "raft")
-            
-            # Send through normal message sending mechanism
-            self.send_message(msg)
-            
-            logging.debug(f"Sent RAFT message: {msg.get_type()}")
-            
+            if (self.bridge_registered and self.service_discovery_bridge and
+                hasattr(self.service_discovery_bridge, 'is_leader') and
+                self.service_discovery_bridge.is_leader()):
+                
+                logging.info(f"Received failure notification from node {sender_id} about node {failed_node_id}: {reason}")
+                
+                # As leader, we can propose the membership change
+                success = self.comm_manager.service_discovery_bridge.propose_membership_change(
+                    action="remove",
+                    node_id=failed_node_id,
+                    reason=f"Reported by node {sender_id}: {reason}"
+                )
+                
+                if success:
+                    logging.info(f"Leader proposed removal of failed node {failed_node_id} based on report from {sender_id}")
+                else:
+                    logging.warning(f"Leader failed to propose removal of node {failed_node_id}")
+                    
         except Exception as e:
-            logging.error(f"Failed to send RAFT message: {e}")
+            logging.error(f"Error handling node failure notification: {e}")
     
     def is_bridge_active(self) -> bool:
         """
@@ -1418,3 +1627,70 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
             gRPCCommManager: The communication manager instance
         """
         return self
+    
+    def _notify_raft_about_node_removal(self, removed_node_id: int):
+        """
+        Notify RAFT system about node removal to update known_nodes.
+        
+        This ensures the RAFT consensus system stops trying to communicate
+        with nodes that have been removed from the registry due to connection failures.
+        
+        Args:
+            removed_node_id: ID of the node that was removed
+        """
+        try:
+            # Get current list of nodes (excluding the removed one)
+            current_node_ids = list(self.node_registry.keys())
+            
+            # Notify through the bridge if available
+            if self.bridge_registered and self.service_discovery_bridge:
+                # Check if the bridge has access to RAFT node
+                if (hasattr(self.service_discovery_bridge, 'raft_consensus') and 
+                    self.service_discovery_bridge.raft_consensus and
+                    hasattr(self.service_discovery_bridge.raft_consensus, 'raft_node')):
+                    
+                    raft_node = self.service_discovery_bridge.raft_consensus.raft_node
+                    if hasattr(raft_node, 'update_known_nodes'):
+                        logging.info(f"Updating RAFT known_nodes after removing {removed_node_id}: {current_node_ids}")
+                        raft_node.update_known_nodes(current_node_ids)
+                        return
+                        
+            # Fallback: try to notify through observers that might be RAFT-related
+            for observer in self._observers:
+                # Check if observer has RAFT-related methods
+                if hasattr(observer, 'handle_node_removal'):
+                    try:
+                        observer.handle_node_removal(removed_node_id, current_node_ids)
+                        logging.debug(f"Notified observer about node {removed_node_id} removal")
+                    except Exception as e:
+                        logging.warning(f"Observer failed to handle node removal: {e}")
+                        
+                # Check if observer has access to RAFT node (e.g., worker manager)
+                elif hasattr(observer, 'raft_consensus'):
+                    try:
+                        raft_consensus = observer.raft_consensus
+                        if (hasattr(raft_consensus, 'raft_node') and 
+                            hasattr(raft_consensus.raft_node, 'update_known_nodes')):
+                            logging.info(f"Updating RAFT known_nodes via observer after removing {removed_node_id}: {current_node_ids}")
+                            raft_consensus.raft_node.update_known_nodes(current_node_ids)
+                    except Exception as e:
+                        logging.warning(f"Failed to update RAFT known_nodes via observer: {e}")
+                        
+        except Exception as e:
+            logging.error(f"Error notifying RAFT about node {removed_node_id} removal: {e}")
+    
+    def _notify_raft_about_membership_change(self):
+        """
+        Notify RAFT system about membership changes to update known_nodes.
+        
+        This is a general method that updates the RAFT system with the current
+        list of nodes in the registry.
+        """
+        try:
+            # Get current list of nodes
+            current_node_ids = list(self.node_registry.keys())
+            
+            # Notify through the bridge if available
+            if self.bridge_registered and self.service_discovery_bridge:
+                # Check if the bridge has access to RAFT node
+                if (hasattr(self.service_discovery_bridge, 'raft_consensus') and 
