@@ -656,6 +656,18 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
                     
         except Exception as e:
             logging.error(f"Failed to update node registry: {e}")
+
+    def add_node_to_registry(self, node_info: NodeInfo):
+        """
+        Add a node to the local registry.
+        
+        Args:
+            node_info: NodeInfo object containing node details
+        """
+        with config_lock:
+            self.node_registry[node_info.node_id] = node_info
+            self._rebuild_ip_config()
+            logging.info(f"Node {node_info.node_id} added to registry")
     
     def _add_self_to_registry(self, capabilities: List[str], metadata: Dict):
         """Add this node to the local registry."""
@@ -745,11 +757,11 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
             return
         
         try:
-            # Check if we're in bridge mode
-            if self.bridge_registered and self.service_discovery_bridge:
-                # In bridge mode, registry updates come from RAFT leader
-                logging.debug("Bridge mode: registry updates come from RAFT leader, skipping manual refresh")
-                return
+            # # Check if we're in bridge mode
+            # if self.bridge_registered and self.service_discovery_bridge:
+            #     # In bridge mode, registry updates come from RAFT leader
+            #     logging.debug("Bridge mode: registry updates come from RAFT leader, skipping manual refresh")
+            #     return
             
             # Non-bridge mode: update directly from service discovery
             logging.info("Manual registry refresh from service discovery")

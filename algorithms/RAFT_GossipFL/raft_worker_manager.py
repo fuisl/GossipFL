@@ -1109,6 +1109,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                 logging.error(f"Node {self.node_id}: No RAFT node available for membership change")
                 return
             
+            logging.debug(f"Node {self.node_id}: Handling membership change: action={action}, node_id={node_id}, round={round_num}")
             old_known_nodes = set(raft_node.known_nodes)  # Copy for change detection
             
             if action == 'add':
@@ -1136,9 +1137,9 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                         logging.debug(f"Node {self.node_id}: Removed connection info for node {node_id}")
             
             # If current_nodes is provided, use it to update known nodes
-            if current_nodes is not None:
-                raft_node.known_nodes = set(current_nodes)
-                logging.info(f"Node {self.node_id}: Updated known nodes to {current_nodes} at round {round_num}")
+            # if current_nodes is not None:
+            #     raft_node.known_nodes = set(current_nodes)
+            #     logging.info(f"Node {self.node_id}: Updated known nodes to {current_nodes} at round {round_num}")
             
             # Update connection info for all nodes if provided
             if current_nodes_info:
@@ -1151,7 +1152,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             if old_known_nodes != raft_node.known_nodes:
                 # Update known nodes count and notify any monitoring components
                 raft_node.update_known_nodes(node_ids=list(raft_node.known_nodes))
-                
+                logging.debug(f"Node {self.node_id}: Updated known nodes to {raft_node.known_nodes}")
                 # Notify service discovery bridge to update communication manager
                 if hasattr(self, 'service_discovery_bridge') and self.service_discovery_bridge:
                     if action == 'add' and node_info:

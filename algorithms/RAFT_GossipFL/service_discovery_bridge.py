@@ -800,34 +800,9 @@ class RaftServiceDiscoveryBridge:
             node_info: Connection information for the node
         """
         try:
-            # Method 1: Try comm manager's register_node method
-            if hasattr(self.comm_manager, 'register_node'):
-                self.comm_manager.register_node(
-                    node_id=node_id,
-                    host=node_info.get('ip_address', node_info.get('host', 'localhost')),
-                    port=node_info.get('port', 9000 + node_id)
-                )
-                logging.info(f"Bridge: Registered node {node_id} in communication registry")
-                return
-                
-            # Method 2: Try direct registry update
-            if hasattr(self.comm_manager, 'client_registry'):
-                self.comm_manager.client_registry[node_id] = {
-                    'host': node_info.get('ip_address', node_info.get('host', 'localhost')),
-                    'port': node_info.get('port', 9000 + node_id),
-                    'timestamp': time.time()
-                }
-                logging.info(f"Bridge: Updated client registry for node {node_id}")
-                return
-                
-            # Method 3: Try bridge-specific callback
-            if hasattr(self.comm_manager, '_on_bridge_node_registry_update'):
-                self.comm_manager._on_bridge_node_registry_update([{
-                    'node_id': node_id,
-                    'host': node_info.get('ip_address', node_info.get('host', 'localhost')),
-                    'port': node_info.get('port', 9000 + node_id)
-                }])
-                logging.info(f"Bridge: Updated registry via bridge callback for node {node_id}")
+            if hasattr(self.comm_manager, 'add_node_to_registry'):
+                self.comm_manager.add_node_to_registry(node_info)
+                logging.info(f"Bridge: Refreshed node registry for node {node_id}")
                 return
                 
             logging.warning(f"Bridge: No method available to update registry for node {node_id}")
@@ -844,10 +819,12 @@ class RaftServiceDiscoveryBridge:
             node_id: ID of the node
             node_info: Connection info (for add operations)
         """
+        logging.debug(f"Bridge: Notifying comm manager of membership change: action={action}, node_id={node_id}")
         try:
             if action == 'add' and node_info:
                 self._update_registry_for_node(node_id, node_info)
             elif action == 'remove':
+                #TODO
                 # Remove from registry if possible
                 if hasattr(self.comm_manager, 'client_registry') and node_id in self.comm_manager.client_registry:
                     del self.comm_manager.client_registry[node_id]
