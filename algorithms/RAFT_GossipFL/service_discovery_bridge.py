@@ -158,63 +158,90 @@ class RaftServiceDiscoveryBridge:
                 
             cm = self.comm_manager
             
-            # Helper function to filter out envelope parameters before calling consensus methods
-            def _filter_params(params):
-                """Filter out message envelope parameters that consensus methods don't expect."""
-                filtered = {}
-                envelope_keys = {
-                    RaftMessage.ARG_TYPE, 
-                    # RaftMessage.ARG_SENDER,
-                    RaftMessage.ARG_RECEIVER,
-                    'message_source'
-                }
-                
-                # Special parameter name mapping for consensus methods
-                param_mapping = {
-                    'sender': 'follower_id',  # Map sender to follower_id for append_response
-                    RaftMessage.MSG_ARG_KEY_SENDER: 'follower_id'  # Also handle the constant
-                }
-                
-                for key, value in params.items():
-                    if key not in envelope_keys:
-                        # Apply parameter name mapping if needed
-                        mapped_key = param_mapping.get(key, key)
-                        filtered[mapped_key] = value
-                
-                return filtered
+            # Explicit parameter mapping for each message type
+            # This is much more robust than trying to filter generically
+            def handle_prevote_request(params):
+                return self.consensus.handle_prevote_request(
+                    candidate_id=params.get(RaftMessage.ARG_CANDIDATE_ID),
+                    term=params.get(RaftMessage.ARG_TERM),
+                    last_log_index=params.get(RaftMessage.ARG_LAST_LOG_INDEX),
+                    last_log_term=params.get(RaftMessage.ARG_LAST_LOG_TERM)
+                )
+            
+            def handle_prevote_response(params):
+                return self.consensus.handle_prevote_response(
+                    voter_id=params.get(RaftMessage.MSG_ARG_KEY_SENDER),
+                    term=params.get(RaftMessage.ARG_TERM),
+                    prevote_granted=params.get(RaftMessage.ARG_VOTE_GRANTED)
+                )
+            
+            def handle_vote_request(params):
+                return self.consensus.handle_vote_request(
+                    candidate_id=params.get(RaftMessage.ARG_CANDIDATE_ID),
+                    term=params.get(RaftMessage.ARG_TERM),
+                    last_log_index=params.get(RaftMessage.ARG_LAST_LOG_INDEX),
+                    last_log_term=params.get(RaftMessage.ARG_LAST_LOG_TERM)
+                )
+            
+            def handle_vote_response(params):
+                return self.consensus.handle_vote_response(
+                    voter_id=params.get(RaftMessage.MSG_ARG_KEY_SENDER),
+                    term=params.get(RaftMessage.ARG_TERM),
+                    vote_granted=params.get(RaftMessage.ARG_VOTE_GRANTED)
+                )
+            
+            def handle_append_entries(params):
+                return self.consensus.handle_append_entries(
+                    leader_id=params.get(RaftMessage.MSG_ARG_KEY_SENDER),
+                    term=params.get(RaftMessage.ARG_TERM),
+                    prev_log_index=params.get(RaftMessage.ARG_PREV_LOG_INDEX),
+                    prev_log_term=params.get(RaftMessage.ARG_PREV_LOG_TERM),
+                    entries=params.get(RaftMessage.ARG_ENTRIES, []),
+                    leader_commit=params.get(RaftMessage.ARG_LEADER_COMMIT)
+                )
+            
+            def handle_append_response(params):
+                return self.consensus.handle_append_response(
+                    follower_id=params.get(RaftMessage.MSG_ARG_KEY_SENDER),
+                    term=params.get(RaftMessage.ARG_TERM),
+                    success=params.get(RaftMessage.ARG_SUCCESS),
+                    match_index=params.get(RaftMessage.ARG_MATCH_INDEX)
+                )
+            
+            def handle_install_snapshot(params):
+                return self.consensus.handle_install_snapshot(
+                    leader_id=params.get(RaftMessage.MSG_ARG_KEY_SENDER),
+                    term=params.get(RaftMessage.ARG_TERM),
+                    last_incl_idx=params.get(RaftMessage.ARG_LAST_INCLUDED_INDEX),
+                    last_incl_term=params.get(RaftMessage.ARG_LAST_INCLUDED_TERM),
+                    data=params.get(RaftMessage.ARG_DATA)
+                )
             
             # Register handlers for each RAFT message type
             handler_map = {
-                RaftMessage.MSG_TYPE_PREVOTE_REQUEST: 
-                    lambda p: self.consensus.handle_prevote_request(**_filter_params(p)),
-                RaftMessage.MSG_TYPE_PREVOTE_RESPONSE: 
-                    lambda p: self.consensus.handle_prevote_response(**_filter_params(p)),
-                RaftMessage.MSG_TYPE_REQUEST_VOTE: 
-                    lambda p: self.consensus.handle_vote_request(**_filter_params(p)),
-                RaftMessage.MSG_TYPE_VOTE_RESPONSE: 
-                    lambda p: self.consensus.handle_vote_response(**_filter_params(p)),
-                RaftMessage.MSG_TYPE_APPEND_ENTRIES: 
-                    lambda p: self.consensus.handle_append_entries(**_filter_params(p)),
-                RaftMessage.MSG_TYPE_APPEND_RESPONSE: 
-                    lambda p: self.consensus.handle_append_response(
-                        follower_id=p.get('sender', p.get(RaftMessage.MSG_ARG_KEY_SENDER)),
-                        term=p.get(RaftMessage.ARG_TERM),
-                        success=p.get(RaftMessage.ARG_SUCCESS),
-                        match_index=p.get(RaftMessage.ARG_MATCH_INDEX)
-                    ),
-                RaftMessage.MSG_TYPE_INSTALL_SNAPSHOT: 
-                    lambda p: self.consensus.handle_install_snapshot(**_filter_params(p))
+                RaftMessage.MSG_TYPE_PREVOTE_REQUEST: handle_prevote_request,
+                RaftMessage.MSG_TYPE_PREVOTE_RESPONSE: handle_prevote_response,
+                RaftMessage.MSG_TYPE_REQUEST_VOTE: handle_vote_request,
+                RaftMessage.MSG_TYPE_VOTE_RESPONSE: handle_vote_response,
+                RaftMessage.MSG_TYPE_APPEND_ENTRIES: handle_append_entries,
+                RaftMessage.MSG_TYPE_APPEND_RESPONSE: handle_append_response,
+                RaftMessage.MSG_TYPE_INSTALL_SNAPSHOT: handle_install_snapshot
             }
             
-            # Register all handlers
+            # Register all handlers with error handling
             for msg_type, handler in handler_map.items():
-                # Use default parameter to capture handler by value, not reference
-                cm.add_raft_handler(msg_type, (lambda params, h=handler: h(params)))
+                def safe_handler(params, h=handler):
+                    try:
+                        return h(params)
+                    except Exception as e:
+                        logging.error(f"Error handling RAFT message type {msg_type}: {e}", exc_info=True)
+                        raise
+                
+                cm.add_raft_handler(msg_type, safe_handler)
                 
             logging.info(f"RAFT message handlers registered with comm manager")
         except Exception as e:
-            logging.error(f"Error wiring comm to consensus: {e}", exc_info=True)
-    
+            logging.error(f"Error wiring comm to consensus: {e}", exc_info=True)   
     def _register_discovery_callbacks(self):
         """
         Register callbacks for service discovery events.

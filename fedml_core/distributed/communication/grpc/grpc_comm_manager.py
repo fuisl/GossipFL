@@ -886,7 +886,7 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
         receiver_info = self.node_registry[receiver_id]
         channel_url = f"{receiver_info.ip_address}:{receiver_info.port}"
         
-        logging.info(f"Sending message to {channel_url}")
+        logging.debug(f"Sending message to {channel_url}")
         
         try:
             channel = grpc.insecure_channel(channel_url, options=self.opts)
