@@ -30,17 +30,18 @@ class RaftServiceDiscoveryBridge:
         self.comm_manager = comm_manager
         self.lock = threading.RLock()
         
+        # Initialize pending join responses for event-driven responses
+        self.pending_join_responses = {}
+        
+        # Store original commit callback for chaining
+        self._original_commit_callback = None
+        
         # Ensure comm_manager has raft_handlers dictionary
         if not hasattr(self.comm_manager, '_raft_handlers'):
             self.comm_manager._raft_handlers = {}
             
         # Complete initialization in a deterministic order
         self._init_bridge()
-        
-        # Register commit callback for event-driven responses
-        if hasattr(consensus, 'register_commit_callback'):
-            consensus.register_commit_callback(self.on_commit)
-            logging.info("Bridge: Registered commit callback for event-driven responses")
         
         logging.info(f"RaftServiceDiscoveryBridge initialized for node {self.consensus.raft_node.node_id}")
     
@@ -230,7 +231,11 @@ class RaftServiceDiscoveryBridge:
         try:
             # Set commit callbacks on RAFT node
             self.consensus.raft_node.on_membership_change = self._on_commit_membership
-            self.consensus.raft_node.on_commit = self._on_commit_any
+            
+            # Chain our commit handler with existing consensus handler
+            # Store original callback if it exists
+            self._original_commit_callback = getattr(self.consensus.raft_node, 'on_commit', None)
+            self.consensus.raft_node.on_commit = self._on_commit_chained
             
             logging.info(f"Consensus commit callbacks registered")
         except Exception as e:
@@ -328,6 +333,24 @@ class RaftServiceDiscoveryBridge:
         except Exception as e:
             logging.error(f"Error handling membership change commit: {e}", exc_info=True)
     
+    def _on_commit_chained(self, entry):
+        """
+        Chained commit handler that calls both bridge handlers and original consensus handler.
+        
+        Args:
+            entry: The committed log entry
+        """
+        try:
+            # First call the original consensus commit handler if it exists
+            if self._original_commit_callback:
+                self._original_commit_callback(entry)
+            
+            # Then call our bridge-specific commit handler for join responses
+            self.on_commit(entry, entry.get('index', 0))
+            
+        except Exception as e:
+            logging.error(f"Error in chained commit handler: {e}", exc_info=True)
+    
     def _on_commit_any(self, entry):
         """
         Handle any log entry commit.
@@ -362,15 +385,24 @@ class RaftServiceDiscoveryBridge:
                 logging.debug(f"Ignoring join request from self")
                 return
             
+            # Check for duplicate join request
+            pending_join_key = f"join_{sender_id}"
+            if pending_join_key in self.pending_join_responses:
+                logging.info(f"Bridge: Duplicate join request from {sender_id}, ignoring")
+                return
+            
+            # Check if node is already a cluster member
+            if sender_id in self.consensus.raft_node.known_nodes:
+                logging.info(f"Bridge: Node {sender_id} already in cluster, sending approval")
+                self._send_join_response(sender_id, True, "Already a cluster member")
+                return
+            
             # Check if we're the leader
             if self.consensus.raft_node.state == RaftState.LEADER:
                 logging.info(f"Bridge: Processing join request as leader for node {sender_id}")
                 
                 # Store pending join request - response will be sent after commit
                 pending_join_key = f"join_{sender_id}"
-                if not hasattr(self, 'pending_join_responses'):
-                    self.pending_join_responses = {}
-                
                 self.pending_join_responses[pending_join_key] = {
                     'node_id': sender_id,
                     'node_info': node_info,
@@ -378,6 +410,7 @@ class RaftServiceDiscoveryBridge:
                 }
                 
                 # Propose membership change to add the node through RAFT consensus
+                # This should be the ONLY place membership change is proposed for join requests
                 success = self.consensus.propose_membership_change(
                     action='add',
                     node_id=sender_id,
@@ -389,6 +422,9 @@ class RaftServiceDiscoveryBridge:
                     # Clean up pending response and send immediate rejection
                     del self.pending_join_responses[pending_join_key]
                     self._send_join_response(sender_id, False, "Failed to add to RAFT log")
+                    logging.error(f"Bridge: Failed to propose membership change for node {sender_id}")
+                else:
+                    logging.info(f"Bridge: Proposed membership change for node {sender_id}, waiting for commit")
                 
             else:
                 # We're not the leader - redirect to current leader
@@ -426,6 +462,17 @@ class RaftServiceDiscoveryBridge:
                 # Clear the join progress flag since we were accepted
                 if hasattr(self, '_join_in_progress'):
                     self._join_in_progress = False
+                    
+                # Transition from INITIAL to FOLLOWER state now that we're approved
+                if self.consensus.raft_node.state == RaftState.INITIAL:
+                    with self.consensus.raft_node.state_lock:
+                        self.consensus.raft_node.become_follower(self.consensus.raft_node.current_term)
+                        logging.info(f"Node {self.consensus.raft_node.node_id}: Transitioned from INITIAL to FOLLOWER after join approval")
+                        
+                        # Start election timer now that we're a proper cluster member
+                        if self.consensus:
+                            self.consensus.start_election_timer_for_initial_node()
+                
                 # The membership change will be propagated through RAFT consensus
                 # and handled by the commit callback when committed
                 
@@ -708,16 +755,19 @@ class RaftServiceDiscoveryBridge:
             log_index: The index of the committed entry
         """
         try:
-            if log_entry.get('command', {}).get('type') == 'membership':
-                command = log_entry.get('command', {})
+            # Handle the log entry based on its structure
+            # Check if this is a standard RAFT log entry with a command
+            command = log_entry.get('command', {})
+            if not command:
+                # If no command, this might be a direct entry format
+                command = log_entry
+            
+            if command.get('type') == 'membership':
                 action = command.get('action')
                 node_id = command.get('node_id')
                 
                 if action == 'add' and node_id:
                     # Check if this was a pending join request
-                    if not hasattr(self, 'pending_join_responses'):
-                        self.pending_join_responses = {}
-                        
                     pending_join_key = f"join_{node_id}"
                     if pending_join_key in self.pending_join_responses:
                         # Now send the join response after consensus is reached
@@ -725,11 +775,18 @@ class RaftServiceDiscoveryBridge:
                         del self.pending_join_responses[pending_join_key]
                         logging.info(f"Bridge: Sent join response to {node_id} after commit")
                     
-                    # Update registry with new node
+                    # Update registry with new node - this is critical for communication
                     node_info = command.get('node_info', {})
                     if node_info:
                         self._update_registry_for_node(node_id, node_info)
                         logging.info(f"Bridge: Updated registry for node {node_id} after commit")
+                    else:
+                        logging.warning(f"Bridge: No node_info available for node {node_id} - registry not updated")
+                        
+                elif action == 'remove' and node_id:
+                    # Notify comm manager of node removal
+                    self._notify_comm_manager_membership_change('remove', node_id)
+                    logging.info(f"Bridge: Processed node {node_id} removal after commit")
                         
         except Exception as e:
             logging.error(f"Bridge: Error in commit callback: {e}", exc_info=True)
@@ -742,16 +799,61 @@ class RaftServiceDiscoveryBridge:
             node_id: ID of the node to register
             node_info: Connection information for the node
         """
-        if hasattr(self.comm_manager, 'register_node'):
-            try:
+        try:
+            # Method 1: Try comm manager's register_node method
+            if hasattr(self.comm_manager, 'register_node'):
                 self.comm_manager.register_node(
                     node_id=node_id,
-                    host=node_info.get('ip_address', 'localhost'),
+                    host=node_info.get('ip_address', node_info.get('host', 'localhost')),
                     port=node_info.get('port', 9000 + node_id)
                 )
                 logging.info(f"Bridge: Registered node {node_id} in communication registry")
-            except Exception as e:
-                logging.error(f"Bridge: Failed to register node {node_id}: {e}")
+                return
+                
+            # Method 2: Try direct registry update
+            if hasattr(self.comm_manager, 'client_registry'):
+                self.comm_manager.client_registry[node_id] = {
+                    'host': node_info.get('ip_address', node_info.get('host', 'localhost')),
+                    'port': node_info.get('port', 9000 + node_id),
+                    'timestamp': time.time()
+                }
+                logging.info(f"Bridge: Updated client registry for node {node_id}")
+                return
+                
+            # Method 3: Try bridge-specific callback
+            if hasattr(self.comm_manager, '_on_bridge_node_registry_update'):
+                self.comm_manager._on_bridge_node_registry_update([{
+                    'node_id': node_id,
+                    'host': node_info.get('ip_address', node_info.get('host', 'localhost')),
+                    'port': node_info.get('port', 9000 + node_id)
+                }])
+                logging.info(f"Bridge: Updated registry via bridge callback for node {node_id}")
+                return
+                
+            logging.warning(f"Bridge: No method available to update registry for node {node_id}")
+            
+        except Exception as e:
+            logging.error(f"Bridge: Failed to register node {node_id}: {e}")
+
+    def _notify_comm_manager_membership_change(self, action: str, node_id: int, node_info: Dict[str, Any] = None):
+        """
+        Notify communication manager of membership changes.
+        
+        Args:
+            action: 'add' or 'remove'
+            node_id: ID of the node
+            node_info: Connection info (for add operations)
+        """
+        try:
+            if action == 'add' and node_info:
+                self._update_registry_for_node(node_id, node_info)
+            elif action == 'remove':
+                # Remove from registry if possible
+                if hasattr(self.comm_manager, 'client_registry') and node_id in self.comm_manager.client_registry:
+                    del self.comm_manager.client_registry[node_id]
+                    logging.info(f"Bridge: Removed node {node_id} from client registry")
+        except Exception as e:
+            logging.error(f"Bridge: Error notifying comm manager of membership change: {e}")
 def _msg(msg_type: int, receiver=None, **kwargs):
     """
     Create a message envelope for RAFT messages.

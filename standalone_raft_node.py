@@ -469,10 +469,10 @@ class StandaloneRaftNode:
                 self.raft_node.become_leader()
                 self.logger.info(f"Node is now leader in term {self.raft_node.current_term}")
         else:
-            # Joining node: stay in INITIAL/FOLLOWER state and send join request
+            # Joining node: stay in INITIAL state and send join request
             self.logger.info(f"Joining existing cluster with nodes: {other_nodes}")
-            with self.raft_node.state_lock:
-                self.raft_node.become_follower(0)  # Start as follower with term 0
+            # DO NOT transition to FOLLOWER yet - stay in INITIAL state until join is approved
+            self.logger.info("Node will stay in INITIAL state until join request is approved")
             
             # Send join request to the cluster through the service discovery bridge
             if hasattr(self.worker_manager, 'service_discovery_bridge'):

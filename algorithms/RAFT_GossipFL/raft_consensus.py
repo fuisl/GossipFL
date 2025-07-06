@@ -138,8 +138,12 @@ class RaftConsensus:
             
             self.is_running = True
             
-            # Start election timer thread (always running for followers/candidates)
-            self._start_election_timer_thread()
+            # Start election timer thread only if not in INITIAL state
+            # INITIAL state nodes should wait for join approval before participating in elections
+            if self.raft_node.state != RaftState.INITIAL:
+                self._start_election_timer_thread()
+            else:
+                logging.info(f"Node {self.raft_node.node_id}: Skipping election timer start - node in INITIAL state")
             
             # Start discovery hint sender if configured
             if self.discovery_hint_sender:
@@ -151,6 +155,14 @@ class RaftConsensus:
                 self._start_leader_threads()
             
             logging.info(f"Node {self.raft_node.node_id}: RAFT consensus operations started")
+    
+    def start_election_timer_for_initial_node(self):
+        """Start election timer for nodes transitioning out of INITIAL state."""
+        with self.thread_lock:
+            if self.is_running and self.raft_node.state != RaftState.INITIAL:
+                if not self.election_timer_thread or not self.election_timer_thread.is_alive():
+                    self._start_election_timer_thread()
+                    logging.info(f"Node {self.raft_node.node_id}: Started election timer after leaving INITIAL state")
     
     def stop(self):
         """Stop all consensus operations."""
@@ -219,6 +231,11 @@ class RaftConsensus:
                 # Stop leader-specific threads
                 self._stop_leader_threads()
                 
+                # Start election timer if not already running and this node was previously in INITIAL state
+                if not hasattr(self, 'election_timer_thread') or not self.election_timer_thread.is_alive():
+                    logging.info(f"Node {self.raft_node.node_id}: Starting election timer after transitioning from INITIAL state")
+                    self._start_election_timer_thread()
+                
                 # Update discovery hint sender when becoming follower/candidate
                 if self.discovery_hint_sender:
                     hint_state = HintRaftState.FOLLOWER if new_state == RaftState.FOLLOWER else HintRaftState.CANDIDATE
@@ -230,6 +247,12 @@ class RaftConsensus:
                     logging.debug(f"Node {self.raft_node.node_id}: Updated discovery hint sender for {hint_state} state")
                 
                 # Note: Leader tracking is now handled by RaftNode.get_leader_id()
+                
+            elif new_state == RaftState.INITIAL:
+                # Stop all threads when going back to INITIAL state
+                self._stop_leader_threads()
+                self._stop_election_timer_thread()
+                logging.info(f"Node {self.raft_node.node_id}: Stopped election timer - returning to INITIAL state")
     
     def _start_election_timer_thread(self):
         """Start the election timer thread (always runs for followers/candidates)."""
