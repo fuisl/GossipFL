@@ -57,9 +57,9 @@ class MockArgs:
     discovery_port: int = 8080
     node_id: int = 0
     bootstrap: bool = False
-    min_election_timeout: int = 150
-    max_election_timeout: int = 300
-    heartbeat_interval: int = 50
+    min_election_timeout: int = 5000
+    max_election_timeout: int = 10000
+    heartbeat_interval: int = 2000
     raft_log_compaction_threshold: int = 100
     client_num_in_total: Optional[int] = None
     comm_round: int = 100

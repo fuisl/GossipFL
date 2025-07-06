@@ -84,13 +84,13 @@ class RaftNode:
         self.state_lock = threading.RLock()
         
         # Election timeout (randomized to prevent split votes)
-        self.min_election_timeout = getattr(args, 'min_election_timeout', 150) / 1000.0  # default 150ms
-        self.max_election_timeout = getattr(args, 'max_election_timeout', 300) / 1000.0  # default 300ms
+        self.min_election_timeout = 5  # BUG: This should be configurable
+        self.max_election_timeout = 10 # BUG: This should be configurable
         self.reset_election_timeout()
         
         # Heartbeat interval (for leaders)
-        self.heartbeat_interval = getattr(args, 'heartbeat_interval', 50) / 1000.0  # default 50ms
-        
+        self.heartbeat_interval = 2 # BUG: This should be configurable
+
         # Callbacks for external interactions (to be set by the manager)
         self.on_state_change = None
         self.on_commit = None
@@ -746,6 +746,9 @@ class RaftNode:
                     elif array_idx >= len(self.log) or array_idx < 0:
                         log_ok = False
                         reason = f"prev_log_index ({prev_log_index}) outside log range"
+                        logging.debug(f"Node {self.node_id}: Log consistency check - "
+                        f"prev_log_index={prev_log_index}, log_length={len(self.log)}, "
+                        f"prev_log_term={prev_log_term}")
                         logging.info(f"Node {self.node_id}: Log consistency check failed: {reason}")
                         return self.current_term, False
                     elif self.log[array_idx]['term'] != prev_log_term:
