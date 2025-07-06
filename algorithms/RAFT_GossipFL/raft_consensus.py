@@ -189,6 +189,16 @@ class RaftConsensus:
                 # Start leader-specific threads
                 self._start_leader_threads()
                 
+                # ——————————————————————————————
+                # CRITICAL: Immediately propose coordinator entry for this term
+                # This ensures all followers know who the coordinator is
+                try:
+                    current_round = self._get_current_round()
+                    idx = self.add_coordinator_update(self.raft_node.node_id, current_round)
+                    logging.info(f"Leader {self.raft_node.node_id}: Proposed coordinator entry at index {idx} for round {current_round}")
+                except Exception as e:
+                    logging.error(f"Leader {self.raft_node.node_id}: Error proposing coordinator update: {e}")
+                
                 # Update discovery hint sender when becoming leader
                 if self.discovery_hint_sender:
                     self.discovery_hint_sender.update_raft_state(
@@ -652,50 +662,88 @@ class RaftConsensus:
             return -1
         
         try:
-            if action == 'add':
-                # Pass the complete node_info dictionary, not just node_id
-                if node_info:
-                    # Create a complete node_info dict with node_id included
-                    complete_node_info = {
-                        'node_id': node_id,
-                        'ip_address': node_info.get('ip_address', 'localhost'),
-                        'port': node_info.get('port', 9000 + node_id),
-                        'capabilities': node_info.get('capabilities', ['grpc', 'fedml']),
-                        'timestamp': node_info.get('timestamp', time.time())
-                    }
-                    idx = self.raft_node.add_node(complete_node_info, round_num)
-                else:
-                    # Fallback to just node_id (for backward compatibility)
-                    idx = self.raft_node.add_node(node_id, round_num)
-                return idx
-            elif action == 'remove':
-                idx = self.raft_node.remove_node(node_id, round_num, reason)
-                return idx
+            # Create a complete membership change entry that includes all current nodes
+            # This ensures every follower knows the complete cluster membership
+            current_nodes = list(self.raft_node.known_nodes)
+            
+            # For 'add' actions, prepare complete node_info
+            complete_node_info = None
+            if action == 'add' and node_info:
+                complete_node_info = {
+                    'node_id': node_id,
+                    'ip_address': node_info.get('ip_address', 'localhost'),
+                    'port': node_info.get('port', 9000 + node_id),
+                    'capabilities': node_info.get('capabilities', ['grpc', 'fedml']),
+                    'timestamp': node_info.get('timestamp', time.time())
+                }
+            
+            # Create the command for the log
+            command = {
+                'type': 'membership',
+                'action': action,
+                'node_id': node_id,
+                'current_nodes': current_nodes,
+                'timestamp': time.time(),
+                'round': round_num,
+                'reason': reason
+            }
+            
+            # Add node_info for 'add' operations
+            if action == 'add' and complete_node_info:
+                command['node_info'] = complete_node_info
+            
+            # Add to the log
+            log_index = self.raft_node.add_log_entry(command)
+            
+            if log_index > 0:
+                if action == 'add':
+                    # Call RaftNode's add_node after the log entry is added
+                    if complete_node_info:
+                        idx = self.raft_node.add_node(complete_node_info, round_num)
+                    else:
+                        idx = self.raft_node.add_node(node_id, round_num)
+                    logging.info(f"Leader {self.raft_node.node_id}: Added membership change (add node {node_id}) at index {log_index}")
+                elif action == 'remove':
+                    idx = self.raft_node.remove_node(node_id, round_num, reason)
+                    logging.info(f"Leader {self.raft_node.node_id}: Added membership change (remove node {node_id}) at index {log_index}")
+                
+                return log_index
+            else:
+                logging.error(f"Leader {self.raft_node.node_id}: Failed to add membership change to log")
+                return -1
             
         except Exception as e:
             logging.error(f"Node {self.raft_node.node_id}: Error adding membership change: {str(e)}")
             return -1
     
-    def add_coordinator_update(self, coordinator_id):
+    def add_coordinator_update(self, coordinator_id, round_num=0):
         """
         Add a coordinator update to the log (leaders only).
         
         Args:
             coordinator_id (int): ID of the new coordinator
+            round_num (int): Current training round number
             
         Returns:
             int: Index of the new log entry, or -1 if not leader
         """
         if self.raft_node.state != RaftState.LEADER:
+            logging.warning(f"Node {self.raft_node.node_id}: Cannot add coordinator update - not a leader")
             return -1
         
         command = {
             'type': 'coordinator',
             'coordinator_id': coordinator_id,
+            'round': round_num,
             'timestamp': time.time()
         }
         
-        return self.raft_node.add_log_entry(command)
+        log_index = self.raft_node.add_log_entry(command)
+        
+        if log_index > 0:
+            logging.info(f"Leader {self.raft_node.node_id}: Added coordinator update for node {coordinator_id}, round {round_num} at index {log_index}")
+        
+        return log_index
     
     def get_coordinator_id(self):
         """
@@ -1482,23 +1530,111 @@ class RaftConsensus:
     def _membership_change_callback(self, nodes):
         """Callback for membership changes."""
         try:
+            # 1) Update service discovery bridge
             if self.service_discovery_bridge:
                 self.service_discovery_bridge.handle_membership_change(nodes)
+                
+            # 2) Notify worker manager with the updated node set
+            # Get current round from raft state or fallback to args
+            round_num = self._get_current_round()
+            
+            if self.worker_manager is not None:
+                self.worker_manager.on_membership_change(set(nodes), round_num=round_num)
+                logging.debug(f"Node {self.raft_node.node_id}: Worker manager notified of membership change to {nodes}")
+            else:
+                logging.warning(f"Node {self.raft_node.node_id}: No worker manager available to notify about membership change")
+                
+            # Update discovery hint sender if we're the leader
+            if self.discovery_hint_sender and self.raft_node.state == RaftState.LEADER:
+                self.discovery_hint_sender.update_raft_state(
+                    new_state=HintRaftState.LEADER,
+                    term=self.raft_node.current_term,
+                    known_nodes=nodes
+                )
+                logging.debug(f"Node {self.raft_node.node_id}: Discovery hint sender updated with new membership")
         except Exception as e:
-            logging.error(f"Node {self.raft_node.node_id}: Error in membership change callback: {e}")
+            logging.error(f"Node {self.raft_node.node_id}: Error in membership change callback: {e}", exc_info=True)
     
     def _handle_membership_commit(self, data):
         """Handle committed membership changes."""
         try:
-            # Implementation depends on the specific membership change format
-            logging.info(f"Node {self.raft_node.node_id}: Committed membership change: {data}")
+            action = data.get('action')
+            node_id = data.get('node_id')
+            node_info = data.get('node_info')
+            current_nodes = set(data.get('current_nodes', []))
+            round_num = data.get('round', 0)
+            reason = data.get('reason', 'unspecified')
+            
+            logging.info(f"Node {self.raft_node.node_id}: Committed membership {action} for node {node_id}, reason: {reason}")
+            
+            # 1) Let the service discovery bridge update its comm_manager
+            if self.service_discovery_bridge:
+                self.service_discovery_bridge.handle_membership_change(current_nodes)
+                # If we have node_info for 'add' actions, update the comm_manager directly
+                if action == 'add' and node_info and hasattr(self.service_discovery_bridge, '_notify_comm_manager_membership_change'):
+                    self.service_discovery_bridge._notify_comm_manager_membership_change(
+                        action='add', node_id=node_id, node_info=node_info
+                    )
+            
+            # 2) Notify the worker_manager so it can update its topology
+            if self.worker_manager is not None:
+                self.worker_manager.on_membership_change(current_nodes, round_num=round_num)
+                
+                # If we have node info and the worker_manager has service_discovery_bridge
+                if action == 'add' and node_info and hasattr(self.worker_manager, 'service_discovery_bridge') and \
+                   self.worker_manager.service_discovery_bridge is not None and \
+                   hasattr(self.worker_manager.service_discovery_bridge, '_notify_comm_manager_membership_change'):
+                    self.worker_manager.service_discovery_bridge._notify_comm_manager_membership_change(
+                        action='add', node_id=node_id, node_info=node_info
+                    )
+            
+            # 3) Update our internal node set if needed
+            # This ensures everyone has the same view of cluster membership
+            if action == 'add' and node_id not in self.raft_node.known_nodes:
+                # If we're the leader, we already did this when creating the log entry
+                if self.raft_node.state != RaftState.LEADER:
+                    if node_info:
+                        self.raft_node.add_node(node_info, round_num, apply_now=True)
+                    else:
+                        self.raft_node.add_node(node_id, round_num, apply_now=True)
+            elif action == 'remove' and node_id in self.raft_node.known_nodes:
+                # If we're the leader, we already did this when creating the log entry
+                if self.raft_node.state != RaftState.LEADER:
+                    self.raft_node.remove_node(node_id, round_num, reason, apply_now=True)
+                    
         except Exception as e:
-            logging.error(f"Node {self.raft_node.node_id}: Error handling membership commit: {e}")
+            logging.error(f"Node {self.raft_node.node_id}: Error handling membership commit: {e}", exc_info=True)
     
     def _handle_coordinator_commit(self, data):
         """Handle committed coordinator changes."""
         try:
-            # Implementation depends on the specific coordinator change format
-            logging.info(f"Node {self.raft_node.node_id}: Committed coordinator change: {data}")
+            new_coordinator = data.get('coordinator_id')
+            round_num = data.get('round', 0)
+            old_coordinator = None
+            reason = 'raft-commit'
+            
+            logging.info(f"Node {self.raft_node.node_id}: Committed coordinator change to {new_coordinator} for round {round_num}")
+            
+            # Get previous coordinator if available through worker_manager
+            if hasattr(self.worker_manager, 'coordinator_id'):
+                old_coordinator = self.worker_manager.coordinator_id
+            
+            # Notify the worker manager about the coordinator change
+            if self.worker_manager is not None:
+                # First notify about the coordinator change
+                self.worker_manager.on_coordinator_change(
+                    new_coordinator=new_coordinator,
+                    old_coordinator=old_coordinator,
+                    round_num=round_num,
+                    reason=reason
+                )
+                
+                # If I'm the new coordinator, trigger the training process
+                if new_coordinator == self.raft_node.node_id:
+                    self.worker_manager.on_become_coordinator(round_num)
+                    logging.info(f"Node {self.raft_node.node_id}: Triggered training process as new coordinator for round {round_num}")
+            else:
+                logging.warning(f"Node {self.raft_node.node_id}: No worker manager available to notify about coordinator change")
+                
         except Exception as e:
-            logging.error(f"Node {self.raft_node.node_id}: Error handling coordinator commit: {e}")
+            logging.error(f"Node {self.raft_node.node_id}: Error handling coordinator commit: {e}", exc_info=True)
