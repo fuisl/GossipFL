@@ -27,6 +27,13 @@ class RaftTopologyManager(SAPSTopologyManager):
         self.topology_cache = {}  # Cache for topologies by round number
         self.match = None  # Store the gossip match list
         
+        # Initialize with a basic identity topology to avoid index errors
+        # This will be replaced when generate_topology() is called
+        if len(self.topology) == 0:
+            self.topology = np.zeros([self.n, self.n])
+            for i in range(self.n):
+                self.topology[i][i] = 1.0  # Self-connections as initial fallback
+        
         logging.info(f"RaftTopologyManager initialized")
     
     def generate_topology(self, t):

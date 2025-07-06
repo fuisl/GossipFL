@@ -13,7 +13,7 @@ def create_trainer(args, device, model=None, **kwargs):
     if args.algorithm in ['FedAvg', 'AFedAvg', 'PSGD', 'APSGD', 'Local_PSGD', 
                           'FedSGD', 'centralized', 'FedNova']:
         optimizer = create_optimizer(args, model, **kwargs)
-    elif args.algorithm in ['DPSGD', 'DCD_PSGD', 'CHOCO_SGD', 'SAPS_FL']:
+    elif args.algorithm in ['DPSGD', 'DCD_PSGD', 'CHOCO_SGD', 'SAPS_FL', 'RAFT_GossipFL']:
         params = make_initial_param_groups(args, model)
         optimizer = create_optimizer(args, None, params, **kwargs)
     else:
