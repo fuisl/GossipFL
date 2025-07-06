@@ -1,367 +1,158 @@
-"""
-RAFT Service Discovery Bridge
-
-Simple bridge between service discovery events and RAFT consensus operations.
-When nodes are discovered/lost, this bridge converts them to RAFT membership proposals.
-"""
-
 import logging
 import threading
 import time
-from typing import Optional, Dict, Any, Callable, List
-
+from .raft_messages import RaftMessage
+from .raft_consensus import RaftConsensus
 
 class RaftServiceDiscoveryBridge:
     """
-    Bridge between service discovery and RAFT consensus.
-    
-    Receives service discovery events and translates them into RAFT operations.
+    Bridge between DynamicGRPCCommManager and the new RaftConsensus.
+    Hooks:
+      • consensus → comms: send RPCs  
+      • comms → consensus: handle RPCs  
+      • discovery events → membership proposals
+      • membership commits → comm manager registry updates
     """
-    
-    def __init__(self, node_id: int, raft_consensus=None, worker_manager=None):
-        """
-        Initialize the service discovery bridge.
-        
-        Args:
-            node_id: Local node identifier
-            raft_consensus: RAFT consensus manager (can be set later)
-            worker_manager: Worker manager for sending messages (can be set later)
-        """
-        self.node_id = node_id
-        self.raft_consensus = raft_consensus
-        self.worker_manager = worker_manager
-        self.comm_manager = None
+    def __init__(self, consensus: RaftConsensus, comm_manager):
+        self.consensus    = consensus
+        self.comm_manager = comm_manager
         self.lock = threading.RLock()
-        
-        logging.info(f"Service discovery bridge initialized for node {node_id}")
-    
-    def set_raft_consensus(self, raft_consensus):
-        """Set the RAFT consensus manager reference."""
-        with self.lock:
-            self.raft_consensus = raft_consensus
-            logging.info(f"Bridge: RAFT consensus manager set for node {self.node_id}")
-    
-    def set_consensus_manager(self, consensus_manager):
-        """Set the consensus manager reference (alias for set_raft_consensus)."""
-        self.set_raft_consensus(consensus_manager)
-    
-    def register_with_comm_manager(self, comm_manager):
-        """
-        Register the bridge with the communication manager.
-        
-        This replaces the original callbacks with bridge-aware versions.
-        
-        Args:
-            comm_manager: The DynamicGRPCCommManager instance
-        """
-        with self.lock:
-            self.comm_manager = comm_manager
-            
-            # Store original callbacks if they exist
-            self._original_on_node_discovered = getattr(comm_manager, 'on_node_discovered', None)
-            self._original_on_node_lost = getattr(comm_manager, 'on_node_lost', None)
-            
-            # Replace callbacks with bridge versions
-            comm_manager.on_node_discovered = self._on_node_discovered_bridge
-            comm_manager.on_node_lost = self._on_node_lost_bridge
-            
-            logging.info(f"Bridge: Registered with communication manager for node {self.node_id}")
-    
-    def _on_node_discovered_bridge(self, discovered_node_id: int, node_info):
-        """Bridge callback for node discovered events."""
-        try:
-            # Skip self-events
-            if discovered_node_id == self.node_id:
-                return
-                
-            logging.info(f"Bridge: Node {discovered_node_id} discovered")
-            
-            # Process through RAFT if we have consensus manager
-            if self.raft_consensus:
-                self._propose_add_node(discovered_node_id, node_info)
-            
-            # Call original callback if it exists
-            if self._original_on_node_discovered:
-                self._original_on_node_discovered(discovered_node_id, node_info)
-                
-        except Exception as e:
-            logging.error(f"Bridge: Error processing node discovered event for {discovered_node_id}: {e}")
-    
-    def _on_node_lost_bridge(self, lost_node_id: int):
-        """Bridge callback for node lost events."""
-        try:
-            # Skip self-events
-            if lost_node_id == self.node_id:
-                return
-                
-            logging.info(f"Bridge: Node {lost_node_id} lost")
-            
-            # Process through RAFT if we have consensus manager
-            if self.raft_consensus:
-                self._propose_remove_node(lost_node_id)
-            
-            # Call original callback if it exists
-            if self._original_on_node_lost:
-                self._original_on_node_lost(lost_node_id)
-                
-        except Exception as e:
-            logging.error(f"Bridge: Error processing node lost event for {lost_node_id}: {e}")
-    
-    def _propose_add_node(self, node_id: int, node_info):
-        """Propose adding a node through RAFT consensus."""
-        try:
-            # Handle both dictionary and object formats for node_info
-            if isinstance(node_info, dict):
-                connection_info = {
-                    'ip_address': node_info.get('ip_address', 'localhost'),
-                    'port': node_info.get('port', 9000 + node_id),
-                    'capabilities': node_info.get('capabilities', ['grpc', 'fedml']),
-                    'timestamp': node_info.get('timestamp', time.time())
-                }
-            else:
-                connection_info = {
-                    'ip_address': getattr(node_info, 'ip_address', 'localhost'),
-                    'port': getattr(node_info, 'port', 9000 + node_id),
-                    'capabilities': getattr(node_info, 'capabilities', ['grpc', 'fedml']),
-                    'timestamp': getattr(node_info, 'timestamp', time.time())
-                }
-            
-            success = self.raft_consensus.propose_membership_change(
-                action='add',
-                node_id=node_id,
-                node_info=connection_info,
-                reason='service_discovery'
-            )
-            
-            if success:
-                logging.info(f"Bridge: Proposed adding node {node_id} with connection info: "
-                            f"{connection_info['ip_address']}:{connection_info['port']}")
-            else:
-                logging.warning(f"Bridge: Failed to propose adding node {node_id}")
-                
-        except Exception as e:
-            logging.error(f"Bridge: Failed to propose adding node {node_id}: {e}")
-    
-    def _propose_remove_node(self, node_id: int):
-        """Propose removing a node through RAFT consensus."""
-        try:
-            # Create membership entry data
-            entry_data = {
-                'node_id': node_id,
-                'action': 'remove'
-            }
-            
-            # Propose through RAFT consensus
-            self.raft_consensus.propose_membership_change('remove', entry_data)
-            logging.info(f"Bridge: Proposed removing node {node_id} through RAFT")
-            
-        except Exception as e:
-            logging.error(f"Bridge: Failed to propose removing node {node_id}: {e}")
-    
-    def handle_join_request(self, joining_node_id: int, node_info: Dict[str, Any]) -> bool:
-        """
-        Handle a join request from a new node.
-        
-        Args:
-            joining_node_id: ID of the node requesting to join
-            node_info: Information about the joining node
-            
-        Returns:
-            True if join request was processed, False otherwise
-        """
-        try:
-            logging.info(f"Bridge: Handling join request from node {joining_node_id}")
-            
-            # Check if we have RAFT consensus
-            if not self.raft_consensus:
-                logging.warning(f"Bridge: No RAFT consensus manager for join request")
-                return False
-            
-            # Only leaders can process join requests
-            if not self.raft_consensus.is_leader():
-                logging.info(f"Bridge: Not leader, forwarding join request to leader")
-                return self._forward_join_request_to_leader(joining_node_id, node_info)
-            
-            # Propose adding the node
-            self._propose_add_node(joining_node_id, node_info)
-            return True
-            
-        except Exception as e:
-            logging.error(f"Bridge: Error handling join request from {joining_node_id}: {e}")
-            return False
-    
-    def handle_node_discovered(self, node_id: int, node_info: Dict[str, Any] = None):
-        """Handle a node discovery event for joining the cluster."""
-        try:
-            # If this is self-discovery, send join request to discovered nodes
-            if node_id == self.node_id:
-                logging.info(f"Bridge: Self-discovery for node {node_id}, sending join request")
-                
-                # Get discovered nodes from communication manager
-                if not self.comm_manager:
-                    logging.error(f"Bridge: No communication manager available")
-                    return False
-                
-                cluster_nodes = self.comm_manager.get_cluster_nodes_info()
-                other_nodes = [n for n in cluster_nodes.keys() if n != self.node_id]
-                
-                if not other_nodes:
-                    logging.warning(f"Bridge: No other nodes discovered, cannot join cluster")
-                    return False
-                
-                # Create default node info if not provided
-                if node_info is None:
-                    node_info = {
-                        'node_id': node_id,
-                        'ip_address': 'localhost',
-                        'port': 9000 + node_id,
-                        'capabilities': ['grpc', 'fedml'],
-                        'timestamp': time.time()
-                    }
-                
-                # Send join request to the first discovered node (assume it's leader or will forward)
-                target_node = other_nodes[0]
-                
-                if hasattr(self, 'worker_manager') and self.worker_manager:
-                    self.worker_manager.send_join_request(target_node, node_info)
-                    logging.info(f"Bridge: Sent join request to node {target_node}")
-                    return True
-                else:
-                    logging.error(f"Bridge: No worker manager available to send join request")
-                    return False
-        
-            else:
-                logging.info(f"Bridge: Node {node_id} discovered - connection info: {node_info}")
-                return True
-                    
-        except Exception as e:
-            logging.error(f"Bridge: Error handling node discovered event for {node_id}: {e}")
-            return False
 
-    def on_membership_change(self, new_nodes: set, round_num: int = 0):
-        """
-        Handle membership change notifications from RAFT consensus.
-        
-        This is called when RAFT consensus has applied a membership change.
-        
-        Args:
-            new_nodes: Set of all current cluster nodes
-            round_num: Training round number (if applicable)
-        """
-        try:
-            logging.info(f"Bridge: Membership changed to {new_nodes}")
-            
-            # Update communication manager's node registry
-            if self.comm_manager:
-                self._update_comm_manager_registry(new_nodes)
-                
-        except Exception as e:
-            logging.error(f"Bridge: Error handling membership change: {e}")
-    
-    def _update_comm_manager_registry(self, new_nodes: set):
-        """Update the communication manager's node registry with new membership."""
-        try:
-            # Convert node set to cluster info format
-            cluster_info = {'nodes': []}
-            
-            for node_id in new_nodes:
-                try:
-                    # Get node info from comm manager if available
-                    node_info = self.comm_manager.get_node_info(node_id)
-                    cluster_info['nodes'].append({
-                        'node_id': node_id,
-                        'ip_address': node_info.ip_address,
-                        'port': node_info.port
-                    })
-                except Exception as e:
-                    logging.warning(f"Bridge: Could not get info for node {node_id}: {e}")
-            
-            # Update the registry
-            if hasattr(self.comm_manager, '_update_node_registry_from_discovery'):
-                self.comm_manager._update_node_registry_from_discovery(cluster_info)
-                logging.info(f"Bridge: Updated comm manager registry with {len(cluster_info['nodes'])} nodes")
-            
-        except Exception as e:
-            logging.error(f"Bridge: Failed to update comm manager registry: {e}")
-    
-    def stop(self):
-        """
-        Stop the service discovery bridge and clean up resources.
-        """
-        try:
-            with self.lock:
-                logging.info(f"Bridge: Stopping service discovery bridge for node {self.node_id}")
-                
-                # Restore original callbacks if we have a comm manager
-                if self.comm_manager:
-                    if hasattr(self, '_original_on_node_discovered'):
-                        self.comm_manager.on_node_discovered = self._original_on_node_discovered
-                    if hasattr(self, '_original_on_node_lost'):
-                        self.comm_manager.on_node_lost = self._original_on_node_lost
-                
-                # Clear references
-                self.raft_consensus = None
-                self.comm_manager = None
-                
-                logging.info(f"Bridge: Service discovery bridge stopped for node {self.node_id}")
-                
-        except Exception as e:
-            logging.error(f"Bridge: Error stopping service discovery bridge: {e}")
+        # 1) Register ourselves with the comm layer
+        comm_manager.register_service_discovery_bridge(self)
 
-    def _forward_join_request_to_leader(self, joining_node_id: int, node_info: Dict[str, Any]) -> bool:
-        """Forward join request to the current leader."""
-        try:
-            # Get the current leader from RAFT consensus
-            leader_id = self.raft_consensus.get_current_leader()
-            
-            if leader_id is None:
-                logging.warning(f"Bridge: No known leader to forward join request")
-                return False
-            
-            # Send join request message to leader
-            if hasattr(self, 'worker_manager') and self.worker_manager:
-                self.worker_manager.send_join_request(leader_id, node_info)
-                logging.info(f"Bridge: Forwarded join request from {joining_node_id} to leader {leader_id}")
-                return True
-            else:
-                logging.error(f"Bridge: No worker manager available to forward join request")
-                return False
-                
-        except Exception as e:
-            logging.error(f"Bridge: Error forwarding join request to leader: {e}")
-            return False
-        
-    def set_worker_manager(self, worker_manager):
-        """Set the worker manager reference."""
-        with self.lock:
-            self.worker_manager = worker_manager
-            logging.info(f"Bridge: Worker manager set for node {self.node_id}")
+        # 2) Wire consensus → comms
+        self._wire_consensus_to_comm()
 
-    def set_comm_manager_callbacks(self, on_membership_change: Callable, on_node_registry_update: Callable):
-        """
-        Set callbacks to notify the communication manager of changes.
-        
-        Args:
-            on_membership_change: Callback for individual membership changes
-            on_node_registry_update: Callback for full registry updates
-        """
-        self.on_membership_change = on_membership_change
-        self.on_node_registry_update = on_node_registry_update
+        # 3) Wire comms → consensus
+        self._wire_comm_to_consensus()
 
-    def _notify_comm_manager_membership_change(self, action: str, node_id: int, node_info: Dict = None):
-        """Notify communication manager of membership changes."""
-        try:
-            if hasattr(self, 'on_membership_change') and self.on_membership_change:
-                self.on_membership_change(action, node_id, node_info)
-                logging.debug(f"Notified comm manager: {action} node {node_id}")
-        except Exception as e:
-            logging.error(f"Error notifying comm manager of membership change: {e}")
+        # 4) Hook comm_manager membership callbacks
+        comm_manager.on_node_discovered = self._on_node_discovered
+        comm_manager.on_node_lost       = self._on_node_lost
 
-    def _notify_comm_manager_full_update(self, node_list: List[Dict]):
-        """Notify communication manager of complete registry update."""
-        try:
-            if hasattr(self, 'on_node_registry_update') and self.on_node_registry_update:
-                self.on_node_registry_update(node_list)
-                logging.debug(f"Notified comm manager: full update with {len(node_list)} nodes")
-        except Exception as e:
-            logging.error(f"Error notifying comm manager of registry update: {e}")
+        # 5) Hook consensus commit callbacks
+        consensus.raft_node.on_membership_change = self._on_commit_membership
+        consensus.raft_node.on_commit = self._on_commit_any
+
+        logging.info("RaftServiceDiscoveryBridge initialized")
+
+    def _wire_consensus_to_comm(self):
+        cm = self.comm_manager.send_raft_message
+        rn = self.consensus.raft_node
+
+        rn.on_send_prevote   = lambda cid, term, lli, llt: cm(_msg(RaftMessage.MSG_TYPE_PREVOTE_REQUEST,
+                                                                   term=term,
+                                                                   candidate_id=cid,
+                                                                   last_log_index=lli,
+                                                                   last_log_term=llt))
+        rn.on_send_vote      = lambda cid, term, lli, llt: cm(_msg(RaftMessage.MSG_TYPE_REQUEST_VOTE,
+                                                                   term=term,
+                                                                   candidate_id=cid,
+                                                                   last_log_index=lli,
+                                                                   last_log_term=llt))
+        rn.on_send_append    = lambda peer, term, lid, pli, plt, entries, lcommit: cm(
+                                   _msg(RaftMessage.MSG_TYPE_APPEND_ENTRIES,
+                                        leader_id=lid,
+                                        term=term,
+                                        prev_log_index=pli,
+                                        prev_log_term=plt,
+                                        entries=entries,
+                                        leader_commit=lcommit),
+                                   receiver=peer)
+        rn.on_send_snapshot  = lambda peer, term, lid, idx, term0, data: cm(
+                                   _msg(RaftMessage.MSG_TYPE_INSTALL_SNAPSHOT,
+                                        leader_id=lid,
+                                        term=term,
+                                        last_included_index=idx,
+                                        last_included_term=term0,
+                                        data=data),
+                                   receiver=peer)
+
+        # And the responses...
+        rn.on_send_prevote_response = lambda peer, term, granted: cm(
+                                          _msg(RaftMessage.MSG_TYPE_PREVOTE_RESPONSE,
+                                               term=term,
+                                               vote_granted=granted),
+                                          receiver=peer)
+        rn.on_send_vote_response   = lambda peer, term, granted: cm(
+                                          _msg(RaftMessage.MSG_TYPE_VOTE_RESPONSE,
+                                               term=term,
+                                               vote_granted=granted),
+                                          receiver=peer)
+        rn.on_send_append_response = lambda peer, term, success, match_idx: cm(
+                                          _msg(RaftMessage.MSG_TYPE_APPEND_RESPONSE,
+                                               term=term,
+                                               success=success,
+                                               match_index=match_idx),
+                                          receiver=peer)
+
+    def _wire_comm_to_consensus(self):
+        # whenever comm manager sees an envelope, it will call us
+        cm = self.comm_manager
+        # hook your own filtering in comm_manager.send_raft_message handler
+        cm.add_raft_handler(RaftMessage.MSG_TYPE_PREVOTE_REQUEST,
+                            lambda p: self.consensus.handle_prevote_request(**p))
+        cm.add_raft_handler(RaftMessage.MSG_TYPE_PREVOTE_RESPONSE,
+                            lambda p: self.consensus.handle_prevote_response(**p))
+        cm.add_raft_handler(RaftMessage.MSG_TYPE_REQUEST_VOTE,
+                            lambda p: self.consensus.handle_vote_request(**p))
+        cm.add_raft_handler(RaftMessage.MSG_TYPE_VOTE_RESPONSE,
+                            lambda p: self.consensus.handle_vote_response(**p))
+        cm.add_raft_handler(RaftMessage.MSG_TYPE_APPEND_ENTRIES,
+                            lambda p: self.consensus.handle_append_entries(**p))
+        cm.add_raft_handler(RaftMessage.MSG_TYPE_APPEND_RESPONSE,
+                            lambda p: self.consensus.handle_append_response(**p))
+        cm.add_raft_handler(RaftMessage.MSG_TYPE_INSTALL_SNAPSHOT,
+                            lambda p: self.consensus.handle_install_snapshot(**p))
+
+    def _on_node_discovered(self, node_id, node_info):
+        # skip self
+        if node_id == self.consensus.raft_node.node_id:
+            return
+        logging.info(f"Bridge: node discovered {node_id}")
+        self.consensus.propose_membership_change(
+            action='add',
+            node_id=node_id,
+            node_info=node_info,
+            reason='service_discovery'
+        )
+
+    def _on_node_lost(self, node_id):
+        if node_id == self.consensus.raft_node.node_id:
+            return
+        logging.info(f"Bridge: node lost {node_id}")
+        self.consensus.propose_membership_change(
+            action='remove',
+            node_id=node_id,
+            reason='service_discovery_lost'
+        )
+
+    def _on_commit_membership(self, new_nodes: set, round_num=0):
+        # consensus has applied a membership log entry
+        # notify comm manager to rebuild its registry
+        node_list = []
+        for nid in new_nodes:
+            info = self.comm_manager.get_node_info(nid)
+            node_list.append({
+                'node_id': nid,
+                'ip_address': info.ip_address,
+                'port': info.port,
+                'capabilities': info.capabilities,
+                'metadata': info.metadata
+            })
+        # full update
+        self.comm_manager._on_bridge_node_registry_update(node_list)
+
+    def _on_commit_any(self, entry):
+        # if it's a coordinator entry, notify worker manager, etc.
+        # leave defaults in RaftConsensus
+        pass
+
+def _msg(msg_type: int, receiver=None, **kwargs):
+    envelope = { RaftMessage.ARG_TYPE: msg_type }
+    envelope.update(kwargs)
+    # allow override of "receiver" for per-peer RPCs
+    if receiver is not None:
+        envelope[RaftMessage.ARG_RECEIVER] = receiver
+    return envelope
