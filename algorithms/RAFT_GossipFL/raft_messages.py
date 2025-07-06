@@ -64,6 +64,12 @@ class RaftMessage:
     ARG_TIMESTAMP               = "timestamp"
     ARG_JOIN_APPROVED           = "join_approved"
 
+    # Re-export Message constants for use in RAFT code
+    MSG_ARG_KEY_SENDER = "sender"
+    MSG_ARG_KEY_RECEIVER = "receiver"
+    MSG_ARG_KEY_TYPE = "msg_type"
+    MSG_ARG_COORDINATOR = "coordinator"  # Used for coordinator ID in state packages
+
 
 class LogEntryType:
     """
