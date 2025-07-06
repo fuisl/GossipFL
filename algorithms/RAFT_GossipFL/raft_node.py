@@ -683,10 +683,9 @@ class RaftNode:
             leader_commit (int): Leader's commit index
             
         Returns:
-            tuple: (current_term, success, hint) where:
+            tuple: (current_term, success) where:
                 - current_term: follower's current term for leader to update if needed
                 - success: True if append was successful, False otherwise
-                - hint: suggested next_index for leader to retry with (None if success or no hint)
         """
         with self.state_lock:
             try:
@@ -701,7 +700,7 @@ class RaftNode:
                 if self.state == RaftState.INITIAL:
                     if not self._is_ready_for_cluster_participation():
                         logging.debug(f"Node {self.node_id}: Rejecting AppendEntries in INITIAL state - not ready")
-                        return self.current_term, False, None
+                        return self.current_term, False
                     
                     # Ready to accept leadership - transition to follower
                     logging.info(f"Node {self.node_id}: Converting from INITIAL to FOLLOWER on receiving AppendEntries")
@@ -710,7 +709,7 @@ class RaftNode:
                 # If term < currentTerm, reject
                 if term < self.current_term:
                     logging.info(f"Node {self.node_id}: Rejecting AppendEntries with term {term} < current term {self.current_term}")
-                    return self.current_term, False, None
+                    return self.current_term, False
                 
                 # If term > currentTerm, convert to follower
                 if term > self.current_term:
@@ -754,17 +753,13 @@ class RaftNode:
                     elif array_idx >= len(self.log) or array_idx < 0:
                         log_ok = False
                         reason = f"prev_log_index ({prev_log_index}) outside log range"
-                        # Provide hint for leader to retry - suggest where our log actually starts
-                        hint = max(self.first_log_index - 1, self.last_snapshot_index) if len(self.log) > 0 else self.last_snapshot_index
-                        logging.info(f"Node {self.node_id}: Log consistency check failed: {reason}, suggesting retry from index {hint}")
-                        return self.current_term, False, hint
+                        logging.info(f"Node {self.node_id}: Log consistency check failed: {reason}")
+                        return self.current_term, False
                     elif self.log[array_idx]['term'] != prev_log_term:
                         log_ok = False
                         reason = f"term mismatch at prev_log_index {prev_log_index}: expected term {prev_log_term}, got {self.log[array_idx]['term']}"
-                        # Provide hint to help leader find the right index
-                        hint = max(prev_log_index - 1, self.first_log_index - 1, self.last_snapshot_index)
-                        logging.info(f"Node {self.node_id}: Log consistency check failed: {reason}, suggesting retry from index {hint}")
-                        return self.current_term, False, hint
+                        logging.info(f"Node {self.node_id}: Log consistency check failed: {reason}")
+                        return self.current_term, False
                     else:
                         log_ok = True
                         reason = "log consistency check passed"
@@ -773,7 +768,7 @@ class RaftNode:
                         f"Node {self.node_id}: Log consistency check: {log_ok}, {reason}")
                 
                 if not log_ok:
-                    return self.current_term, False, None
+                    return self.current_term, False
                 
                 # --- Step 3: Process entries ---
                 
@@ -827,12 +822,12 @@ class RaftNode:
                         logging.info(f"Node {self.node_id}: Updated commit index from {old_commit_index} to {self.commit_index}")
                         self.apply_committed_entries()
                 
-                return self.current_term, True, None
+                return self.current_term, True
                 
             except Exception as e:
                 logging.error(f"Node {self.node_id}: Error processing AppendEntries: {e}", exc_info=True)
                 # On error, it's safer to reject the append
-                return self.current_term, False, None
+                return self.current_term, False
     
     def compact_log(self, up_to_index=None):
         """
@@ -1798,3 +1793,146 @@ class RaftNode:
             except Exception as e:
                 logging.error(f"Leader {self.node_id}: Error creating read barrier: {e}")
                 return -1
+    
+    def send_heartbeats(self):
+        """Send heartbeat messages to all followers via callbacks."""
+        with self.lock:
+            if self.state != RaftState.LEADER:
+                return
+            
+            for node_id in self.known_nodes:
+                if node_id == self.node_id:
+                    continue  # Skip self
+                
+                try:
+                    next_index = self.next_index.get(
+                        node_id, self.first_log_index + len(self.log)
+                    )
+                    
+                    if next_index <= self.last_snapshot_index:
+                        # Follower is too far behind, send snapshot
+                        if callable(self.on_send_snapshot):
+                            self.on_send_snapshot(
+                                node_id, 
+                                self.current_term, 
+                                self.node_id, 
+                                self.last_snapshot_index, 
+                                self.last_snapshot_term, 
+                                self.log  # snapshot data
+                            )
+                        continue
+                    
+                    prev_log_index = next_index - 1
+                    prev_log_term = self.get_term_at_index(prev_log_index)
+                    
+                    # Send heartbeat (empty append entries)
+                    if callable(self.on_send_append):
+                        self.on_send_append(
+                            node_id,
+                            self.current_term,
+                            self.node_id,
+                            prev_log_index,
+                            prev_log_term,
+                            [],  # Empty entries for heartbeat
+                            self.commit_index
+                        )
+                        
+                except Exception as e:
+                    logging.error(f"Node {self.node_id}: Error sending heartbeat to {node_id}: {e}")
+    
+    def replicate_logs(self):
+        """Replicate log entries to followers via callbacks."""
+        with self.lock:
+            if self.state != RaftState.LEADER:
+                return
+            
+            for node_id in self.known_nodes:
+                if node_id == self.node_id:
+                    continue  # Skip self
+                
+                try:
+                    next_index = self.next_index.get(
+                        node_id, self.first_log_index + len(self.log)
+                    )
+                    
+                    if next_index <= self.last_snapshot_index:
+                        # Follower is too far behind, send snapshot
+                        if callable(self.on_send_snapshot):
+                            self.on_send_snapshot(
+                                node_id, 
+                                self.current_term, 
+                                self.node_id, 
+                                self.last_snapshot_index, 
+                                self.last_snapshot_term, 
+                                self.log  # snapshot data
+                            )
+                        continue
+                    
+                    array_idx = next_index - self.first_log_index
+                    if array_idx < len(self.log):
+                        # There are entries to replicate
+                        entries_to_send = self.log[array_idx:]
+                        
+                        prev_log_index = next_index - 1
+                        prev_log_term = self.get_term_at_index(prev_log_index)
+                        
+                        # Send append entries with new log entries
+                        if callable(self.on_send_append):
+                            self.on_send_append(
+                                node_id,
+                                self.current_term,
+                                self.node_id,
+                                prev_log_index,
+                                prev_log_term,
+                                entries_to_send,
+                                self.commit_index
+                            )
+                    
+                except Exception as e:
+                    logging.error(f"Node {self.node_id}: Error replicating logs to {node_id}: {e}")
+    
+    def request_votes_from_all(self):
+        """Request votes from all known nodes via callbacks."""
+        with self.lock:
+            if self.state != RaftState.CANDIDATE:
+                return
+            
+            last_log_index, last_log_term = self.get_last_log_info()
+            
+            for node_id in self.known_nodes:
+                if node_id == self.node_id:
+                    continue  # Skip self
+                
+                try:
+                    # Send vote request via callback
+                    if callable(self.on_send_vote):
+                        self.on_send_vote(
+                            node_id,
+                            self.current_term,
+                            self.node_id,
+                            last_log_index,
+                            last_log_term
+                        )
+                        
+                except Exception as e:
+                    logging.error(f"Node {self.node_id}: Error requesting vote from {node_id}: {e}")
+    
+    def should_replicate_logs(self):
+        """Check if there are logs to replicate."""
+        with self.lock:
+            if self.state != RaftState.LEADER:
+                return False
+            
+            # Check if any follower's next_index is behind our log
+            for node_id in self.known_nodes:
+                if node_id == self.node_id:
+                    continue
+                
+                next_index = self.next_index.get(
+                    node_id, self.first_log_index + len(self.log)
+                )
+                
+                if next_index < self.first_log_index + len(self.log):
+                    return True
+            
+            return False
