@@ -91,6 +91,19 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         # Used to trigger next training round - should be integrated with round_start_authorized
         self.round_start_event = threading.Event()  # Used to trigger next training round
         
+        # Add RAFT-specific coordinator tracking (similar to legacy SAPS_FL)
+        self.flag_client_finish_dict = dict()
+        for client_index in range(size):  # Use initial size, will be updated dynamically
+            self.flag_client_finish_dict[client_index] = False
+            
+        # Coordinator synchronization events
+        self.all_clients_finish_event = threading.Event()
+        self.total_metric_lock = threading.Lock()
+        self.start_epoch_event = threading.Event()  # For legacy compatibility
+        
+        # Running flag for clean shutdown
+        self.running = True
+        
         # # Override SAPS_FL coordinator detection
         # self._override_saps_coordinator_logic()
         
@@ -411,11 +424,19 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                 
                 for iteration in range(self.worker.num_iterations):
                     self.iteration = iteration
-                    logging.debug("Waiting for RAFT authorization to start round")
+                    logging.debug(f"Node {self.node_id}: Starting iteration {iteration}, waiting for RAFT authorization")
                     
                     # Wait for RAFT consensus to authorize the round start
-                    self.round_start_authorized.wait()
-                    logging.debug("RAFT authorized round start, beginning iteration")
+                    # This is the key synchronization point that replaces MPI barriers
+                    authorized = self.round_start_authorized.wait(timeout=60.0)  # 60 second timeout
+                    if not authorized:
+                        logging.error(f"Node {self.node_id}: Timeout waiting for round authorization")
+                        continue
+                        
+                    logging.debug(f"Node {self.node_id}: RAFT authorized round start, beginning iteration {iteration}")
+                    
+                    # Clear the authorization for the next round (moved to after training)
+                    # self.round_start_authorized.clear()  # Don't clear here, clear after training completes
                     
                     # Get model params
                     from utils.data_utils import get_data
@@ -485,9 +506,25 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                             = self.worker.train_one_step(self.epoch, self.iteration,
                                                             self.train_tracker, self.metrics)
 
-                    # Clear events for next iteration
-                    self.round_start_authorized.clear()
+                    # Clear events for next iteration and signal completion to coordinator
+                    self.round_start_authorized.clear()  # Clear authorization after successful completion
                     self.sync_receive_all_event.clear()
+
+                    # Report completion to coordinator and signal that we're ready for the next round
+                    self.test_and_send_to_coordinator(iteration, epoch)
+                    
+                    # For coordinator nodes, signal that this client has finished
+                    if hasattr(self, 'flag_client_finish_dict') and self.node_id in self.flag_client_finish_dict:
+                        self.flag_client_finish_dict[self.node_id] = True
+                        logging.debug(f"Node {self.node_id}: Marked self as finished for round")
+                        
+                        # If coordinator, check if all clients finished and can start next round
+                        if self.is_coordinator and hasattr(self, 'check_worker_finish_and_notify'):
+                            try:
+                                # This will trigger notify_clients() if all workers are done
+                                self.check_worker_finish_and_notify()
+                            except Exception as e:
+                                logging.error(f"Node {self.node_id}: Error checking worker finish: {e}", exc_info=True)
 
                     """
                         Before send msg to coordinator,
@@ -918,36 +955,102 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         """
         Handle committed log entries from RAFT.
         
+        This is the critical method that connects RAFT consensus to training coordination.
+        When the RAFT leader commits entries, this method processes them and triggers
+        the appropriate training synchronization events.
+        
         Args:
             log_entry: The committed log entry containing state updates
         """
-        if log_entry.get('type') == 'topology_update':
-            topology_data = log_entry.get('topology')
-            bandwidth_data = log_entry.get('bandwidth')
-            round_num = log_entry.get('round')
+        try:
+            entry_type = log_entry.get('type')
             
-            logging.info(f"Applying RAFT topology update for round {round_num}")
+            logging.debug(f"Node {self.node_id}: Processing committed RAFT entry: {entry_type}")
             
-            # Update topology manager with RAFT-committed topology
-            self.topology_manager.topology = topology_data
-            self.topology_manager.bandwidth = bandwidth_data
-            self.current_topology = topology_data
-            self.current_bandwidth = bandwidth_data
-            
-            # Signal that topology is ready
-            self.topology_ready_event.set()
-            
-        elif log_entry.get('type') == 'round_start':
-            round_num = log_entry.get('round')
-            
-            logging.info(f"RAFT authorized round {round_num} start")
-            self.raft_round_state = log_entry
-            self.round_start_authorized.set()
-            
-        elif log_entry.get('type') == 'member_change':
-            # Handle dynamic membership changes
-            new_members = log_entry.get('members')
-            logging.info(f"RAFT membership change: {new_members}")
+            if entry_type == 'topology_update':
+                # Handle both old and new topology update formats
+                topology_data = log_entry.get('topology') or log_entry.get('data', {}).get('topology_matrix')
+                bandwidth_data = log_entry.get('bandwidth') or log_entry.get('data', {}).get('bandwidth_matrix')
+                round_num = log_entry.get('round') or log_entry.get('data', {}).get('round', 0)
+                
+                logging.info(f"Node {self.node_id}: Applying RAFT topology update for round {round_num}")
+                
+                # Update topology manager with RAFT-committed topology
+                if topology_data and hasattr(self, 'topology_manager'):
+                    self.topology_manager.topology = topology_data
+                    self.current_topology = topology_data
+                    
+                if bandwidth_data and hasattr(self, 'topology_manager'):
+                    self.topology_manager.bandwidth = bandwidth_data
+                    self.current_bandwidth = bandwidth_data
+                
+                # Signal that topology is ready
+                if hasattr(self, 'topology_ready_event'):
+                    self.topology_ready_event.set()
+                    
+            elif entry_type == 'round_start':
+                # This is the key entry that triggers training rounds
+                round_num = log_entry.get('round') or log_entry.get('data', {}).get('round', 0)
+                coordinator_id = log_entry.get('coordinator_id') or log_entry.get('data', {}).get('coordinator_id')
+                
+                logging.info(f"Node {self.node_id}: RAFT authorized round {round_num} start (coordinator: {coordinator_id})")
+                
+                # Store round state and update tracking
+                self.raft_round_state = log_entry
+                if hasattr(self, 'global_round_idx'):
+                    self.global_round_idx = round_num
+                
+                # Signal that this round is authorized to proceed - this is the key for training sync
+                if hasattr(self, 'round_start_authorized'):
+                    self.round_start_authorized.set()
+                    logging.debug(f"Node {self.node_id}: Set round_start_authorized for round {round_num}")
+                
+                # Also trigger the general round start event for compatibility
+                if hasattr(self, 'round_start_event'):
+                    self.round_start_event.set()
+                    
+                # If we have the legacy start_epoch_event, trigger it too for compatibility with SAPS_FL
+                if hasattr(self, 'start_epoch_event'):
+                    self.start_epoch_event.set()
+                    logging.debug(f"Node {self.node_id}: Set start_epoch_event for legacy compatibility")
+                    
+            elif entry_type == 'member_change':
+                # Handle dynamic membership changes
+                new_members = log_entry.get('members') or log_entry.get('data', {}).get('nodes', set())
+                action = log_entry.get('action') or log_entry.get('data', {}).get('action', 'unknown')
+                round_num = log_entry.get('round') or log_entry.get('data', {}).get('round', 0)
+                
+                logging.info(f"Node {self.node_id}: RAFT membership change - {action}, members: {new_members}")
+                
+                # Trigger membership change handling
+                if hasattr(self, 'on_membership_change'):
+                    self.on_membership_change(new_members, round_num=round_num)
+                    
+            elif entry_type == 'coordinator_change':
+                # Handle coordinator changes
+                new_coordinator = log_entry.get('coordinator_id') or log_entry.get('data', {}).get('coordinator_id')
+                old_coordinator = log_entry.get('old_coordinator_id') or log_entry.get('data', {}).get('old_coordinator_id')
+                round_num = log_entry.get('round') or log_entry.get('data', {}).get('round', 0)
+                
+                if new_coordinator is not None:
+                    logging.info(f"Node {self.node_id}: RAFT coordinator change from {old_coordinator} to {new_coordinator}")
+                    
+                    # Update coordinator tracking
+                    self.coordinator_id = new_coordinator
+                    was_coordinator = self.is_coordinator
+                    self.is_coordinator = (new_coordinator == self.node_id)
+                    
+                    # If we became coordinator, start coordinator duties
+                    if self.is_coordinator and not was_coordinator:
+                        self.on_become_coordinator(round_num)
+                    elif not self.is_coordinator and was_coordinator:
+                        logging.info(f"Node {self.node_id}: No longer coordinator")
+                        
+            else:
+                logging.debug(f"Node {self.node_id}: Unknown entry type in RAFT commit: {entry_type}")
+                
+        except Exception as e:
+            logging.error(f"Node {self.node_id}: Error handling RAFT state commit: {e}", exc_info=True)
             self.handle_membership_change(new_members)
     
     def handle_committed_entry(self, entry):
@@ -1293,6 +1396,116 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             entries, 
             commit_index
         )
+
+    def run_coordinator(self):
+        """
+        Run the RAFT-based coordinator duties.
+        
+        This replaces the legacy MPI barrier-based coordinator with RAFT consensus-driven
+        coordination. The coordinator (RAFT leader) drives training rounds by proposing
+        log entries that trigger round starts across all nodes.
+        """
+        logging.info(f"Node {self.node_id}: Starting RAFT coordinator duties")
+        
+        # Initialize coordinator state
+        round_number = 0
+        
+        try:
+            while self.is_coordinator and hasattr(self, 'running') and self.running:
+                try:
+                    # Wait for nodes to finish current round (if any)
+                    if hasattr(self, 'all_clients_finish_event'):
+                        self.all_clients_finish_event.wait(timeout=30.0)
+                        self.all_clients_finish_event.clear()
+                    
+                    # Verify we're still the leader before proposing the next round
+                    if not self.is_coordinator or self.raft_consensus.get_leader_id() != self.node_id:
+                        logging.info(f"Node {self.node_id}: No longer coordinator, stopping coordinator duties")
+                        break
+                    
+                    # Generate new topology if needed (only if coordinator)
+                    if hasattr(self, 'topology_manager') and self.topology_manager:
+                        try:
+                            self.topology_manager.generate_topology(t=round_number)
+                            
+                            # Propose topology update through RAFT consensus
+                            topology_entry = {
+                                'type': 'topology_update',
+                                'data': {
+                                    'topology_matrix': self.topology_manager.get_topology(),
+                                    'round': round_number,
+                                    'timestamp': time.time()
+                                }
+                            }
+                            self.raft_consensus.propose_entry(topology_entry)
+                            logging.debug(f"Node {self.node_id}: Proposed topology update for round {round_number}")
+                        except Exception as e:
+                            logging.error(f"Node {self.node_id}: Error updating topology: {e}", exc_info=True)
+                    
+                    # Propose the start of a new training round
+                    round_start_entry = {
+                        'type': 'round_start',
+                        'data': {
+                            'round': round_number,
+                            'coordinator_id': self.node_id,
+                            'timestamp': time.time()
+                        }
+                    }
+                    
+                    success = self.raft_consensus.propose_entry(round_start_entry)
+                    if success:
+                        logging.info(f"Node {self.node_id}: Proposed start of training round {round_number}")
+                        round_number += 1
+                    else:
+                        logging.warning(f"Node {self.node_id}: Failed to propose round start - may no longer be leader")
+                        time.sleep(1.0)  # Brief pause before retry
+                    
+                    # Brief pause to avoid overwhelming the system
+                    time.sleep(0.1)
+                    
+                except Exception as e:
+                    logging.error(f"Node {self.node_id}: Error in coordinator loop: {e}", exc_info=True)
+                    time.sleep(1.0)  # Longer pause on error
+                    
+        except Exception as e:
+            logging.error(f"Node {self.node_id}: Fatal error in coordinator: {e}", exc_info=True)
+        finally:
+            logging.info(f"Node {self.node_id}: Coordinator duties ended")
+
+    def notify_clients(self):
+        """
+        Notify all clients to start the next training round via RAFT consensus.
+        
+        This method replaces the legacy MPI-based client notification with
+        RAFT log entry proposals that trigger round starts.
+        """
+        if not self.is_coordinator:
+            logging.warning(f"Node {self.node_id}: Cannot notify clients - not coordinator")
+            return
+            
+        logging.info(f"Node {self.node_id}: Notifying clients via RAFT consensus")
+        
+        # In RAFT-based system, "notifying clients" means proposing a round_start entry
+        # This will be applied to all nodes when the log entry is committed
+        round_start_entry = {
+            'type': 'round_start',
+            'data': {
+                'round': getattr(self, 'global_round_idx', 0),
+                'coordinator_id': self.node_id,
+                'timestamp': time.time()
+            }
+        }
+        
+        success = self.raft_consensus.propose_entry(round_start_entry)
+        if success:
+            logging.info(f"Node {self.node_id}: Successfully proposed round start notification")
+        else:
+            logging.error(f"Node {self.node_id}: Failed to propose round start notification")
+            
+        # Also set local round authorization for the coordinator itself
+        if hasattr(self, 'round_start_authorized'):
+            self.round_start_authorized.set()
+            logging.debug(f"Node {self.node_id}: Set local round start authorization")
     
     def _register_raft_callbacks(self):
         """
