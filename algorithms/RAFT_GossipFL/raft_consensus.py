@@ -594,7 +594,16 @@ class RaftConsensus:
             else:
                 # If AppendEntries fails because of log inconsistency, decrement nextIndex and retry
                 if follower_id in self.raft_node.next_index:
-                    self.raft_node.next_index[follower_id] = max(1, self.raft_node.next_index[follower_id] - 1)
+                    # For nodes with empty logs (match_index=0), reset to beginning
+                    if match_index == 0:
+                        self.raft_node.next_index[follower_id] = 1
+                        logging.info(f"Node {self.raft_node.node_id}: Reset next_index for follower {follower_id} to 1 (empty log)")
+                    else:
+                        self.raft_node.next_index[follower_id] = max(1, self.raft_node.next_index[follower_id] - 1)
+                        logging.debug(f"Node {self.raft_node.node_id}: Decremented next_index for follower {follower_id} to {self.raft_node.next_index[follower_id]}")
+                    
+                    # Immediately retry with the corrected next_index
+                    self.raft_node.send_heartbeats()
     
     def add_topology_update(self, topology_data):
         """

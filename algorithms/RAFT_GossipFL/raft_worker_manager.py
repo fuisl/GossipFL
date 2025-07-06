@@ -1312,8 +1312,29 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         if hasattr(self.raft_consensus, 'raft_node') and self.raft_consensus.raft_node is not None:
             raft_node = self.raft_consensus.raft_node
             
-            # Application-specific callbacks
-            raft_node.on_commit = self.handle_committed_entry
+            # Application-specific callbacks - CHAIN with existing callbacks instead of overriding
+            existing_on_commit = getattr(raft_node, 'on_commit', None)
+            if existing_on_commit:
+                # Chain with existing callback (likely from bridge)
+                def chained_commit_handler(entry):
+                    try:
+                        # Call existing callback first (bridge)
+                        existing_on_commit(entry)
+                    except Exception as e:
+                        logging.error(f"Error in existing on_commit callback: {e}", exc_info=True)
+                    try:
+                        # Then call our handler
+                        self.handle_committed_entry(entry)
+                    except Exception as e:
+                        logging.error(f"Error in worker manager on_commit callback: {e}", exc_info=True)
+                
+                raft_node.on_commit = chained_commit_handler
+                logging.info(f"Node {self.node_id}: Chained commit callback with existing handler")
+            else:
+                # No existing callback, just set ours
+                raft_node.on_commit = self.handle_committed_entry
+                logging.info(f"Node {self.node_id}: Set worker manager commit callback")
+            
             raft_node.on_membership_change = self.on_membership_change
             
             # Communication callbacks

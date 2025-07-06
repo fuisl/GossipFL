@@ -36,6 +36,9 @@ class RaftServiceDiscoveryBridge:
         # Store original commit callback for chaining
         self._original_commit_callback = None
         
+        # Initialize recursion guard
+        self._in_commit_handler = False
+        
         # Ensure comm_manager has raft_handlers dictionary
         if not hasattr(self.comm_manager, '_raft_handlers'):
             self.comm_manager._raft_handlers = {}
@@ -217,6 +220,15 @@ class RaftServiceDiscoveryBridge:
                     data=params.get(RaftMessage.ARG_DATA)
                 )
             
+            def handle_join_request(params):
+                sender_id = params.get(RaftMessage.MSG_ARG_KEY_SENDER)
+                node_info = params.get(RaftMessage.ARG_NODE_INFO, {})
+                return self.handle_join_request(sender_id, node_info)
+            
+            def handle_join_response(params):
+                sender_id = params.get(RaftMessage.MSG_ARG_KEY_SENDER)
+                return self.handle_join_response(sender_id, params)
+            
             # Register handlers for each RAFT message type
             handler_map = {
                 RaftMessage.MSG_TYPE_PREVOTE_REQUEST: handle_prevote_request,
@@ -225,7 +237,9 @@ class RaftServiceDiscoveryBridge:
                 RaftMessage.MSG_TYPE_VOTE_RESPONSE: handle_vote_response,
                 RaftMessage.MSG_TYPE_APPEND_ENTRIES: handle_append_entries,
                 RaftMessage.MSG_TYPE_APPEND_RESPONSE: handle_append_response,
-                RaftMessage.MSG_TYPE_INSTALL_SNAPSHOT: handle_install_snapshot
+                RaftMessage.MSG_TYPE_INSTALL_SNAPSHOT: handle_install_snapshot,
+                RaftMessage.MSG_TYPE_JOIN_REQUEST: handle_join_request,
+                RaftMessage.MSG_TYPE_JOIN_RESPONSE: handle_join_response
             }
             
             # Register all handlers with error handling
@@ -382,16 +396,28 @@ class RaftServiceDiscoveryBridge:
         Args:
             entry: The committed log entry
         """
+        # Guard against infinite recursion
+        if hasattr(self, '_in_commit_handler') and self._in_commit_handler:
+            return
+        
         try:
-            # First call the original consensus commit handler if it exists
-            if self._original_commit_callback:
+            self._in_commit_handler = True
+            
+            # First call the original consensus commit handler if it exists and it's not ourselves
+            if (self._original_commit_callback and 
+                self._original_commit_callback != self._on_commit_chained):
                 self._original_commit_callback(entry)
             
             # Then call our bridge-specific commit handler for join responses
             self.on_commit(entry, entry.get('index', 0))
             
         except Exception as e:
-            logging.error(f"Error in chained commit handler: {e}", exc_info=True)
+            # Use print instead of logging to avoid potential recursion in logging
+            print(f"Error in chained commit handler: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self._in_commit_handler = False
     
     def _on_commit_any(self, entry):
         """
@@ -482,7 +508,7 @@ class RaftServiceDiscoveryBridge:
             logging.error(f"Error handling join request from {sender_id}: {e}", exc_info=True)
             self._send_join_response(sender_id, False, f"Error processing join request: {e}")
 
-    def handle_join_response(self, sender_id: int, response_params: Dict):
+    def handle_join_response(self, sender_id: int, response_params):
         """
         Handle join response from another node.
         
@@ -493,9 +519,23 @@ class RaftServiceDiscoveryBridge:
             response_params: Response parameters including status and message
         """
         try:
-            join_approved = response_params.get(RaftMessage.ARG_JOIN_APPROVED, False)
-            message = response_params.get('message', 'No message')
-            redirect_leader = response_params.get(RaftMessage.ARG_LEADER_ID)
+            # Handle both dict and protobuf message objects
+            if hasattr(response_params, 'get') and callable(response_params.get):
+                # Try dict-style access first
+                try:
+                    join_approved = response_params.get(RaftMessage.ARG_JOIN_APPROVED, False)
+                    message = response_params.get('message', 'No message')
+                    redirect_leader = response_params.get(RaftMessage.ARG_LEADER_ID)
+                except TypeError:
+                    # If that fails, try attribute access (protobuf style)
+                    join_approved = getattr(response_params, RaftMessage.ARG_JOIN_APPROVED, False)
+                    message = getattr(response_params, 'message', 'No message')
+                    redirect_leader = getattr(response_params, RaftMessage.ARG_LEADER_ID, None)
+            else:
+                # Assume it's a dict-like object with direct attribute access
+                join_approved = getattr(response_params, RaftMessage.ARG_JOIN_APPROVED, False)
+                message = getattr(response_params, 'message', 'No message')
+                redirect_leader = getattr(response_params, RaftMessage.ARG_LEADER_ID, None)
             
             logging.info(f"Bridge: Received join response from {sender_id}: approved={join_approved}, message='{message}'")
             
@@ -817,6 +857,11 @@ class RaftServiceDiscoveryBridge:
                         del self.pending_join_responses[pending_join_key]
                         logging.info(f"Bridge: Sent join response to {node_id} after commit")
                     
+                    # CRITICAL: Send snapshot to synchronize ANY newly added node
+                    # This handles both explicit join requests AND service discovery additions
+                    self._send_snapshot_to_new_node(node_id)
+                    logging.info(f"Bridge: Sending snapshot to newly added node {node_id}")
+                    
                     # Update registry with new node - this is critical for communication
                     node_info = command.get('node_info', {})
                     if node_info:
@@ -875,6 +920,71 @@ class RaftServiceDiscoveryBridge:
                     logging.info(f"Bridge: Removed node {node_id} from client registry")
         except Exception as e:
             logging.error(f"Bridge: Error notifying comm manager of membership change: {e}")
+    
+    def _send_snapshot_to_new_node(self, node_id: int):
+        """
+        Send current state snapshot to a newly joined node.
+        
+        Args:
+            node_id: ID of the newly joined node
+        """
+        try:
+            logging.info(f"Bridge: Attempting to send snapshot to node {node_id}")
+            
+            if (not hasattr(self, 'worker_manager') or not self.worker_manager or
+                not hasattr(self.worker_manager, 'raft_consensus') or 
+                not self.worker_manager.raft_consensus):
+                logging.warning(f"Bridge: Cannot send snapshot to {node_id} - no worker manager or consensus")
+                logging.debug(f"Bridge: worker_manager = {getattr(self, 'worker_manager', 'None')}")
+                return
+                
+            raft_node = self.worker_manager.raft_consensus.raft_node
+            if not raft_node or raft_node.state != RaftState.LEADER:
+                logging.warning(f"Bridge: Cannot send snapshot to {node_id} - not leader (state: {raft_node.state if raft_node else 'None'})")
+                return
+            
+            # Get current state snapshot
+            last_log_index, last_log_term = raft_node.get_last_log_info()
+            
+            # Create snapshot data with current cluster state
+            snapshot_data = {
+                'cluster_state': {
+                    'nodes': list(raft_node.known_nodes),
+                    'current_term': raft_node.current_term,
+                    'commit_index': raft_node.commit_index,
+                    'last_applied': raft_node.last_applied
+                },
+                'log_entries': raft_node.log.copy() if hasattr(raft_node, 'log') else [],
+                'metadata': {
+                    'snapshot_term': raft_node.current_term,
+                    'snapshot_index': last_log_index
+                }
+            }
+            
+            logging.info(f"Bridge: Sending snapshot to new node {node_id} (index: {last_log_index}, term: {last_log_term})")
+            
+            # Send install snapshot message
+            if hasattr(self.worker_manager, 'send_install_snapshot'):
+                logging.debug(f"Bridge: Using worker_manager.send_install_snapshot for node {node_id}")
+                self.worker_manager.send_install_snapshot(
+                    node_id=node_id,
+                    term=raft_node.current_term,
+                    last_included_index=last_log_index,
+                    last_included_term=last_log_term,
+                    data=snapshot_data
+                )
+                
+                # Reset next_index for this node to start from the snapshot
+                if hasattr(raft_node, 'next_index'):
+                    raft_node.next_index[node_id] = last_log_index + 1
+                    raft_node.match_index[node_id] = last_log_index  # Set to last_log_index, not 0
+                    logging.info(f"Bridge: Reset next_index for {node_id} to {last_log_index + 1}, match_index to {last_log_index}")
+            else:
+                logging.error(f"Bridge: Worker manager does not have send_install_snapshot method")
+                logging.debug(f"Bridge: Available worker_manager methods: {[m for m in dir(self.worker_manager) if not m.startswith('_')]}")
+                
+        except Exception as e:
+            logging.error(f"Bridge: Error sending snapshot to new node {node_id}: {e}", exc_info=True)
 def _msg(msg_type: int, receiver=None, **kwargs):
     """
     Create a message envelope for RAFT messages.
