@@ -795,8 +795,9 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             # Extract sender ID from message parameters using standardized method
             sender_id = msg_params.get_sender_id()
             node_info = msg_params.get(RaftMessage.MSG_ARG_NODE_INFO)
-            
-            logging.info(f"Received join request from node {sender_id}")
+
+            logging.debug(f"sender_id: {msg_params.get_sender_id()}; receiver_id: {msg_params.get_receiver_id()}")
+            logging.info(f"Received join request for node {node_info['node_id']} (sender_id={sender_id})")
             
             # Forward to the service discovery bridge
             if self.service_discovery_bridge:
@@ -1010,9 +1011,13 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             receiver_id (int): ID of the receiver
             node_info (dict): Optional node information
         """
-        message = Message(RaftMessage.MSG_TYPE_RAFT_JOIN_REQUEST, self.get_sender_id(), receiver_id)
+        message = Message(RaftMessage.MSG_TYPE_RAFT_JOIN_REQUEST, sender_id=self.node_id, receiver_id=receiver_id)
+        logging.debug(f"Node {self.node_id} sending join request to {receiver_id} with message: {message.to_string()}")
         if node_info:
             message.add_params(RaftMessage.MSG_ARG_NODE_INFO, node_info)
+
+        logging.debug(f"Node {self.node_id} sending join request to {receiver_id}")
+        logging.debug(f"Node info: {node_info}")
         self.send_message(message)
     
     def send_join_response(self, receiver_id, success, leader_id=None, error_msg=None):
@@ -1025,7 +1030,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             leader_id (int): ID of the current leader (if known)
             error_msg (str): Error message if join failed
         """
-        message = Message(RaftMessage.MSG_TYPE_RAFT_JOIN_RESPONSE, self.get_sender_id(), receiver_id)
+        message = Message(RaftMessage.MSG_TYPE_RAFT_JOIN_RESPONSE, sender_id=self.get_sender_id(), receiver_id=receiver_id)
         message.add_params(RaftMessage.MSG_ARG_SUCCESS, success)
         if leader_id is not None:
             message.add_params(RaftMessage.MSG_ARG_LEADER_ID, leader_id)

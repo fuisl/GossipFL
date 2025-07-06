@@ -668,26 +668,30 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
     
     def refresh_node_registry(self):
         """
-        Refresh node registry from service discovery.
+        Manual registry refresh from service discovery.
         
-        This is a manual refresh method that can be called when needed,
-        replacing the old polling mechanism.
+        This is only used for initial bootstrap or manual refresh requests.
+        During normal operation, the leader will keep the registry updated
+        through RAFT consensus via bridge notifications.
         """
         if not self.use_service_discovery or not self.service_discovery_client:
-            logging.warning("Service discovery not available for registry refresh")
+            logging.debug("Service discovery not available for registry refresh")
             return
         
         try:
-            # Get current nodes from service discovery
+            # Check if we're in bridge mode
+            if self.bridge_registered and self.service_discovery_bridge:
+                # In bridge mode, registry updates come from RAFT leader
+                logging.debug("Bridge mode: registry updates come from RAFT leader, skipping manual refresh")
+                return
+            
+            # Non-bridge mode: update directly from service discovery
+            logging.info("Manual registry refresh from service discovery")
             nodes = self.service_discovery_client.get_nodes()
             
             if nodes:
-                # Convert to cluster info format
                 cluster_info = {'nodes': nodes, 'total_nodes': len(nodes)}
-                
-                # Update registry
                 self._update_node_registry_from_discovery(cluster_info)
-                
                 logging.debug(f"Registry refreshed: {len(nodes)} nodes")
             else:
                 logging.warning("No nodes returned from service discovery refresh")
@@ -699,14 +703,22 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
         """
         Discover new nodes that have joined the cluster.
         
+        In bridge mode, this is not needed as the leader will notify us
+        of new nodes through RAFT consensus.
+        
         Returns:
             List of newly discovered nodes
         """
         if not self.use_service_discovery:
             return []
         
+        # In bridge mode, node discovery is handled by RAFT leader
+        if self.bridge_registered and self.service_discovery_bridge:
+            logging.debug("Bridge mode: node discovery handled by RAFT leader")
+            return []
+        
         try:
-            # Get current nodes from service discovery
+            # Non-bridge mode: manual discovery
             current_nodes = self.service_discovery_client.get_nodes()
             
             # Find new nodes
@@ -742,11 +754,8 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
     
     def send_message(self, msg: Message):
         """Send message using node registry information."""
-        import pickle
-        import time
-        
-        logging.info(f"Sending message: {msg}")
-        
+        logging.info(f"Sending message: {msg.to_string()}")
+
         # Serialize message
         pickle_dump_start_time = time.time()
         msg_pkl = pickle.dumps(msg)
@@ -762,12 +771,18 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
         
         # Get receiver info from node registry
         if receiver_id not in self.node_registry:
-            # Try to discover the node if not in registry
-            logging.info(f"Receiver node {receiver_id} not in registry, attempting discovery")
-            self.refresh_node_registry()
-            
-            if receiver_id not in self.node_registry:
-                raise ValueError(f"Receiver node {receiver_id} not found in registry and discovery failed")
+            # In bridge mode, we don't manually refresh - the leader will notify us
+            if self.bridge_registered and self.service_discovery_bridge:
+                logging.warning(f"Receiver node {receiver_id} not in registry. "
+                            f"Waiting for leader to notify about new nodes.")
+                raise ValueError(f"Receiver node {receiver_id} not found in registry")
+            else:
+                # Non-bridge mode: try manual refresh
+                logging.info(f"Receiver node {receiver_id} not in registry, attempting discovery")
+                self.refresh_node_registry()
+                
+                if receiver_id not in self.node_registry:
+                    raise ValueError(f"Receiver node {receiver_id} not found in registry and discovery failed")
         
         receiver_info = self.node_registry[receiver_id]
         channel_url = f"{receiver_info.ip_address}:{receiver_info.port}"
@@ -803,33 +818,39 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
             # Update node reachability
             self._update_node_reachability(receiver_id, False)
             
-            # Try to refresh registry and retry once
-            if self.use_service_discovery:
-                logging.info("Attempting registry refresh before retry")
-                self.refresh_node_registry()
-                
-                if receiver_id in self.node_registry:
-                    # Retry with updated information
-                    try:
-                        receiver_info = self.node_registry[receiver_id]
-                        channel_url = f"{receiver_info.ip_address}:{receiver_info.port}"
-                        
-                        channel = grpc.insecure_channel(channel_url, options=self.opts)
-                        stub = grpc_comm_manager_pb2_grpc.gRPCCommManagerStub(channel)
-                        
-                        request = grpc_comm_manager_pb2.CommRequest()
-                        request.client_id = self.rank
-                        request.message = msg_pkl
-                        
-                        stub.sendMessage(request)
-                        logging.info("Message sent successfully on retry")
-                        
-                        # Update node reachability
-                        self._update_node_reachability(receiver_id, True)
-                        
-                    except Exception as retry_e:
-                        logging.error(f"Retry also failed: {retry_e}")
+            # In bridge mode, don't retry with manual refresh - let RAFT handle it
+            if not (self.bridge_registered and self.service_discovery_bridge):
+                # Non-bridge mode: try manual refresh and retry once
+                if self.use_service_discovery:
+                    logging.info("Attempting registry refresh before retry")
+                    self.refresh_node_registry()
+                    
+                    if receiver_id in self.node_registry:
+                        # Retry with updated information
+                        try:
+                            receiver_info = self.node_registry[receiver_id]
+                            channel_url = f"{receiver_info.ip_address}:{receiver_info.port}"
+                            
+                            channel = grpc.insecure_channel(channel_url, options=self.opts)
+                            stub = grpc_comm_manager_pb2_grpc.gRPCCommManagerStub(channel)
+                            
+                            request = grpc_comm_manager_pb2.CommRequest()
+                            request.client_id = self.rank
+                            request.message = msg_pkl
+                            
+                            stub.sendMessage(request)
+                            logging.info("Message sent successfully on retry")
+                            
+                            # Update node reachability
+                            self._update_node_reachability(receiver_id, True)
+                            
+                        except Exception as retry_e:
+                            logging.error(f"Retry also failed: {retry_e}")
+                            raise
+                    else:
                         raise
+                else:
+                    raise
             else:
                 raise
         finally:
@@ -1043,7 +1064,17 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
             # Set bridge reference
             self.service_discovery_bridge = bridge
             
-            # Register bridge with itself (bridge will replace callbacks)
+            # Store original callbacks before bridge replaces them
+            self._original_on_node_discovered = self.on_node_discovered
+            self._original_on_node_lost = self.on_node_lost
+            
+            # Set up bridge callbacks to notify comm manager
+            bridge.set_comm_manager_callbacks(
+                on_membership_change=self._on_bridge_membership_change,
+                on_node_registry_update=self._on_bridge_node_registry_update
+            )
+            
+            # Register bridge with itself (bridge will replace discovery callbacks)
             bridge.register_with_comm_manager(self)
             
             self.bridge_registered = True
@@ -1054,6 +1085,112 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
         except Exception as e:
             logging.error(f"Failed to register service discovery bridge: {e}")
             return False
+        
+    def _on_bridge_membership_change(self, action: str, node_id: int, node_info: Dict = None):
+        """
+        Handle membership changes from the bridge.
+        
+        This is called when the bridge has processed a membership change through RAFT
+        and needs to notify the communication manager to update its registry.
+        
+        Args:
+            action: 'add' or 'remove'
+            node_id: ID of the node that changed
+            node_info: Connection info for added nodes
+        """
+        try:
+            logging.info(f"Bridge notified membership change: {action} node {node_id}")
+            
+            if action == 'add' and node_info:
+                # Add to local registry
+                with config_lock:
+                    if node_id not in self.node_registry:
+                        self.node_registry[node_id] = NodeInfo(
+                            node_id=node_id,
+                            ip_address=node_info.get('ip_address', 'localhost'),
+                            port=node_info.get('port', 9000 + node_id),
+                            capabilities=node_info.get('capabilities', ['grpc', 'fedml']),
+                            metadata=node_info.get('metadata', {})
+                        )
+                        self._rebuild_ip_config()
+                        
+                        # Notify original callback if it exists
+                        if self._original_on_node_discovered:
+                            self._original_on_node_discovered(node_id, self.node_registry[node_id])
+                        
+                        logging.info(f"Added node {node_id} to registry via bridge notification")
+            
+            elif action == 'remove':
+                # Remove from local registry
+                with config_lock:
+                    if node_id in self.node_registry:
+                        del self.node_registry[node_id]
+                        self._rebuild_ip_config()
+                        
+                        # Notify original callback if it exists
+                        if self._original_on_node_lost:
+                            self._original_on_node_lost(node_id)
+                        
+                        logging.info(f"Removed node {node_id} from registry via bridge notification")
+            
+        except Exception as e:
+            logging.error(f"Error handling bridge membership change: {e}")
+
+    def _on_bridge_node_registry_update(self, full_node_list: List[Dict]):
+        """
+        Handle complete node registry update from bridge.
+        
+        This is called when the bridge has received a complete cluster state
+        and needs to synchronize the communication manager's registry.
+        
+        Args:
+            full_node_list: Complete list of nodes with connection info
+        """
+        try:
+            logging.info(f"Bridge requested full registry update: {len(full_node_list)} nodes")
+            
+            with config_lock:
+                # Save current state for comparison
+                old_nodes = set(self.node_registry.keys())
+                
+                # Clear registry (except self)
+                self.node_registry = {k: v for k, v in self.node_registry.items() if k == self.node_id}
+                
+                # Add all nodes from the update
+                for node_info in full_node_list:
+                    node_id = node_info['node_id']
+                    if node_id != self.node_id:  # Don't overwrite self
+                        self.node_registry[node_id] = NodeInfo(
+                            node_id=node_id,
+                            ip_address=node_info['ip_address'],
+                            port=node_info['port'],
+                            capabilities=node_info.get('capabilities', ['grpc', 'fedml']),
+                            metadata=node_info.get('metadata', {})
+                        )
+                
+                # Rebuild IP configuration
+                self._rebuild_ip_config()
+                
+                # Notify about changes
+                new_nodes = set(self.node_registry.keys())
+                added_nodes = new_nodes - old_nodes
+                removed_nodes = old_nodes - new_nodes
+                
+                # Notify original callbacks
+                if self._original_on_node_discovered:
+                    for node_id in added_nodes:
+                        if node_id != self.node_id:
+                            self._original_on_node_discovered(node_id, self.node_registry[node_id])
+                
+                if self._original_on_node_lost:
+                    for node_id in removed_nodes:
+                        if node_id != self.node_id:
+                            self._original_on_node_lost(node_id)
+                
+                logging.info(f"Registry updated via bridge: +{len(added_nodes)} -{len(removed_nodes)} nodes")
+            
+        except Exception as e:
+            logging.error(f"Error handling bridge registry update: {e}")
     
     def unregister_service_discovery_bridge(self):
         """Unregister the service discovery bridge."""

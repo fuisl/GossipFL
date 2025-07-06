@@ -321,6 +321,14 @@ class StandaloneRaftNode:
         """Handle shutdown signals."""
         self.logger.info(f"Received signal {signum}, shutting down...")
         self.shutdown()
+        # Force exit if graceful shutdown takes too long
+        import threading
+        def force_exit():
+            time.sleep(10)  # Give 10 seconds for graceful shutdown
+            self.logger.warning("Forcing exit due to shutdown timeout")
+            os._exit(1)
+    
+        threading.Thread(target=force_exit, daemon=True).start()
     
     def start(self):
         """Start the RAFT node."""
@@ -364,18 +372,32 @@ class StandaloneRaftNode:
         self.shutdown_event.set()
         
         try:
-            # Stop RAFT consensus
+            # Stop RAFT consensus FIRST (this is critical for leaders)
             if hasattr(self, 'raft_consensus'):
+                self.logger.info("Stopping RAFT consensus...")
                 self.raft_consensus.stop()
-            
-            # Stop gRPC communication manager
-            if hasattr(self, 'comm_manager') and hasattr(self.comm_manager, 'stop_receive_message'):
-                self.comm_manager.stop_receive_message()
-            
+                
             # Stop status monitoring
             if hasattr(self, 'status_monitor'):
+                self.logger.info("Stopping status monitor...")
                 self.status_monitor.stop()
                 
+            # Stop gRPC communication manager
+            if hasattr(self, 'comm_manager'):
+                self.logger.info("Stopping communication manager...")
+                if hasattr(self.comm_manager, 'stop_receive_message'):
+                    self.comm_manager.stop_receive_message()
+                # Force close gRPC connections
+                if hasattr(self.comm_manager, 'close_all_connections'):
+                    self.comm_manager.close_all_connections()
+            
+            # Wait for threads to finish with timeout
+            if hasattr(self, 'comm_thread') and self.comm_thread.is_alive():
+                self.logger.info("Waiting for communication thread to finish...")
+                self.comm_thread.join(timeout=2)
+                if self.comm_thread.is_alive():
+                    self.logger.warning("Communication thread did not finish gracefully")
+                    
         except Exception as e:
             self.logger.error(f"Error during shutdown: {e}")
         

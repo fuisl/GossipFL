@@ -768,13 +768,14 @@ class RaftConsensus:
         
         return log_index
     
-    def add_membership_change(self, action, node_id, round_num=0, reason="unspecified"):
+    def add_membership_change(self, action, node_id, node_info=None, round_num=0, reason="unspecified"):
         """
         Add a membership change to the log (leaders only).
         
         Args:
             action (str): 'add' or 'remove'
             node_id (int): ID of the node to add/remove
+            node_info (dict, optional): Connection information for new nodes
             round_num (int, optional): Current training round number
             reason (str, optional): Reason for the membership change
             
@@ -791,7 +792,20 @@ class RaftConsensus:
         
         try:
             if action == 'add':
-                idx = self.raft_node.add_node(node_id, round_num)
+                # Pass the complete node_info dictionary, not just node_id
+                if node_info:
+                    # Create a complete node_info dict with node_id included
+                    complete_node_info = {
+                        'node_id': node_id,
+                        'ip_address': node_info.get('ip_address', 'localhost'),
+                        'port': node_info.get('port', 9000 + node_id),
+                        'capabilities': node_info.get('capabilities', ['grpc', 'fedml']),
+                        'timestamp': node_info.get('timestamp', time.time())
+                    }
+                    idx = self.raft_node.add_node(complete_node_info, round_num)
+                else:
+                    # Fallback to just node_id (for backward compatibility)
+                    idx = self.raft_node.add_node(node_id, round_num)
                 return idx
             elif action == 'remove':
                 idx = self.raft_node.remove_node(node_id, round_num, reason)
@@ -1448,22 +1462,22 @@ class RaftConsensus:
                 logging.warning(f"Node {self.raft_node.node_id}: Cannot propose membership change - not a leader")
                 return False
             
-            # Use enhanced add_node method if available and adding a node
-            if action == 'add' and hasattr(self.raft_node, 'enhance_add_node_with_connection_info') and node_info:
-                log_index = self.raft_node.enhance_add_node_with_connection_info(
-                    node_id, node_info, round_num=self._get_current_round()
-                )
-            else:
-                # Use existing membership change method
-                log_index = self.add_membership_change(action, node_id, round_num=self._get_current_round(), reason=reason or "service_discovery")
+            # Call add_membership_change with node_info preserved
+            log_index = self.add_membership_change(
+                action=action,
+                node_id=node_id,
+                node_info=node_info,
+                round_num=self._get_current_round(),
+                reason=reason or "service_discovery"
+            )
             
             success = log_index != -1
             if success:
                 logging.info(f"Leader {self.raft_node.node_id}: Proposed membership change - "
-                           f"action: {action}, node: {node_id}, log_index: {log_index}")
+                        f"action: {action}, node: {node_id}, log_index: {log_index}")
             else:
                 logging.warning(f"Leader {self.raft_node.node_id}: Failed to propose membership change - "
-                              f"action: {action}, node: {node_id}")
+                            f"action: {action}, node: {node_id}")
             
             return success
             

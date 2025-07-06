@@ -1158,23 +1158,21 @@ class RaftNode:
                     # Update known nodes count and notify any monitoring components
                     self.update_known_nodes(node_ids=list(self.known_nodes))
                     
-                    # If we have a manager, notify it about membership change
-                    if hasattr(self, 'consensus_manager') and self.consensus_manager is not None:
-                        try:
-                            self.consensus_manager.on_membership_change(self.known_nodes, round_num)
-                            logging.debug(f"Node {self.node_id}: Notified consensus manager of membership change")
-                        except Exception as e:
-                            logging.error(f"Node {self.node_id}: Error notifying consensus manager of membership change: {e}")
-                    
-                    # Notify communication manager to establish/close connections
-                    if hasattr(self, 'comm_manager') and self.comm_manager is not None:
-                        try:
-                            if action == 'add' and node_id in self.node_connection_info:
-                                self.comm_manager.establish_connection(node_id, self.node_connection_info[node_id])
+                    if hasattr(self, 'consensus_manager') and self.consensus_manager:
+                        bridge = getattr(self.consensus_manager, 'service_discovery_bridge', None)
+                        if bridge:
+                            # Notify bridge to update communication manager
+                            if action == 'add' and node_info:
+                                bridge._notify_comm_manager_membership_change(
+                                    action='add',
+                                    node_id=node_id,
+                                    node_info=node_info
+                                )
                             elif action == 'remove':
-                                self.comm_manager.close_connection(node_id)
-                        except Exception as e:
-                            logging.error(f"Node {self.node_id}: Error updating connections: {e}")
+                                bridge._notify_comm_manager_membership_change(
+                                    action='remove',
+                                    node_id=node_id
+                                )
                             
             except Exception as e:
                 logging.error(f"Node {self.node_id}: Error applying membership change: {e}", exc_info=True)
@@ -1349,76 +1347,44 @@ class RaftNode:
                     logging.warning(f"Node {self.node_id}: Cannot add node - not a leader")
                     return -1
                 
-                # Extract node ID and connection info from parameter
-                if isinstance(new_node_info, dict):
-                    new_node_id = new_node_info.get('node_id')
-                    if new_node_id is None:
-                        logging.error(f"Leader {self.node_id}: No node_id found in node info")
-                        return -1
-                    
-                    # Extract connection information
-                    node_connection_info = {
-                        'ip_address': new_node_info.get('ip_address', 'localhost'),
-                        'port': new_node_info.get('port', 9000 + new_node_id),
-                        'capabilities': new_node_info.get('capabilities', ['grpc', 'fedml']),
-                        'timestamp': new_node_info.get('timestamp', time.time())
-                    }
-                else:
-                    # Backward compatibility - just node ID
-                    new_node_id = new_node_info
-                    node_connection_info = {
-                        'ip_address': 'localhost',
-                        'port': 9000 + new_node_id,
-                        'capabilities': ['grpc', 'fedml'],
-                        'timestamp': time.time()
-                    }
-                
-                # Check if node already exists
-                if new_node_id in self.known_nodes:
-                    logging.debug(f"Leader {self.node_id}: Node {new_node_id} already in cluster")
+                # Extract and validate node information
+                node_id, connection_info = self._extract_node_info(new_node_info)
+                if node_id is None:
                     return -1
                 
-                # Store connection information locally
-                if not hasattr(self, 'node_connection_info'):
-                    self.node_connection_info = {}
-                self.node_connection_info[new_node_id] = node_connection_info
+                # Check if node already exists
+                if node_id in self.known_nodes:
+                    logging.debug(f"Leader {self.node_id}: Node {node_id} already in cluster")
+                    return -1
                 
                 # Create membership log entry with complete connection info
-                current_nodes = set(self.known_nodes)
-                current_nodes.add(new_node_id)
+                # DO NOT update known_nodes immediately - wait for commit
+                log_entry = self._create_membership_log_entry(
+                    action='add',
+                    node_id=node_id,
+                    connection_info=connection_info,
+                    round_num=round_num
+                )
                 
-                # Collect connection info for all nodes
-                current_nodes_info = {}
-                for node_id in current_nodes:
-                    if hasattr(self, 'node_connection_info') and node_id in self.node_connection_info:
-                        current_nodes_info[node_id] = self.node_connection_info[node_id]
-                
-                # Add log entry with complete node and connection information
-                log_index = self.add_log_entry({
-                    'type': 'membership',
-                    'action': 'add',
-                    'node_id': new_node_id,
-                    'node_info': node_connection_info,  # Connection info for the new node
-                    'current_nodes': list(current_nodes),  # All current nodes
-                    'current_nodes_info': current_nodes_info,  # Connection info for all nodes
-                    'round': round_num
-                })
+                log_index = self.add_log_entry(log_entry)
                 
                 if log_index == -1:
                     logging.error(f"Leader {self.node_id}: Failed to add log entry for node addition")
                     return -1
                 
-                # Initialize leader state for the new node
+                # Store connection info for immediate leader use (replication)
+                # but don't update known_nodes until commit
+                if not hasattr(self, 'pending_node_connection_info'):
+                    self.pending_node_connection_info = {}
+                self.pending_node_connection_info[node_id] = connection_info
+                
+                # Initialize leader state for the new node (for replication)
                 last_log_index = self.first_log_index + len(self.log) - 1 if len(self.log) > 0 else 0
-                self.next_index[new_node_id] = last_log_index + 1
-                self.match_index[new_node_id] = 0
+                self.next_index[node_id] = last_log_index + 1
+                self.match_index[node_id] = 0
                 
-                # Update known nodes
-                self.known_nodes.add(new_node_id)
-                self.update_known_nodes(node_ids=list(self.known_nodes))
-                
-                logging.info(f"Leader {self.node_id}: Added node {new_node_id} with connection info " +
-                            f"{node_connection_info['ip_address']}:{node_connection_info['port']} at round {round_num}")
+                logging.info(f"Leader {self.node_id}: Proposed adding node {node_id} with connection info " +
+                            f"{connection_info['ip_address']}:{connection_info['port']} at round {round_num}")
                 
                 return log_index
                 
@@ -1433,7 +1399,7 @@ class RaftNode:
         Args:
             node_id (int): ID of the node to remove
             round_num (int, optional): Current training round number
-            reason (str, optional): Reason for node removal (e.g., "timeout", "failure", "voluntary")
+            reason (str, optional): Reason for node removal
             
         Returns:
             int: Log index of the membership entry, or -1 on failure
@@ -1441,63 +1407,221 @@ class RaftNode:
         with self.state_lock:
             try:
                 if self.state != RaftState.LEADER:
-                    logging.warning(
-                        f"Node {self.node_id}: Cannot remove node {node_id} - not a leader"
-                    )
+                    logging.warning(f"Node {self.node_id}: Cannot remove node {node_id} - not a leader")
                     return -1
                     
                 if node_id not in self.known_nodes:
-                    logging.debug(
-                        f"Leader {self.node_id}: Node {node_id} not in cluster, no action needed"
-                    )
-                    return -1  # Already removed
-                
-                # Make a copy of current nodes for the log entry (for consistency)
-                current_nodes = set(self.known_nodes)
-                current_nodes.remove(node_id)
-                
-                # Add a log entry for the membership change first
-                # We include current_nodes to ensure all nodes have the same view
-                log_index = self.add_log_entry({
-                    'type': 'membership',
-                    'action': 'remove',
-                    'node_id': node_id,
-                    'current_nodes': list(current_nodes),  # Convert set to list for JSON serialization
-                    'round': round_num,
-                    'reason': reason
-                })
-                
-                if log_index == -1:
-                    logging.error(
-                        f"Leader {self.node_id}: Failed to add log entry for node removal"
-                    )
+                    logging.debug(f"Leader {self.node_id}: Node {node_id} not in cluster, no action needed")
                     return -1
                 
-                # Only update state after successful log entry creation
-                # The actual change will be applied when the entry is committed
-                self.known_nodes.remove(node_id)
-                self.update_known_nodes(len(self.known_nodes))
-                
-                # Clean up leader state for the removed node
-                if node_id in self.next_index:
-                    del self.next_index[node_id]
-                if node_id in self.match_index:
-                    del self.match_index[node_id]
-                
-                # If we're removing the coordinator, we may need to select a new one
-                if hasattr(self, 'current_coordinator_id') and self.current_coordinator_id == node_id:
-                    logging.warning(f"Leader {self.node_id}: Removed node {node_id} was the coordinator, will need new coordinator")
-                    # The actual coordinator change would typically be handled elsewhere
-                    # but we note it here for visibility
-                
-                logging.info(
-                    f"Leader {self.node_id}: Removed node {node_id} from cluster at round {round_num} (reason: {reason})"
+                log_entry = self._create_membership_log_entry(
+                    action='remove',
+                    node_id=node_id,
+                    connection_info=None,
+                    round_num=round_num,
+                    reason=reason
                 )
+                
+                log_index = self.add_log_entry(log_entry)
+                
+                if log_index == -1:
+                    logging.error(f"Leader {self.node_id}: Failed to add log entry for node removal")
+                    return -1
+                
+                logging.info(f"Leader {self.node_id}: Proposed removing node {node_id} from cluster at round {round_num} (reason: {reason})")
+                
                 return log_index
                 
             except Exception as e:
                 logging.error(f"Leader {self.node_id}: Error removing node {node_id}: {e}", exc_info=True)
                 return -1
+    
+    def _extract_node_info(self, new_node_info):
+        """
+        Extract node ID and connection info from input parameter.
+        
+        Args:
+            new_node_info: Either int (node ID) or dict (node info)
+            
+        Returns:
+            tuple: (node_id, connection_info_dict) or (None, None) on error
+        """
+        try:
+            if isinstance(new_node_info, dict):
+                node_id = new_node_info.get('node_id')
+                if node_id is None:
+                    logging.error(f"Leader {self.node_id}: No node_id found in node info")
+                    return None, None
+                
+                # Standardized connection info structure
+                connection_info = {
+                    'ip_address': new_node_info.get('ip_address', 'localhost'),
+                    'port': new_node_info.get('port', 9000 + node_id),
+                    'capabilities': new_node_info.get('capabilities', ['grpc', 'fedml']),
+                    'timestamp': new_node_info.get('timestamp', time.time())
+                }
+            else:
+                # Backward compatibility - just node ID
+                node_id = new_node_info
+                connection_info = {
+                    'ip_address': 'localhost',
+                    'port': 9000 + node_id,
+                    'capabilities': ['grpc', 'fedml'],
+                    'timestamp': time.time()
+                }
+            
+            return node_id, connection_info
+            
+        except Exception as e:
+            logging.error(f"Leader {self.node_id}: Error extracting node info: {e}")
+            return None, None
+    
+    def _create_membership_log_entry(self, action, node_id, connection_info, round_num, reason=None):
+        """
+        Create a standardized membership log entry.
+        
+        Args:
+            action (str): 'add' or 'remove'
+            node_id (int): Node ID
+            connection_info (dict): Connection information (None for remove)
+            round_num (int): Training round number
+            reason (str, optional): Reason for change
+            
+        Returns:
+            dict: Log entry command
+        """
+        try:
+            # Create base log entry
+            log_entry = {
+                'type': 'membership',
+                'action': action,
+                'node_id': node_id,
+                'round': round_num,
+                'timestamp': time.time()
+            }
+            
+            # Add connection info for add operations
+            if action == 'add' and connection_info:
+                log_entry['node_info'] = connection_info
+            
+            # Add reason for remove operations
+            if action == 'remove' and reason:
+                log_entry['reason'] = reason
+            
+            # Add current cluster state for consistency
+            log_entry['current_nodes'] = list(self.known_nodes)
+            
+            # Add connection info for all current nodes
+            if hasattr(self, 'node_connection_info'):
+                log_entry['current_nodes_info'] = dict(self.node_connection_info)
+            
+            return log_entry
+            
+        except Exception as e:
+            logging.error(f"Leader {self.node_id}: Error creating membership log entry: {e}")
+            return {}
+    
+    def _apply_membership_change(self, command):
+        """
+        Apply a membership change command with proper state management.
+        
+        Args:
+            command (dict): The membership change command
+        """
+        with self.state_lock:
+            try:
+                action = command.get('action')
+                node_id = command.get('node_id')
+                node_info = command.get('node_info', {})
+                current_nodes = command.get('current_nodes', [])
+                current_nodes_info = command.get('current_nodes_info', {})
+                round_num = command.get('round', 0)
+                
+                old_known_nodes = set(self.known_nodes)
+                
+                if action == 'add':
+                    # Add the node to known nodes
+                    if node_id not in self.known_nodes:
+                        self.known_nodes.add(node_id)
+                        logging.info(f"Node {self.node_id}: Added node {node_id} to known nodes at round {round_num}")
+                    
+                    # Store connection information
+                    if node_info:
+                        if not hasattr(self, 'node_connection_info'):
+                            self.node_connection_info = {}
+                        self.node_connection_info[node_id] = node_info
+                        logging.debug(f"Node {self.node_id}: Stored connection info for node {node_id}")
+                    
+                    # Move from pending to active connection info if leader
+                    if (self.state == RaftState.LEADER and 
+                        hasattr(self, 'pending_node_connection_info') and 
+                        node_id in self.pending_node_connection_info):
+                        if not hasattr(self, 'node_connection_info'):
+                            self.node_connection_info = {}
+                        self.node_connection_info[node_id] = self.pending_node_connection_info[node_id]
+                        del self.pending_node_connection_info[node_id]
+                        
+                elif action == 'remove':
+                    # Remove the node from known nodes
+                    if node_id in self.known_nodes:
+                        self.known_nodes.remove(node_id)
+                        logging.info(f"Node {self.node_id}: Removed node {node_id} from known nodes at round {round_num}")
+                    
+                    # Clean up connection information
+                    if hasattr(self, 'node_connection_info') and node_id in self.node_connection_info:
+                        del self.node_connection_info[node_id]
+                        logging.debug(f"Node {self.node_id}: Removed connection info for node {node_id}")
+                    
+                    # Clean up leader state for removed node
+                    if self.state == RaftState.LEADER:
+                        if node_id in self.next_index:
+                            del self.next_index[node_id]
+                        if node_id in self.match_index:
+                            del self.match_index[node_id]
+                
+                # Update from current_nodes if provided (for consistency)
+                if current_nodes:
+                    self.known_nodes = set(current_nodes)
+                
+                # Update connection info for all nodes if provided
+                if current_nodes_info:
+                    if not hasattr(self, 'node_connection_info'):
+                        self.node_connection_info = {}
+                    self.node_connection_info.update(current_nodes_info)
+                
+                # Update cluster state if membership changed
+                if old_known_nodes != self.known_nodes:
+                    self.update_known_nodes(node_ids=list(self.known_nodes))
+                    
+                    # Notify other components of membership change
+                    self._notify_membership_change(action, node_id, round_num)
+                
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error applying membership change: {e}", exc_info=True)
+    
+    def _notify_membership_change(self, action, node_id, round_num):
+        """
+        Notify other components of membership changes.
+        
+        Args:
+            action (str): 'add' or 'remove'
+            node_id (int): Node that was added/removed
+            round_num (int): Training round number
+        """
+        try:
+            # Notify consensus manager
+            if hasattr(self, 'consensus_manager') and self.consensus_manager is not None:
+                self.consensus_manager.on_membership_change(self.known_nodes, round_num)
+            
+            # Notify communication manager
+            if hasattr(self, 'comm_manager') and self.comm_manager is not None:
+                if action == 'add' and hasattr(self, 'node_connection_info') and node_id in self.node_connection_info:
+                    self.comm_manager.establish_connection(node_id, self.node_connection_info[node_id])
+                elif action == 'remove':
+                    self.comm_manager.close_connection(node_id)
+            
+        except Exception as e:
+            logging.error(f"Node {self.node_id}: Error notifying membership change: {e}")
     
     def update_commit_index(self):
         """
@@ -2222,77 +2346,6 @@ class RaftNode:
             except Exception as e:
                 logging.error(f"Node {self.node_id}: Error initializing from discovery: {e}")
                 return False
-
-    def enhance_add_node_with_connection_info(self, new_node_id, node_info, round_num=0):
-        """
-        Enhanced version of add_node that includes connection information.
-        
-        Args:
-            new_node_id (int): ID of the new node
-            node_info (dict): Connection information including IP, port, capabilities
-            round_num (int): Current training round number
-            
-        Returns:
-            int: Log index of the membership entry, or -1 on failure
-        """
-        with self.state_lock:
-            try:
-                if self.state != RaftState.LEADER:
-                    logging.warning(f"Node {self.node_id}: Cannot add node {new_node_id} - not a leader")
-                    return -1
-                
-                # Validate node_info
-                if not node_info or 'ip_address' not in node_info or 'port' not in node_info:
-                    logging.error(f"Leader {self.node_id}: Cannot add node {new_node_id} - missing connection info")
-                    return -1
-                
-                if new_node_id in self.known_nodes:
-                    logging.debug(f"Leader {self.node_id}: Node {new_node_id} already in cluster")
-                    return -1
-                
-                # Store connection information
-                if not hasattr(self, 'node_connection_info'):
-                    self.node_connection_info = {}
-                self.node_connection_info[new_node_id] = node_info
-                
-                # Create enhanced membership log entry
-                current_nodes = set(self.known_nodes)
-                current_nodes.add(new_node_id)
-                
-                # Get current nodes with their connection info
-                current_nodes_info = {}
-                for node_id in current_nodes:
-                    if node_id in self.node_connection_info:
-                        current_nodes_info[node_id] = self.node_connection_info[node_id]
-                
-                # Add log entry with complete node information
-                log_index = self.add_log_entry({
-                    'type': 'membership',
-                    'action': 'add',
-                    'node_id': new_node_id,
-                    'node_info': node_info,  # Complete connection info
-                    'current_nodes': list(current_nodes),
-                    'current_nodes_info': current_nodes_info,  # All nodes with connection info
-                    'round': round_num
-                })
-                
-                if log_index != -1:
-                    # Initialize leader state for the new node
-                    last_log_index = self.first_log_index + len(self.log) - 1 if len(self.log) > 0 else 0
-                    self.next_index[new_node_id] = last_log_index + 1
-                    self.match_index[new_node_id] = 0
-                    
-                    # Update known nodes
-                    self.known_nodes.add(new_node_id)
-                    self.update_known_nodes(node_ids=list(self.known_nodes))
-                    
-                    logging.info(f"Leader {self.node_id}: Added node {new_node_id} with connection info at {node_info['ip_address']}:{node_info['port']}")
-                
-                return log_index
-                
-            except Exception as e:
-                logging.error(f"Leader {self.node_id}: Error adding node {new_node_id} with connection info: {e}")
-                return -1
 
     def _can_accept_leader_messages(self):
         """

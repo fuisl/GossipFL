@@ -8,7 +8,7 @@ When nodes are discovered/lost, this bridge converts them to RAFT membership pro
 import logging
 import threading
 import time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Callable, List
 
 
 class RaftServiceDiscoveryBridge:
@@ -110,18 +110,35 @@ class RaftServiceDiscoveryBridge:
     def _propose_add_node(self, node_id: int, node_info):
         """Propose adding a node through RAFT consensus."""
         try:
-            # Create membership entry data
-            entry_data = {
-                'node_id': node_id,
-                'ip_address': node_info.ip_address,
-                'port': node_info.port,
-                'action': 'add'
-            }
+            # Handle both dictionary and object formats for node_info
+            if isinstance(node_info, dict):
+                connection_info = {
+                    'ip_address': node_info.get('ip_address', 'localhost'),
+                    'port': node_info.get('port', 9000 + node_id),
+                    'capabilities': node_info.get('capabilities', ['grpc', 'fedml']),
+                    'timestamp': node_info.get('timestamp', time.time())
+                }
+            else:
+                connection_info = {
+                    'ip_address': getattr(node_info, 'ip_address', 'localhost'),
+                    'port': getattr(node_info, 'port', 9000 + node_id),
+                    'capabilities': getattr(node_info, 'capabilities', ['grpc', 'fedml']),
+                    'timestamp': getattr(node_info, 'timestamp', time.time())
+                }
             
-            # Propose through RAFT consensus
-            self.raft_consensus.propose_membership_change('add', entry_data)
-            logging.info(f"Bridge: Proposed adding node {node_id} through RAFT")
+            success = self.raft_consensus.propose_membership_change(
+                action='add',
+                node_id=node_id,
+                node_info=connection_info,
+                reason='service_discovery'
+            )
             
+            if success:
+                logging.info(f"Bridge: Proposed adding node {node_id} with connection info: "
+                            f"{connection_info['ip_address']}:{connection_info['port']}")
+            else:
+                logging.warning(f"Bridge: Failed to propose adding node {node_id}")
+                
         except Exception as e:
             logging.error(f"Bridge: Failed to propose adding node {node_id}: {e}")
     
@@ -166,7 +183,7 @@ class RaftServiceDiscoveryBridge:
                 return self._forward_join_request_to_leader(joining_node_id, node_info)
             
             # Propose adding the node
-            self._propose_add_node(joining_node_id, type('NodeInfo', (), node_info)())
+            self._propose_add_node(joining_node_id, node_info)
             return True
             
         except Exception as e:
@@ -315,3 +332,32 @@ class RaftServiceDiscoveryBridge:
         with self.lock:
             self.worker_manager = worker_manager
             logging.info(f"Bridge: Worker manager set for node {self.node_id}")
+
+    def set_comm_manager_callbacks(self, on_membership_change: Callable, on_node_registry_update: Callable):
+        """
+        Set callbacks to notify the communication manager of changes.
+        
+        Args:
+            on_membership_change: Callback for individual membership changes
+            on_node_registry_update: Callback for full registry updates
+        """
+        self.on_membership_change = on_membership_change
+        self.on_node_registry_update = on_node_registry_update
+
+    def _notify_comm_manager_membership_change(self, action: str, node_id: int, node_info: Dict = None):
+        """Notify communication manager of membership changes."""
+        try:
+            if hasattr(self, 'on_membership_change') and self.on_membership_change:
+                self.on_membership_change(action, node_id, node_info)
+                logging.debug(f"Notified comm manager: {action} node {node_id}")
+        except Exception as e:
+            logging.error(f"Error notifying comm manager of membership change: {e}")
+
+    def _notify_comm_manager_full_update(self, node_list: List[Dict]):
+        """Notify communication manager of complete registry update."""
+        try:
+            if hasattr(self, 'on_node_registry_update') and self.on_node_registry_update:
+                self.on_node_registry_update(node_list)
+                logging.debug(f"Notified comm manager: full update with {len(node_list)} nodes")
+        except Exception as e:
+            logging.error(f"Error notifying comm manager of registry update: {e}")

@@ -55,14 +55,7 @@ class ClientManager(Observer):
             # may not have handlers registered at the ClientManager level
 
     def send_message(self, message):
-        msg = Message()
-        msg.add(Message.MSG_ARG_KEY_TYPE, message.get_type())
-        msg.add(Message.MSG_ARG_KEY_SENDER, message.get_sender_id())
-        msg.add(Message.MSG_ARG_KEY_RECEIVER, message.get_receiver_id())
-        for key, value in message.get_params().items():
-            # logging.info("%s == %s" % (key, value))
-            msg.add(key, value)
-        self.com_manager.send_message(msg)
+        self.com_manager.send_message(message)
 
     @abstractmethod
     def register_message_receive_handlers(self) -> None:
