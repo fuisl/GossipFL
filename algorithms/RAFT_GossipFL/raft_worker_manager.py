@@ -64,7 +64,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         # and will be updated dynamically through RAFT membership changes
         
         # Initialize service discovery bridge for dynamic membership management
-        self.service_discovery_bridge = RaftServiceDiscoveryBridge(node_id, raft_consensus, self)
+        self.service_discovery_bridge = RaftServiceDiscoveryBridge(raft_consensus, comm)
         
         # Register the bridge with this worker manager as the communication manager
         self.service_discovery_bridge.register_with_comm_manager(self)
@@ -91,8 +91,8 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         # Used to trigger next training round - should be integrated with round_start_authorized
         self.round_start_event = threading.Event()  # Used to trigger next training round
         
-        # Override SAPS_FL coordinator detection
-        self._override_saps_coordinator_logic()
+        # # Override SAPS_FL coordinator detection
+        # self._override_saps_coordinator_logic()
         
         logging.info(f"RaftWorkerManager initialized for node {node_id} with service discovery bridge")
     
@@ -105,18 +105,16 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         return getattr(self, '_comm_manager', None)
     
     def set_raft_consensus(self, raft_consensus):
-        """
-        Set the raft_consensus reference and register callbacks after initialization.
-        
-        This is needed because of circular dependencies in initialization order.
-        
-        Args:
-            raft_consensus: The RAFT consensus manager
-        """
+        """Enhanced version with better circular dependency handling."""
         self.raft_consensus = raft_consensus
         
-        # Register all callbacks 
+        # Register callbacks with consensus
         self._register_raft_callbacks()
+        
+        # If bridge exists, register it with consensus
+        if hasattr(self, 'service_discovery_bridge') and self.service_discovery_bridge:
+            if not self.service_discovery_bridge.is_registered_with_consensus():
+                self.raft_consensus.register_service_discovery_bridge(self.service_discovery_bridge)
     
     def register_message_receive_handlers(self):
         """Register message handlers for RAFT and GossipFL messages."""
@@ -125,58 +123,58 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         
         # Register RAFT message handlers
         self.register_message_receive_handler(
-            RaftMessage.MSG_TYPE_RAFT_REQUEST_VOTE,
+            RaftMessage.MSG_TYPE_REQUEST_VOTE,
             self.handle_request_vote)
 
         self.register_message_receive_handler(
-            RaftMessage.MSG_TYPE_RAFT_PREVOTE_REQUEST,
+            RaftMessage.MSG_TYPE_PREVOTE_REQUEST,
             self.handle_prevote_request)
 
         self.register_message_receive_handler(
-            RaftMessage.MSG_TYPE_RAFT_VOTE_RESPONSE,
+            RaftMessage.MSG_TYPE_VOTE_RESPONSE,
             self.handle_vote_response)
 
         self.register_message_receive_handler(
-            RaftMessage.MSG_TYPE_RAFT_PREVOTE_RESPONSE,
+            RaftMessage.MSG_TYPE_PREVOTE_RESPONSE,
             self.handle_prevote_response)
         
         self.register_message_receive_handler(
-            RaftMessage.MSG_TYPE_RAFT_APPEND_ENTRIES,
+            RaftMessage.MSG_TYPE_APPEND_ENTRIES,
             self.handle_append_entries)
         
         self.register_message_receive_handler(
-            RaftMessage.MSG_TYPE_RAFT_APPEND_RESPONSE,
+            RaftMessage.MSG_TYPE_APPEND_RESPONSE,
             self.handle_append_response)
         
         self.register_message_receive_handler(
-            RaftMessage.MSG_TYPE_RAFT_STATE_SNAPSHOT,
+            RaftMessage.MSG_TYPE_STATE_SNAPSHOT,
             self.handle_state_snapshot)
         self.register_message_receive_handler(
-            RaftMessage.MSG_TYPE_RAFT_INSTALL_SNAPSHOT,
+            RaftMessage.MSG_TYPE_INSTALL_SNAPSHOT,
             self.handle_install_snapshot)
 
         # Enhanced message handlers for improved node joining
         self.register_message_receive_handler(
-            RaftMessage.MSG_TYPE_RAFT_LEADER_REDIRECT,
+            RaftMessage.MSG_TYPE_LEADER_REDIRECT,
             self.handle_leader_redirect)
 
         # Initialization parameter exchange
         self.register_message_receive_handler(
-            RaftMessage.MSG_TYPE_RAFT_STATE_REQUEST,
+            RaftMessage.MSG_TYPE_STATE_REQUEST,
             self.handle_state_request)
         self.register_message_receive_handler(
-            RaftMessage.MSG_TYPE_RAFT_PARAM_REQUEST,
+            RaftMessage.MSG_TYPE_PARAM_REQUEST,
             self.handle_param_request)
         self.register_message_receive_handler(
-            RaftMessage.MSG_TYPE_RAFT_PARAM_RESPONSE,
+            RaftMessage.MSG_TYPE_PARAM_RESPONSE,
             self.handle_param_response)
         
         # Join protocol handlers
         self.register_message_receive_handler(
-            RaftMessage.MSG_TYPE_RAFT_JOIN_REQUEST,
+            RaftMessage.MSG_TYPE_JOIN_REQUEST,
             self.handle_join_request)
         self.register_message_receive_handler(
-            RaftMessage.MSG_TYPE_RAFT_JOIN_RESPONSE,
+            RaftMessage.MSG_TYPE_JOIN_RESPONSE,
             self.handle_join_response)
     
     def run(self):
@@ -529,10 +527,10 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             msg_params (dict): Message parameters
         """
         sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
-        term = msg_params.get(RaftMessage.MSG_ARG_TERM)
-        candidate_id = msg_params.get(RaftMessage.MSG_ARG_CANDIDATE_ID)
-        last_log_index = msg_params.get(RaftMessage.MSG_ARG_LAST_LOG_INDEX)
-        last_log_term = msg_params.get(RaftMessage.MSG_ARG_LAST_LOG_TERM)
+        term = msg_params.get(RaftMessage.ARG_TERM)
+        candidate_id = msg_params.get(RaftMessage.ARG_CANDIDATE_ID)
+        last_log_index = msg_params.get(RaftMessage.ARG_LAST_LOG_INDEX)
+        last_log_term = msg_params.get(RaftMessage.ARG_LAST_LOG_TERM)
         
         logging.debug(f"Received RequestVote from {sender_id}, term={term}, candidate={candidate_id}")
         
@@ -542,10 +540,10 @@ class RaftWorkerManager(DecentralizedWorkerManager):
     def handle_prevote_request(self, msg_params):
         """Handle a RAFT PreVote request message."""
         sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
-        term = msg_params.get(RaftMessage.MSG_ARG_TERM)
-        candidate_id = msg_params.get(RaftMessage.MSG_ARG_CANDIDATE_ID)
-        last_log_index = msg_params.get(RaftMessage.MSG_ARG_LAST_LOG_INDEX)
-        last_log_term = msg_params.get(RaftMessage.MSG_ARG_LAST_LOG_TERM)
+        term = msg_params.get(RaftMessage.ARG_TERM)
+        candidate_id = msg_params.get(RaftMessage.ARG_CANDIDATE_ID)
+        last_log_index = msg_params.get(RaftMessage.ARG_LAST_LOG_INDEX)
+        last_log_term = msg_params.get(RaftMessage.ARG_LAST_LOG_TERM)
 
         logging.debug(
             f"Received PreVoteRequest from {sender_id}, term={term}, candidate={candidate_id}"
@@ -563,8 +561,8 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             msg_params (dict): Message parameters
         """
         sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
-        term = msg_params.get(RaftMessage.MSG_ARG_TERM)
-        vote_granted = msg_params.get(RaftMessage.MSG_ARG_VOTE_GRANTED)
+        term = msg_params.get(RaftMessage.ARG_TERM)
+        vote_granted = msg_params.get(RaftMessage.ARG_VOTE_GRANTED)
         
         logging.debug(f"Received VoteResponse from {sender_id}, term={term}, granted={vote_granted}")
 
@@ -574,8 +572,8 @@ class RaftWorkerManager(DecentralizedWorkerManager):
     def handle_prevote_response(self, msg_params):
         """Handle a RAFT PreVote response message."""
         sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
-        term = msg_params.get(RaftMessage.MSG_ARG_TERM)
-        prevote_granted = msg_params.get(RaftMessage.MSG_ARG_VOTE_GRANTED)
+        term = msg_params.get(RaftMessage.ARG_TERM)
+        prevote_granted = msg_params.get(RaftMessage.ARG_VOTE_GRANTED)
 
         logging.debug(
             f"Received PreVoteResponse from {sender_id}, term={term}, granted={prevote_granted}"
@@ -591,12 +589,12 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             msg_params (dict): Message parameters
         """
         sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
-        term = msg_params.get(RaftMessage.MSG_ARG_TERM)
-        prev_log_index = msg_params.get(RaftMessage.MSG_ARG_PREV_LOG_INDEX)
-        prev_log_term = msg_params.get(RaftMessage.MSG_ARG_PREV_LOG_TERM)
-        entries = msg_params.get(RaftMessage.MSG_ARG_ENTRIES)
-        leader_commit = msg_params.get(RaftMessage.MSG_ARG_LEADER_COMMIT)
-        
+        term = msg_params.get(RaftMessage.ARG_TERM)
+        prev_log_index = msg_params.get(RaftMessage.ARG_PREV_LOG_INDEX)
+        prev_log_term = msg_params.get(RaftMessage.ARG_PREV_LOG_TERM)
+        entries = msg_params.get(RaftMessage.ARG_ENTRIES)
+        leader_commit = msg_params.get(RaftMessage.ARG_LEADER_COMMIT)
+
         logging.debug(f"Received AppendEntries from {sender_id}, term={term}, entries={len(entries) if entries else 0}")
         
         # Process the append entries
@@ -610,9 +608,9 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             msg_params (dict): Message parameters
         """
         sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
-        term = msg_params.get(RaftMessage.MSG_ARG_TERM)
-        success = msg_params.get(RaftMessage.MSG_ARG_SUCCESS)
-        match_index = msg_params.get(RaftMessage.MSG_ARG_MATCH_INDEX)
+        term = msg_params.get(RaftMessage.ARG_TERM)
+        success = msg_params.get(RaftMessage.ARG_SUCCESS)
+        match_index = msg_params.get(RaftMessage.ARG_MATCH_INDEX)
         
         logging.debug(f"Received AppendResponse from {sender_id}, term={term}, success={success}")
         
@@ -627,10 +625,10 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         and then process any comprehensive state_package for FL.
         """
         sender_id     = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
-        term          = msg_params.get(RaftMessage.MSG_ARG_TERM)
-        log_entries   = msg_params.get(RaftMessage.MSG_ARG_LOG, [])
-        commit_index  = msg_params.get(RaftMessage.MSG_ARG_COMMIT_INDEX, 0)
-        state_package = msg_params.get(RaftMessage.MSG_ARG_STATE_PACKAGE)
+        term          = msg_params.get(RaftMessage.ARG_TERM)
+        log_entries   = msg_params.get(RaftMessage.ARG_ENTRIES, [])
+        commit_index  = msg_params.get(RaftMessage.ARG_COMMIT_INDEX, 0)
+        state_package = msg_params.get(RaftMessage.ARG_STATE_PACKAGE)
 
         logging.debug(
             f"Received StateSnapshot from {sender_id}, "
@@ -666,12 +664,12 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         once all chunks are received.
         """
         sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
-        term = msg_params.get(RaftMessage.MSG_ARG_TERM)
-        last_idx = msg_params.get(RaftMessage.MSG_ARG_LAST_INCLUDED_INDEX)
-        last_term = msg_params.get(RaftMessage.MSG_ARG_LAST_INCLUDED_TERM)
-        offset = msg_params.get(RaftMessage.MSG_ARG_OFFSET)
-        data = msg_params.get(RaftMessage.MSG_ARG_DATA)
-        done = msg_params.get(RaftMessage.MSG_ARG_DONE)
+        term = msg_params.get(RaftMessage.ARG_TERM)
+        last_idx = msg_params.get(RaftMessage.ARG_LAST_INCLUDED_INDEX)
+        last_term = msg_params.get(RaftMessage.ARG_LAST_INCLUDED_TERM)
+        offset = msg_params.get(RaftMessage.ARG_OFFSET)
+        data = msg_params.get(RaftMessage.ARG_DATA)
+        done = msg_params.get(RaftMessage.ARG_DONE)
 
         logging.debug(
             f"Received InstallSnapshot from {sender_id}, term={term}, index={last_idx}, offset={offset}, done={done}"
@@ -683,8 +681,8 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         )
         
         # If this is the final chunk, apply the complete state package
-        if done and data and isinstance(data, dict) and RaftMessage.MSG_ARG_STATE_PACKAGE in data:
-            state_package = data.get(RaftMessage.MSG_ARG_STATE_PACKAGE)
+        if done and data and isinstance(data, dict) and RaftMessage.ARG_STATE_PACKAGE in data:
+            state_package = data.get(RaftMessage.ARG_STATE_PACKAGE)
             if state_package:
                 logging.info(f"Applying complete state package from snapshot")
                 success = self.initialize_from_state_snapshot(state_package)
@@ -703,7 +701,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             msg_params (dict): Message parameters
         """
         sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
-        leader_id = msg_params.get(RaftMessage.MSG_ARG_LEADER_ID)
+        leader_id = msg_params.get(RaftMessage.ARG_LEADER_ID)
         
         logging.info(f"Received leader redirect from {sender_id}, leader is {leader_id}")
         
@@ -723,23 +721,23 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             last_log_term (int): Term of last log entry
         """
         content = {
-            RaftMessage.MSG_ARG_TERM: term,
-            RaftMessage.MSG_ARG_CANDIDATE_ID: self.node_id,
-            RaftMessage.MSG_ARG_LAST_LOG_INDEX: last_log_index,
-            RaftMessage.MSG_ARG_LAST_LOG_TERM: last_log_term
+            RaftMessage.ARG_TERM: term,
+            RaftMessage.ARG_CANDIDATE_ID: self.node_id,
+            RaftMessage.ARG_LAST_LOG_INDEX: last_log_index,
+            RaftMessage.ARG_LAST_LOG_TERM: last_log_term
         }
         
-        self.send_raft_message(RaftMessage.MSG_TYPE_RAFT_REQUEST_VOTE, receiver_id, content)
+        self.send_raft_message(RaftMessage.MSG_TYPE_REQUEST_VOTE, receiver_id, content)
 
     def send_prevote_request(self, receiver_id, term, last_log_index, last_log_term):
         """Send a RAFT PreVote request message."""
         content = {
-            RaftMessage.MSG_ARG_TERM: term,
-            RaftMessage.MSG_ARG_CANDIDATE_ID: self.node_id,
-            RaftMessage.MSG_ARG_LAST_LOG_INDEX: last_log_index,
-            RaftMessage.MSG_ARG_LAST_LOG_TERM: last_log_term
+            RaftMessage.ARG_TERM: term,
+            RaftMessage.ARG_CANDIDATE_ID: self.node_id,
+            RaftMessage.ARG_LAST_LOG_INDEX: last_log_index,
+            RaftMessage.ARG_LAST_LOG_TERM: last_log_term
         }
-        self.send_raft_message(RaftMessage.MSG_TYPE_RAFT_PREVOTE_REQUEST, receiver_id, content)
+        self.send_raft_message(RaftMessage.MSG_TYPE_PREVOTE_REQUEST, receiver_id, content)
     
     def send_vote_response(self, receiver_id, term, vote_granted):
         """
@@ -751,18 +749,18 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             vote_granted (bool): Whether the vote was granted
         """
         content = {
-            RaftMessage.MSG_ARG_TERM: term,
-            RaftMessage.MSG_ARG_VOTE_GRANTED: vote_granted
+            RaftMessage.ARG_TERM: term,
+            RaftMessage.ARG_VOTE_GRANTED: vote_granted
         }
-        self.send_raft_message(RaftMessage.MSG_TYPE_RAFT_VOTE_RESPONSE, receiver_id, content)
+        self.send_raft_message(RaftMessage.MSG_TYPE_VOTE_RESPONSE, receiver_id, content)
 
     def send_prevote_response(self, receiver_id, term, prevote_granted):
         """Send a RAFT PreVote response message."""
         content = {
-            RaftMessage.MSG_ARG_TERM: term,
-            RaftMessage.MSG_ARG_VOTE_GRANTED: prevote_granted
+            RaftMessage.ARG_TERM: term,
+            RaftMessage.ARG_VOTE_GRANTED: prevote_granted
         }
-        self.send_raft_message(RaftMessage.MSG_TYPE_RAFT_PREVOTE_RESPONSE, receiver_id, content)
+        self.send_raft_message(RaftMessage.MSG_TYPE_PREVOTE_RESPONSE, receiver_id, content)
     
     def send_append_entries(self, receiver_id, term, prev_log_index, prev_log_term, entries, leader_commit):
         """
@@ -777,13 +775,13 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             leader_commit (int): Leader's commit index
         """
         content = {
-            RaftMessage.MSG_ARG_TERM: term,
-            RaftMessage.MSG_ARG_PREV_LOG_INDEX: prev_log_index,
-            RaftMessage.MSG_ARG_PREV_LOG_TERM: prev_log_term,
-            RaftMessage.MSG_ARG_ENTRIES: entries,
-            RaftMessage.MSG_ARG_LEADER_COMMIT: leader_commit
+            RaftMessage.ARG_TERM: term,
+            RaftMessage.ARG_PREV_LOG_INDEX: prev_log_index,
+            RaftMessage.ARG_PREV_LOG_TERM: prev_log_term,
+            RaftMessage.ARG_ENTRIES: entries,
+            RaftMessage.ARG_LEADER_COMMIT: leader_commit
         }
-        self.send_raft_message(RaftMessage.MSG_TYPE_RAFT_APPEND_ENTRIES, receiver_id, content)
+        self.send_raft_message(RaftMessage.MSG_TYPE_APPEND_ENTRIES, receiver_id, content)
     
     def send_append_response(self, receiver_id, term, success, match_index):
         """
@@ -796,11 +794,11 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             match_index (int): Index of highest log entry known to be replicated
         """
         content = {
-            RaftMessage.MSG_ARG_TERM: term,
-            RaftMessage.MSG_ARG_SUCCESS: success,
-            RaftMessage.MSG_ARG_MATCH_INDEX: match_index
+            RaftMessage.ARG_TERM: term,
+            RaftMessage.ARG_SUCCESS: success,
+            RaftMessage.ARG_MATCH_INDEX: match_index
         }
-        self.send_raft_message(RaftMessage.MSG_TYPE_RAFT_APPEND_RESPONSE, receiver_id, content)
+        self.send_raft_message(RaftMessage.MSG_TYPE_APPEND_RESPONSE, receiver_id, content)
 
     def send_install_snapshot(
         self,
@@ -814,14 +812,14 @@ class RaftWorkerManager(DecentralizedWorkerManager):
     ):
         """Send a RAFT InstallSnapshot message."""
         content = {
-            RaftMessage.MSG_ARG_TERM: term,
-            RaftMessage.MSG_ARG_LAST_INCLUDED_INDEX: last_included_index,
-            RaftMessage.MSG_ARG_LAST_INCLUDED_TERM: last_included_term,
-            RaftMessage.MSG_ARG_OFFSET: offset,
-            RaftMessage.MSG_ARG_DATA: data,
-            RaftMessage.MSG_ARG_DONE: done
+            RaftMessage.ARG_TERM: term,
+            RaftMessage.ARG_LAST_INCLUDED_INDEX: last_included_index,
+            RaftMessage.ARG_LAST_INCLUDED_TERM: last_included_term,
+            RaftMessage.ARG_OFFSET: offset,
+            RaftMessage.ARG_DATA: data,
+            RaftMessage.ARG_DONE: done
         }
-        self.send_raft_message(RaftMessage.MSG_TYPE_RAFT_INSTALL_SNAPSHOT, receiver_id, content)
+        self.send_raft_message(RaftMessage.MSG_TYPE_INSTALL_SNAPSHOT, receiver_id, content)
 
     def send_leader_redirect(self, receiver_id, leader_id):
         """
@@ -832,9 +830,9 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             leader_id (int): ID of the current leader
         """
         content = {
-            RaftMessage.MSG_ARG_LEADER_ID: leader_id
+            RaftMessage.ARG_LEADER_ID: leader_id
         }
-        self.send_raft_message(RaftMessage.MSG_TYPE_RAFT_LEADER_REDIRECT, receiver_id, content)
+        self.send_raft_message(RaftMessage.MSG_TYPE_LEADER_REDIRECT, receiver_id, content)
 
     def send_state_request(self, receiver_id):
         """
@@ -848,9 +846,9 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         """
         content = {
             # Add any relevant parameters for state request
-            RaftMessage.MSG_ARG_NODE_ID: self.node_id,
+            RaftMessage.ARG_NODE_ID: self.node_id,
         }
-        self.send_raft_message(RaftMessage.MSG_TYPE_RAFT_STATE_REQUEST, receiver_id, content)
+        self.send_raft_message(RaftMessage.MSG_TYPE_STATE_REQUEST, receiver_id, content)
 
     def initialize_from_state_snapshot(self, state_package):
         """
@@ -864,14 +862,14 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         """
         try:
             # Extract current nodes information from the state package
-            current_nodes = state_package.get(RaftMessage.MSG_ARG_CURRENT_NODES)
+            current_nodes = state_package.get(RaftMessage.ARG_CURRENT_NODES)
             if current_nodes is not None:
                 logging.info(f"Received cluster members: {current_nodes}")
                 # Update our local node list with the received list
                 self.raft_consensus.update_known_nodes(current_nodes)
             
             # Update leader and term information if present
-            leader_id = state_package.get(RaftMessage.MSG_ARG_LEADER_ID)
+            leader_id = state_package.get(RaftMessage.ARG_LEADER_ID)
             if leader_id is not None and leader_id != self.node_id:
                 logging.info(f"Setting leader to {leader_id}")
                 self.coordinator_id = leader_id
@@ -879,7 +877,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                     self.raft_consensus.raft_node.leader_id = leader_id
             
             # Update RAFT term if present
-            term = state_package.get(RaftMessage.MSG_ARG_TERM)
+            term = state_package.get(RaftMessage.ARG_TERM)
             if term is not None and self.raft_consensus and self.raft_consensus.raft_node:
                 if term > self.raft_consensus.raft_node.current_term:
                     logging.info(f"Updating term to {term}")
@@ -888,7 +886,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                     self.raft_consensus.raft_node.state = RaftState.FOLLOWER
             
             # Update model parameters if available
-            model_params = state_package.get(RaftMessage.MSG_ARG_MODEL_PARAMS)
+            model_params = state_package.get(RaftMessage.ARG_MODEL_PARAMS)
             if model_params is not None and hasattr(self.worker, "model_trainer"):
                 self.worker.model_trainer.set_model_params(model_params)
                 logging.info("Applied model parameters from state snapshot")
@@ -899,7 +897,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                 self.coordinator_id = coordinator_id
                 logging.info(f"Set coordinator to {coordinator_id}")
             
-            round_num = state_package.get(RaftMessage.MSG_ARG_ROUND)
+            round_num = state_package.get(RaftMessage.ARG_ROUND)
             if round_num is not None and hasattr(self, 'round'):
                 self.round = round_num
                 logging.info(f"Set training round to {round_num}")
@@ -1317,7 +1315,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             
             # Application-specific callbacks
             raft_node.on_commit = self.handle_committed_entry
-            raft_node.on_membership_change = self.handle_membership_change
+            raft_node.on_membership_change = self.on_membership_change
             
             # Communication callbacks
             raft_node.on_send_prevote = self.broadcast_prevote_request
@@ -1463,7 +1461,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             msg_params: The message parameters
         """
         sender_id = msg_params.get(RaftMessage.MSG_ARG_KEY_SENDER)
-        node_id = msg_params.get(RaftMessage.MSG_ARG_NODE_ID)
+        node_id = msg_params.get(RaftMessage.ARG_NODE_ID)
         
         logging.info(f"Received state request from node {sender_id}")
         
@@ -1475,27 +1473,27 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             # Create a state package with current system state
             state_package = {
                 # Include all necessary state information
-                RaftMessage.MSG_ARG_CURRENT_NODES: self.raft_consensus.get_cluster_members(),
-                RaftMessage.MSG_ARG_LEADER_ID: self.node_id,
-                RaftMessage.MSG_ARG_TERM: self.raft_consensus.raft_node.current_term,
+                RaftMessage.ARG_CURRENT_NODES: self.raft_consensus.get_cluster_members(),
+                RaftMessage.ARG_LEADER_ID: self.node_id,
+                RaftMessage.ARG_TERM: self.raft_consensus.raft_node.current_term,
                 # Include other metadata as needed
             }
             
             # Include model parameters and training state if available
             if hasattr(self, 'latest_model_params') and self.latest_model_params is not None:
-                state_package[RaftMessage.MSG_ARG_MODEL_PARAMS] = self.latest_model_params
+                state_package[RaftMessage.ARG_MODEL_PARAMS] = self.latest_model_params
             
             # Include coordinator and round information if available
             if self.coordinator_id is not None:
                 state_package[RaftMessage.MSG_ARG_COORDINATOR] = self.coordinator_id
             if hasattr(self, 'round') and self.round is not None:
-                state_package[RaftMessage.MSG_ARG_ROUND] = self.round
+                state_package[RaftMessage.ARG_ROUND] = self.round
             
             # Send state snapshot back to requesting node
             content = {
-                RaftMessage.MSG_ARG_STATE_PACKAGE: state_package
+                RaftMessage.ARG_STATE_PACKAGE: state_package
             }
-            self.send_raft_message(RaftMessage.MSG_TYPE_RAFT_STATE_SNAPSHOT, sender_id, content)
+            self.send_raft_message(RaftMessage.MSG_TYPE_STATE_SNAPSHOT, sender_id, content)
             logging.info(f"Sent state snapshot to node {sender_id}")
         else:
             # If not leader, redirect to the leader

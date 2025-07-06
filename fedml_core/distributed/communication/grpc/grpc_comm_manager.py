@@ -360,6 +360,22 @@ class ServiceDiscoveryClient:
 
 
 class DynamicGRPCCommManager(BaseCommunicationManager):
+    def add_raft_handler(self, msg_type, handler):
+        """
+        Register a handler for a specific RAFT message type.
+        Args:
+            msg_type: The RAFT message type (str or int or tuple/list of types)
+            handler: Callable with signature (msg_type, msg_params)
+        """
+        if not hasattr(self, '_raft_handlers'):
+            self._raft_handlers = {}
+        # Allow registering for multiple types at once
+        if isinstance(msg_type, (list, tuple, set)):
+            for t in msg_type:
+                self._raft_handlers[t] = handler
+        else:
+            self._raft_handlers[msg_type] = handler
+
     """
     Refactored Dynamic gRPC Communication Manager.
     
@@ -920,7 +936,7 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
             try:
                 # Check for messages in the gRPC servicer queue
                 msg_bytes = self.grpc_servicer.message_q.get()
-                
+
                 # Deserialize the message
                 try:
                     msg_params = pickle.loads(msg_bytes)
@@ -928,24 +944,40 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
                 except (pickle.UnpicklingError, AttributeError) as e:
                     logging.error(f"Failed to deserialize message: {e}")
                     continue
-                
+
                 logging.debug(f"Received message type: {msg_type}")
-                
-                # Check if this is a RAFT message that should be handled by bridge
-                # Convert msg_type to string to handle cases where it's an integer
+
+                # Check if this is a RAFT message that should be handled by bridge/handler
                 msg_type_str = str(msg_type)
                 is_raft_message = (msg_params.get("message_source") == "raft" or 
                                  msg_type_str.startswith("MSG_TYPE_RAFT_"))
-                
-                if is_raft_message and self.is_bridge_active():
-                    logging.debug(f"Routing RAFT message to bridge: {msg_type}")
-                    # RAFT messages will be handled through the bridge/consensus layer
-                    # The bridge components will register as observers if needed
-                
-                # Notify observers
+
+                handled_by_raft = False
+                if is_raft_message:
+                    # Prefer explicit RAFT handler for this message type if registered
+                    if hasattr(self, '_raft_handlers') and self._raft_handlers:
+                        handler = self._raft_handlers.get(msg_type)
+                        if handler:
+                            logging.debug(f"Dispatching RAFT message to handler for type {msg_type}")
+                            try:
+                                handler(msg_type, msg_params)
+                                handled_by_raft = True
+                            except Exception as e:
+                                logging.error(f"RAFT handler error: {e}")
+                        else:
+                            logging.debug(f"No RAFT handler registered for type {msg_type}")
+                    elif self.is_bridge_active():
+                        # Fallback: if bridge is active, try to notify as observer
+                        logging.debug(f"Routing RAFT message to bridge as observer: {msg_type}")
+                        # (Bridge should be registered as observer if needed)
+
+                # Notify observers (always, or skip for RAFT if handled? Here: always notify)
                 for observer in self._observers:
-                    observer.receive_message(msg_type, msg_params)
-                    
+                    try:
+                        observer.receive_message(msg_type, msg_params)
+                    except Exception as e:
+                        logging.error(f"Observer receive_message error: {e}")
+
             except Exception as e:
                 logging.error(f"Message handling error: {e}")
                 if not self.is_running:
@@ -1061,8 +1093,8 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
             bridge: RaftServiceDiscoveryBridge instance
         """
         try:
-            if self.bridge_registered:
-                logging.warning(f"Service discovery bridge already registered for node {self.node_id}")
+            if self.bridge_registered and self.service_discovery_bridge == bridge:
+                logging.debug(f"Bridge already registered, skipping duplicate registration")
                 return False
             
             # Set bridge reference

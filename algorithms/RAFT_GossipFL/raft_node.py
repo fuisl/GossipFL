@@ -80,6 +80,9 @@ class RaftNode:
         self.prevotes_received = set()  # Set of nodes that granted prevotes for this node
         self.prevote_term = 0  # The term for which prevotes are being collected (current_term + 1)
         
+        # Lock for thread safety
+        self.state_lock = threading.RLock()
+        
         # Election timeout (randomized to prevent split votes)
         self.min_election_timeout = getattr(args, 'min_election_timeout', 150) / 1000.0  # default 150ms
         self.max_election_timeout = getattr(args, 'max_election_timeout', 300) / 1000.0  # default 300ms
@@ -87,9 +90,6 @@ class RaftNode:
         
         # Heartbeat interval (for leaders)
         self.heartbeat_interval = getattr(args, 'heartbeat_interval', 50) / 1000.0  # default 50ms
-        
-        # Lock for thread safety
-        self.state_lock = threading.RLock()
         
         # Callbacks for external interactions (to be set by the manager)
         self.on_state_change = None
@@ -105,17 +105,10 @@ class RaftNode:
         self.known_nodes = set()
         self.current_leader_id = None  # Track current leader ID
         
-        # For backward compatibility, if a fixed cluster size is provided, use it
         # But in dynamic mode, we'll update this through service discovery
-        if hasattr(args, 'client_num_in_total') and args.client_num_in_total is not None:
-            # Static cluster mode - initialize with sequential IDs
-            self.update_known_nodes(list(range(args.client_num_in_total)))
-            logging.info(f"Node {self.node_id}: Initialized in static cluster mode with {args.client_num_in_total} nodes")
-        else:
-            # Dynamic cluster mode - wait for service discovery
-            self.total_nodes = 0
-            self.majority = 1  # Will be updated when nodes are discovered
-            logging.info(f"Node {self.node_id}: Initialized in dynamic cluster mode")
+        self.total_nodes = 0
+        self.majority = 1  # Will be updated when nodes are discovered
+        logging.info(f"Node {self.node_id}: Initialized in dynamic cluster mode")
         
         logging.info(
             f"RAFT Node {self.node_id} initialized in {self.state.name} state"

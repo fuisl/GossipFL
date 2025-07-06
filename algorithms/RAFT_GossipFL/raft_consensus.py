@@ -1128,6 +1128,7 @@ class RaftConsensus:
             return True
             
         except Exception as e:
+            traceback.print_exc()
             logging.error(f"Node {self.raft_node.node_id}: Error registering service discovery bridge: {e}")
             return False
     
