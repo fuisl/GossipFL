@@ -71,14 +71,19 @@ class RaftConsensus:
         if topology_manager:
             self.raft_node.topology_manager = topology_manager
 
-        # Allow the raft_node to access consensus callbacks
-        self.raft_node.consensus_manager = self
-        
         # Service discovery bridge (will be set later)
         self.service_discovery_bridge = None
         
         # Set callback for state changes
         self.raft_node.on_state_change = self.handle_state_change
+        
+        # Wire up all send callbacks
+        self.raft_node.on_send_prevote = self._send_prevote_callback
+        self.raft_node.on_send_vote = self._send_vote_callback
+        self.raft_node.on_send_append = self._send_append_callback
+        self.raft_node.on_send_snapshot = self._send_snapshot_callback
+        self.raft_node.on_commit = self._commit_callback
+        self.raft_node.on_membership_change = self._membership_change_callback
         
         self.election_timer_thread = None
         self.heartbeat_thread = None
@@ -95,15 +100,12 @@ class RaftConsensus:
         # Callback for leadership changes
         self.on_leadership_change = None
         
-        # Current leader ID (None if unknown)
-        self.current_leader_id = None
-        
-        # Current coordinator ID (None if unknown)
-        self.current_coordinator_id = None
+        # Thread-safe replication interval
+        self.replication_interval = getattr(args, 'replication_interval', 0.1)  # default 100ms
         
         # Thread state tracking
         self.is_running = False
-
+        
         # Interval between log replication attempts
         self.replication_interval = getattr(args, "replication_interval", self.raft_node.heartbeat_interval)
         
@@ -184,8 +186,6 @@ class RaftConsensus:
         
         with self.thread_lock:
             if new_state == RaftState.LEADER:
-                self.current_leader_id = self.raft_node.node_id
-                
                 # Start leader-specific threads
                 self._start_leader_threads()
                 
@@ -219,9 +219,7 @@ class RaftConsensus:
                     )
                     logging.debug(f"Node {self.raft_node.node_id}: Updated discovery hint sender for {hint_state} state")
                 
-                # If we were the leader and now we're not, clear our leader status
-                if self.current_leader_id == self.raft_node.node_id:
-                    self.current_leader_id = None
+                # Note: Leader tracking is now handled by RaftNode.get_leader_id()
     
     def _start_election_timer_thread(self):
         """Start the election timer thread (always runs for followers/candidates)."""
@@ -330,12 +328,8 @@ class RaftConsensus:
                     )
 
                     try:
-                        # Start election (which may initiate a PreVote phase)
-                        transitioned = self.raft_node.start_election()
-
-                        # If we actually became a candidate, request votes
-                        if transitioned and self.raft_node.state == RaftState.CANDIDATE:
-                            self.request_votes_from_all()
+                        # Start election - RaftNode will handle vote requests via callbacks
+                        self.raft_node.start_election()
                     except Exception as e:
                         logging.error(
                             f"Node {self.raft_node.node_id}: Error starting election: {e}"
@@ -366,8 +360,8 @@ class RaftConsensus:
                     break
                 
                 try:
-                    # Send heartbeats to all followers (RAFT Algorithm Step)
-                    self.send_heartbeats()
+                    # Send heartbeats periodically 
+                    self.raft_node.send_heartbeats()
                 except Exception as e:
                     logging.error(f"Node {self.raft_node.node_id}: Error sending heartbeats: {e}")
                 
@@ -397,8 +391,9 @@ class RaftConsensus:
                     break
                 
                 try:
-                    # Replicate logs to followers (RAFT Algorithm Step)
-                    self.replicate_logs()
+                    # Check if there are logs to replicate and replicate if needed
+                    if self.raft_node.should_replicate_logs():
+                        self.raft_node.replicate_logs()
                     
                     # Update commit index based on successful replications
                     self.raft_node.update_commit_index()
@@ -414,132 +409,6 @@ class RaftConsensus:
             logging.error(f"Node {self.raft_node.node_id}: Thread traceback: {traceback.format_exc()}")
         finally:
             logging.info(f"Node {self.raft_node.node_id}: Log replication thread finished")
-    
-    def request_votes_from_all(self):
-        """Send vote requests to all other nodes."""
-        if self.raft_node.state != RaftState.CANDIDATE:
-            return
-        
-        last_log_index, last_log_term = self.raft_node.get_last_log_info()
-        
-        for node_id in self.raft_node.known_nodes:
-            if node_id == self.raft_node.node_id:
-                continue  # Skip self
-            
-            # Send vote request to node
-            try:
-                self.worker_manager.send_vote_request(
-                    node_id,
-                    self.raft_node.current_term,
-                    last_log_index,
-                    last_log_term
-                )
-            except Exception as e:
-                logging.error(f"Node {self.raft_node.node_id}: Error sending vote request to {node_id}: {e}")
-
-    def broadcast_prevote_request(self, candidate_id, term, last_log_index, last_log_term):
-        """Send PreVote requests to all other nodes."""
-        for node_id in self.raft_node.known_nodes:
-            if node_id == self.raft_node.node_id:
-                continue
-
-            try:
-                self.worker_manager.send_prevote_request(
-                    node_id,
-                    term,
-                    last_log_index,
-                    last_log_term,
-                )
-            except Exception as e:
-                logging.error(f"Node {self.raft_node.node_id}: Error sending prevote request to {node_id}: {e}")
-
-    def send_heartbeats(self):
-        """Send heartbeat messages to all followers."""
-        if self.raft_node.state != RaftState.LEADER:
-            return
-        
-        for node_id in self.raft_node.known_nodes:
-            if node_id == self.raft_node.node_id:
-                continue  # Skip self
-
-            try:
-                next_index = self.raft_node.next_index.get(
-                    node_id, self.raft_node.first_log_index + len(self.raft_node.log)
-                )
-
-                if next_index <= self.raft_node.last_snapshot_index:
-                    self._send_snapshot(node_id)
-                    continue
-
-                prev_log_index = next_index - 1
-                prev_log_term = self.raft_node.get_term_at_index(prev_log_index)
-                
-                self.worker_manager.send_append_entries(
-                    node_id,
-                    self.raft_node.current_term,
-                    prev_log_index,
-                    prev_log_term,
-                    [],  # Empty entries for heartbeat
-                    self.raft_node.commit_index
-                )
-            except Exception as e:
-                logging.error(f"Node {self.raft_node.node_id}: Error sending heartbeat to {node_id}: {e}")
-    
-    def replicate_logs(self):
-        """Replicate log entries to followers."""
-        if self.raft_node.state != RaftState.LEADER:
-            return
-        
-        for node_id in self.raft_node.known_nodes:
-            if node_id == self.raft_node.node_id:
-                continue  # Skip self
-            
-            try:
-                next_index = self.raft_node.next_index.get(
-                    node_id, self.raft_node.first_log_index + len(self.raft_node.log)
-                )
-
-                if next_index <= self.raft_node.last_snapshot_index:
-                    # follower is too far behind, send snapshot
-                    self._send_snapshot(node_id)
-                    continue
-
-                array_idx = next_index - self.raft_node.first_log_index
-                entries_to_send = self.raft_node.log[array_idx:]
-
-                prev_log_index = next_index - 1
-                prev_log_term = self.raft_node.get_term_at_index(prev_log_index)
-
-                self.worker_manager.send_append_entries(
-                    node_id,
-                    self.raft_node.current_term,
-                    prev_log_index,
-                    prev_log_term,
-                    entries_to_send,
-                    self.raft_node.commit_index,
-                )
-            except Exception as e:
-                logging.error(f"Node {self.raft_node.node_id}: Error replicating logs to {node_id}: {e}")
-
-    def _send_snapshot(self, node_id):
-        """Send a snapshot of the current state to the given follower."""
-        try:
-            self.worker_manager.send_install_snapshot(
-                node_id,
-                self.raft_node.current_term,
-                self.raft_node.last_snapshot_index,
-                self.raft_node.last_snapshot_term,
-                0,
-                self.raft_node.log,
-                True,
-            )
-            logging.debug(
-                f"Node {self.raft_node.node_id}: Sent snapshot to follower {node_id}"
-            )
-        except Exception as e:
-            logging.error(
-                f"Node {self.raft_node.node_id}: Error sending snapshot to {node_id}: {e}"
-            )
     
     def handle_vote_request(self, candidate_id, term, last_log_index, last_log_term):
         """
@@ -588,9 +457,6 @@ class RaftConsensus:
             # Start leader threads (handled by state change callback)
             # The handle_state_change method will start the appropriate threads
             
-            # Set current leader
-            self.current_leader_id = self.raft_node.node_id
-            
             # Notify leadership change
             if self.on_leadership_change:
                 self.on_leadership_change(self.raft_node.node_id)
@@ -632,11 +498,6 @@ class RaftConsensus:
             tuple: (current_term, success)
         """
         try:
-            # Update current leader if this is a valid AppendEntries
-            if term >= self.raft_node.current_term:
-                self.current_leader_id = leader_id
-                logging.debug(f"Node {self.raft_node.node_id}: Updated leader to {leader_id} for term {term}")
-            
             # Process the AppendEntries in the RAFT node
             current_term, success = self.raft_node.append_entries(
                 leader_id, term, prev_log_index, prev_log_term, entries, leader_commit)
@@ -843,7 +704,7 @@ class RaftConsensus:
         Returns:
             int: ID of the current coordinator (same as leader)
         """
-        return self.current_leader_id
+        return self.get_leader_id()
     
     def on_membership_change(self, new_nodes, round_num=0):
         """
@@ -890,9 +751,6 @@ class RaftConsensus:
         """
         try:
             if self.worker_manager is not None:
-                # Update our internal tracking of current coordinator
-                self.current_coordinator_id = new_coordinator
-                
                 # Notify the worker manager about the coordinator change
                 self.worker_manager.on_coordinator_change(
                     new_coordinator=new_coordinator,
@@ -1009,87 +867,6 @@ class RaftConsensus:
             
             return committed_state
     
-    def handle_node_join_request(self, node_id):
-        """
-        Handle a request from a new node to join the cluster.
-        
-        This method uses the RAFT protocol to ensure the joining node
-        gets a consistent view of the cluster state.
-        
-        Args:
-            node_id (int): ID of the node wanting to join
-            
-        Returns:
-            bool: True if the join was handled successfully, False otherwise
-        """
-        if not self.is_leader():
-            logging.info(f"Node {self.raft_node.node_id}: Not leader, cannot handle join request from {node_id}")
-            return False
-        
-        logging.info(f"Node {self.raft_node.node_id}: Handling join request from node {node_id}")
-        
-        self.send_state_to_new_node(node_id)
-        return True
-    
-    def send_state_to_new_node(self, new_node_id):
-        """
-        Send the current state to a new node.
-        
-        Args:
-            new_node_id (int): ID of the new node
-        """
-        # Send the complete log
-        self.worker_manager.send_state_snapshot(
-            new_node_id,
-            self.raft_node.current_term,
-            self.raft_node.log,
-            self.raft_node.commit_index
-        )
-        # Also send the latest model parameters for faster start
-        if hasattr(self.worker_manager.worker, "model_trainer"):
-            params = self.worker_manager.worker.model_trainer.get_model_params()
-            self.worker_manager.send_model_params(new_node_id, params)
-    
-    def handle_state_snapshot(self, term, log, commit_index):
-        """
-        Handle a state snapshot from the leader.
-
-        Args:
-            term (int): Leader's term
-            log (list): Complete log from leader
-            commit_index (int): Leader's commit index
-
-        Returns:
-            bool: True if snapshot was applied, False otherwise
-        """
-        with self.raft_node.state_lock:
-            # Update term if needed
-            if term > self.raft_node.current_term:
-                self.raft_node.become_follower(term)
-            elif self.raft_node.state == RaftState.INITIAL:
-                self.raft_node.become_follower(term)
-
-            # Replace the in‐memory log
-            self.raft_node.log = list(log)  # make a copy to be safe
-
-            # Advance commit index and apply entries
-            if commit_index > self.raft_node.commit_index:
-                self.raft_node.commit_index = commit_index
-                self.raft_node.apply_committed_entries()
-
-        sync_payload = {
-            'leader_id':    self.current_leader_id,
-            'term':         term,
-            'known_nodes':  list(self.raft_node.known_nodes),
-            'commit_index': commit_index,
-            'log_entries':  list(log),
-            'timestamp':    time.time(),
-        }
-        # call directly into your node’s handler
-        self.raft_node.handle_state_sync_response(sync_payload)
-
-        return True
-    
     def is_leader(self):
         """
         Check if this node is the leader.
@@ -1106,7 +883,7 @@ class RaftConsensus:
         Returns:
             int: ID of the current leader, or None if unknown
         """
-        return self.current_leader_id
+        return self.raft_node.get_leader_id()
     
     def get_current_leader(self):
         """
@@ -1187,7 +964,7 @@ class RaftConsensus:
                 'node_id': self.raft_node.node_id,
                 'node_state': str(self.raft_node.state),
                 'current_term': self.raft_node.current_term,
-                'current_leader_id': self.current_leader_id,
+                'current_leader_id': self.get_leader_id(),
                 'commit_index': self.raft_node.commit_index,
                 'log_length': len(self.raft_node.log),
                 'threads': {
@@ -1244,24 +1021,6 @@ class RaftConsensus:
             bool: True if discovery hint sender is configured and active
         """
         return self.discovery_hint_sender is not None
-        
-    def get_leader_id(self):
-        """
-        Get the current leader ID.
-        
-        Returns:
-            int: ID of the current leader, or None if no leader is known
-        """
-        return self.current_leader_id
-    
-    def is_leader(self):
-        """
-        Check if this node is the current leader.
-        
-        Returns:
-            bool: True if this node is the leader
-        """
-        return self.raft_node.state == RaftState.LEADER
     
     def get_known_nodes(self):
         """
@@ -1496,142 +1255,6 @@ class RaftConsensus:
             logging.error(f"Node {self.raft_node.node_id}: Error proposing membership change: {e}")
             return False
     
-    def coordinate_new_node_sync(self, node_id):
-        """
-        Coordinate state synchronization for a new node joining the cluster.
-        
-        Args:
-            node_id (int): ID of the new node
-            
-        Returns:
-            bool: True if sync coordination was successful, False otherwise
-        """
-        try:
-            if self.raft_node.state != RaftState.LEADER:
-                logging.warning(f"Node {self.raft_node.node_id}: Cannot coordinate sync - not a leader")
-                return False
-            
-            # Create state sync response for the new node
-            sync_response = self._create_state_snapshot(node_id)
-            
-            # Send state sync response to the new node
-            return self._send_state_sync_response(node_id, sync_response)
-            
-        except Exception as e:
-            logging.error(f"Node {self.raft_node.node_id}: Error coordinating new node sync: {e}")
-            return False
-    
-    def _create_state_snapshot(self, target_node_id):
-        """
-        Create a complete state snapshot for a new node.
-        
-        Args:
-            target_node_id (int): ID of the node requesting the snapshot
-            
-        Returns:
-            dict: State snapshot containing cluster state
-        """
-        try:
-            # Get current cluster state
-            cluster_state = self.raft_node.get_cluster_state()
-            
-            # Create comprehensive state snapshot
-            snapshot = {
-                'type': 'state_sync_response',
-                'leader_id': self.raft_node.node_id,
-                'term': self.raft_node.current_term,
-                'known_nodes': cluster_state['known_nodes'],
-                'commit_index': self.raft_node.commit_index,
-                'log_entries': self._get_committed_log_entries(),
-                'timestamp': time.time()
-            }
-            
-            # Add connection information if available
-            if hasattr(self.raft_node, 'node_connection_info'):
-                snapshot['node_connection_info'] = dict(self.raft_node.node_connection_info)
-            
-            # Add current model state if available
-            if hasattr(self.raft_node, 'model_state') and self.raft_node.model_state:
-                snapshot['model_state'] = self.raft_node.model_state
-                snapshot['model_version'] = getattr(self.raft_node, 'current_model_version', 0)
-            
-            logging.debug(f"Leader {self.raft_node.node_id}: Created state snapshot for node {target_node_id}")
-            return snapshot
-            
-        except Exception as e:
-            logging.error(f"Node {self.raft_node.node_id}: Error creating state snapshot: {e}")
-            return {}
-    
-    def _get_committed_log_entries(self):
-        """
-        Get all committed log entries for state synchronization.
-        
-        Returns:
-            list: List of committed log entries
-        """
-        try:
-            committed_entries = []
-            
-            # Get entries up to commit index
-            for i in range(self.raft_node.commit_index):
-                log_array_index = i + 1 - self.raft_node.first_log_index
-                if 0 <= log_array_index < len(self.raft_node.log):
-                    committed_entries.append(self.raft_node.log[log_array_index])
-            
-            return committed_entries
-            
-        except Exception as e:
-            logging.error(f"Node {self.raft_node.node_id}: Error getting committed log entries: {e}")
-            return []
-    
-    def _send_state_sync_response(self, target_node_id, sync_response):
-        """
-        Send state sync response to a specific node.
-        
-        Args:
-            target_node_id (int): ID of the target node
-            sync_response (dict): State sync response data
-            
-        Returns:
-            bool: True if sent successfully, False otherwise
-        """
-        try:
-            if hasattr(self.worker_manager, 'send_message_to_node'):
-                # Send via worker manager
-                self.worker_manager.send_message_to_node(target_node_id, sync_response)
-                logging.info(f"Leader {self.raft_node.node_id}: Sent state sync response to node {target_node_id}")
-                return True
-            else:
-                logging.warning(f"Node {self.raft_node.node_id}: No method available to send state sync response")
-                return False
-                
-        except Exception as e:
-            logging.error(f"Node {self.raft_node.node_id}: Error sending state sync response: {e}")
-            return False
-    
-    def broadcast_state_sync_request(self, request_data):
-        """
-        Broadcast a state sync request to find the current leader.
-        
-        Args:
-            request_data (dict): State sync request data
-            
-        Returns:
-            bool: True if broadcast was successful, False otherwise
-        """
-        try:
-            if hasattr(self.worker_manager, 'broadcast_message'):
-                self.worker_manager.broadcast_message(request_data)
-                logging.info(f"Node {self.raft_node.node_id}: Broadcasted state sync request")
-                return True
-            else:
-                logging.warning(f"Node {self.raft_node.node_id}: No method available to broadcast state sync request")
-                return False
-                
-        except Exception as e:
-            logging.error(f"Node {self.raft_node.node_id}: Error broadcasting state sync request: {e}")
-            return False
-    
     def _validate_node_capabilities(self, node_id, node_info):
         """
         Validate that a discovered node has the required capabilities.
@@ -1682,7 +1305,8 @@ class RaftConsensus:
             bool: True if forwarded successfully, False otherwise
         """
         try:
-            if not self.current_leader_id or self.current_leader_id == self.raft_node.node_id:
+            current_leader_id = self.get_leader_id()
+            if not current_leader_id or current_leader_id == self.raft_node.node_id:
                 logging.debug(f"Node {self.raft_node.node_id}: No known leader to forward to")
                 return False
             
@@ -1695,8 +1319,8 @@ class RaftConsensus:
             }
             
             if hasattr(self.worker_manager, 'send_message_to_node'):
-                self.worker_manager.send_message_to_node(self.current_leader_id, forward_message)
-                logging.debug(f"Node {self.raft_node.node_id}: Forwarded {message_type} to leader {self.current_leader_id}")
+                self.worker_manager.send_message_to_node(current_leader_id, forward_message)
+                logging.debug(f"Node {self.raft_node.node_id}: Forwarded {message_type} to leader {current_leader_id}")
                 return True
             else:
                 logging.warning(f"Node {self.raft_node.node_id}: No method available to forward message to leader")
@@ -1746,3 +1370,135 @@ class RaftConsensus:
         except Exception as e:
             logging.error(f"Node {self.raft_node.node_id}: Error getting bridge status: {e}")
             return {'registered': False, 'active': False, 'stats': {}}
+
+    # ============================================================================
+    # RaftNode Callback Implementations
+    # ============================================================================
+    
+    def _broadcast(self, rpc_method_name, *args, max_retries=3, retry_delay=0.1):
+        """
+        Unified method to broadcast RPC to all peers with retry logic.
+        
+        Args:
+            rpc_method_name (str): Name of the worker_manager method to call
+            *args: Arguments to pass to the RPC method
+            max_retries (int): Maximum number of retry attempts
+            retry_delay (float): Delay between retries in seconds
+        """
+        try:
+            for peer in self.raft_node.known_nodes - {self.raft_node.node_id}:
+                self._send_to_peer_with_retry(peer, rpc_method_name, *args, 
+                                             max_retries=max_retries, retry_delay=retry_delay)
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error in broadcast {rpc_method_name}: {e}")
+    
+    def _send_to_peer(self, node_id, rpc_method_name, *args):
+        """
+        Send RPC to a specific peer.
+        
+        Args:
+            node_id (int): Target node ID
+            rpc_method_name (str): Name of the worker_manager method to call
+            *args: Arguments to pass to the RPC method
+        """
+        try:
+            getattr(self.worker_manager, rpc_method_name)(node_id, *args)
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error sending {rpc_method_name} to {node_id}: {e}")
+    
+    def _send_to_peer_with_retry(self, node_id, rpc_method_name, *args, max_retries=3, retry_delay=0.1):
+        """
+        Send RPC to a specific peer with retry logic.
+        
+        Args:
+            node_id (int): Target node ID
+            rpc_method_name (str): Name of the worker_manager method to call
+            *args: Arguments to pass to the RPC method
+            max_retries (int): Maximum number of retry attempts
+            retry_delay (float): Delay between retries in seconds
+        """
+        for attempt in range(max_retries):
+            try:
+                getattr(self.worker_manager, rpc_method_name)(node_id, *args)
+                return  # Success, exit retry loop
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logging.warning(f"Node {self.raft_node.node_id}: Error sending {rpc_method_name} to {node_id} "
+                                   f"(attempt {attempt + 1}/{max_retries}): {e}")
+                    time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+                else:
+                    logging.error(f"Node {self.raft_node.node_id}: Failed to send {rpc_method_name} to {node_id} "
+                                 f"after {max_retries} attempts: {e}")
+    
+    def _send_prevote_callback(self, candidate_id, term, last_log_index, last_log_term):
+        """Callback for sending prevote requests to all peers."""
+        self._broadcast('send_prevote_request', term, candidate_id, last_log_index, last_log_term)
+    
+    def _send_vote_callback(self, candidate_id, term, last_log_index, last_log_term):
+        """Callback for sending vote requests to all peers."""
+        self._broadcast('send_vote_request', term, candidate_id, last_log_index, last_log_term)
+    
+    def _send_append_callback(self, node_id, current_term, leader_id, prev_log_index, prev_log_term, 
+                             entries, leader_commit_index):
+        """Callback for sending append entries to a specific peer with retry logic."""
+        self._send_to_peer_with_retry(node_id, 'send_append_entries', 
+                                     current_term, leader_id, prev_log_index, prev_log_term, entries, leader_commit_index)
+    
+    def _send_snapshot_callback(self, node_id, current_term, leader_id, last_included_index, 
+                               last_included_term, snapshot_data):
+        """Callback for sending snapshots to a specific peer with retry logic."""
+        self._send_to_peer_with_retry(node_id, 'send_install_snapshot',
+                                     current_term, leader_id, last_included_index, last_included_term, 
+                                     0, snapshot_data, True)  # offset=0, done=True
+    
+    def _commit_callback(self, entry):
+        """Callback for when entries are committed."""
+        try:
+            # Handle different types of log entries
+            if isinstance(entry, dict):
+                command = entry.get('command', {})
+                consensus_type = command.get('type')
+                
+                if consensus_type == 'topology':
+                    if self.topology_manager:
+                        self.topology_manager.apply_topology_update(command.get('data'))
+                        
+                elif consensus_type == 'bandwidth':
+                    if self.bandwidth_manager:
+                        self.bandwidth_manager.apply_bandwidth_update(command.get('data'))
+                        
+                elif consensus_type == 'membership':
+                    self._handle_membership_commit(command.get('data'))
+                    
+                elif consensus_type == 'coordinator':
+                    self._handle_coordinator_commit(command.get('data'))
+                    
+                else:
+                    logging.warning(f"Node {self.raft_node.node_id}: Unknown consensus type in commit: {consensus_type}")
+                    
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error in commit callback: {e}")
+            
+    def _membership_change_callback(self, nodes):
+        """Callback for membership changes."""
+        try:
+            if self.service_discovery_bridge:
+                self.service_discovery_bridge.handle_membership_change(nodes)
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error in membership change callback: {e}")
+    
+    def _handle_membership_commit(self, data):
+        """Handle committed membership changes."""
+        try:
+            # Implementation depends on the specific membership change format
+            logging.info(f"Node {self.raft_node.node_id}: Committed membership change: {data}")
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error handling membership commit: {e}")
+    
+    def _handle_coordinator_commit(self, data):
+        """Handle committed coordinator changes."""
+        try:
+            # Implementation depends on the specific coordinator change format
+            logging.info(f"Node {self.raft_node.node_id}: Committed coordinator change: {data}")
+        except Exception as e:
+            logging.error(f"Node {self.raft_node.node_id}: Error handling coordinator commit: {e}")
