@@ -894,8 +894,8 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
         """Remove message observer."""
         if observer in self._observers:
             self._observers.remove(observer)
-    
-    def handle_receive_message(self):
+
+    def start_message_handling(self):
         """Start message handling."""
         # Note: _notify_connection_ready() is already called by _handle_discovery_success()
         self.message_handling_subroutine()
@@ -1255,3 +1255,15 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
         return (self.bridge_registered and 
                 self.service_discovery_bridge and 
                 self.service_discovery_bridge.state.value == "active")
+    
+    def get_comm_manager(self):
+        """
+        Get the communication manager instance.
+        
+        This is useful for components that need to interact with the comm manager
+        directly, such as RAFT consensus or other distributed algorithms.
+        
+        Returns:
+            gRPCCommManager: The communication manager instance
+        """
+        return self
