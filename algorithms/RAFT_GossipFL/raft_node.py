@@ -20,6 +20,17 @@ class RaftNode:
     
     This class encapsulates the state and behavior of a node in the RAFT consensus
     algorithm. It manages state transitions, voting, and term progression.
+    
+    **Pure State Machine Design:**
+    This class has been refactored to be a pure RAFT state machine with no 
+    application-specific logic. All external interactions happen via callbacks:
+    
+    - `on_state_change(new_state)`: Called when node state changes
+    - `on_commit(entry)`: Called when log entries are committed
+    - `on_membership_change(nodes)`: Called when cluster membership changes
+    - `on_send_prevote(...)`: Called to send prevote requests
+    - `on_send_vote(...)`: Called to send vote requests  
+    - `on_send_append(...)`: Called to send append entries
     """
     
     def __init__(self, node_id, args):
@@ -80,17 +91,25 @@ class RaftNode:
         # Lock for thread safety
         self.state_lock = threading.RLock()
         
-        # Callback for state changes (to be set by the manager)
+        # Callbacks for external interactions (to be set by the manager)
         self.on_state_change = None
+        self.on_commit = None
+        self.on_membership_change = None
+        self.on_send_prevote = None
+        self.on_send_vote = None
+        self.on_send_append = None
+        self.on_install_snapshot = None
+        self.on_send_snapshot = None
         
         # Track known nodes - start empty for dynamic discovery
         self.known_nodes = set()
+        self.current_leader_id = None  # Track current leader ID
         
         # For backward compatibility, if a fixed cluster size is provided, use it
         # But in dynamic mode, we'll update this through service discovery
         if hasattr(args, 'client_num_in_total') and args.client_num_in_total is not None:
             # Static cluster mode - initialize with sequential IDs
-            self.update_known_nodes(args.client_num_in_total)
+            self.update_known_nodes(list(range(args.client_num_in_total)))
             logging.info(f"Node {self.node_id}: Initialized in static cluster mode with {args.client_num_in_total} nodes")
         else:
             # Dynamic cluster mode - wait for service discovery
@@ -102,11 +121,12 @@ class RaftNode:
             f"RAFT Node {self.node_id} initialized in {self.state.name} state"
         )
     
-    def update_known_nodes(self, total_nodes=None, node_ids=None):
+    def update_known_nodes(self, node_ids):
         """Update the known nodes set and notify components."""
         try:
             old_known_nodes = set(self.known_nodes)
             new_known_nodes = set(node_ids)
+            self.total_nodes = len(new_known_nodes)
             
             logging.debug(f"Node {self.node_id}: update_known_nodes called with {node_ids}")
             logging.debug(f"Node {self.node_id}: old_known_nodes={old_known_nodes}, new_known_nodes={new_known_nodes}")
@@ -134,12 +154,12 @@ class RaftNode:
             if self.state == RaftState.LEADER:
                 for node_id in added_nodes:
                     if node_id != self.node_id:
-                        self.next_index[node_id] = len(self.log)
+                        self.next_index[node_id] = self.first_log_index + len(self.log)
                         self.match_index[node_id] = 0
                         logging.debug(f"Node {self.node_id}: Initialized leader state for new node {node_id}")
             
             # Notify callback if set
-            if hasattr(self, 'on_membership_change') and self.on_membership_change:
+            if callable(self.on_membership_change):
                 self.on_membership_change(new_known_nodes)
                 
         except Exception as e:
@@ -147,12 +167,13 @@ class RaftNode:
     
     def reset_election_timeout(self):
         """Reset the election timeout with a random value and clear prevote state."""
-        self.election_timeout = random.uniform(self.min_election_timeout, self.max_election_timeout)
-        # Reset prevote state
-        self.prevote_requested = False
-        self.prevotes_received.clear()
-        self.prevote_term = 0
-        logging.debug(f"Node {self.node_id}: Reset election timeout to {self.election_timeout*1000:.2f}ms")
+        with self.state_lock:
+            self.election_timeout = random.uniform(self.min_election_timeout, self.max_election_timeout)
+            # Reset prevote state
+            self.prevote_requested = False
+            self.prevotes_received.clear()
+            self.prevote_term = 0
+            logging.debug(f"Node {self.node_id}: Reset election timeout to {self.election_timeout*1000:.2f}ms")
     
     def update_heartbeat(self):
         """
@@ -257,10 +278,8 @@ class RaftNode:
                             f"(current term: {self.current_term}, known nodes: {len(self.known_nodes)})")
                 
                 # Request prevotes from all other nodes
-                # Note: This would actually send RPCs to other nodes in a real implementation
-                # For the implementation here, we need to call the consensus manager
-                if hasattr(self, 'consensus_manager') and self.consensus_manager is not None:
-                    self.consensus_manager.broadcast_prevote_request(
+                if callable(self.on_send_prevote):
+                    self.on_send_prevote(
                         candidate_id=self.node_id,
                         term=self.prevote_term,
                         last_log_index=last_log_index,
@@ -341,10 +360,14 @@ class RaftNode:
                             f"(previous term: {old_term}, known nodes: {len(self.known_nodes)})")
                 
                 # Request votes from all other nodes
-                # In a real implementation, this would send RPCs to other nodes
-                if hasattr(self, 'consensus_manager') and self.consensus_manager is not None:
+                if callable(self.on_send_vote):
                     last_log_index, last_log_term = self.get_last_log_info()
-                    self.consensus_manager.request_votes_from_all()
+                    self.on_send_vote(
+                        candidate_id=self.node_id,
+                        term=self.current_term,
+                        last_log_index=last_log_index,
+                        last_log_term=last_log_term
+                    )
                 
                 return True
                 
@@ -393,10 +416,7 @@ class RaftNode:
                     logging.warning(f"Node {self.node_id}: Leader for term {self.current_term} refusing to vote for {candidate_id}")
                     return self.current_term, False
                 
-                # Check if vote can be granted:
-                # 1. Our term matches the candidate's term
-                # 2. We haven't voted for anyone else this term (or we already voted for this candidate)
-                # 3. The candidate's log is at least as up-to-date as ours
+                # Check if vote can be granted
                 vote_granted = False
                 if (term == self.current_term and 
                     (self.voted_for is None or self.voted_for == candidate_id) and
@@ -408,6 +428,10 @@ class RaftNode:
                     
                     # Reset election timeout when granting vote
                     self.update_heartbeat()
+                    
+                    # Clear current leader since we're voting for a new candidate
+                    if hasattr(self, 'current_leader_id'):
+                        self.current_leader_id = None
                     
                     logging.info(f"Node {self.node_id}: Granted vote to {candidate_id} for term {term}")
                 else:
@@ -563,7 +587,7 @@ class RaftNode:
                 self.votes_received = set()
                 
                 # Initialize leader state for each follower
-                last_log_index = len(self.log)
+                last_log_index, _ = self.get_last_log_info()
                 self.next_index = {node_id: last_log_index + 1 for node_id in self.known_nodes if node_id != self.node_id}
                 self.match_index = {node_id: 0 for node_id in self.known_nodes if node_id != self.node_id}
                 
@@ -659,44 +683,47 @@ class RaftNode:
             leader_commit (int): Leader's commit index
             
         Returns:
-            tuple: (current_term, success) - current_term is for the leader to update its term
-                  if needed, success indicates whether the append was successful
+            tuple: (current_term, success, hint) where:
+                - current_term: follower's current term for leader to update if needed
+                - success: True if append was successful, False otherwise
+                - hint: suggested next_index for leader to retry with (None if success or no hint)
         """
         with self.state_lock:
             try:
-                # Log heartbeat/append request at appropriate level
+                # Log request
                 is_heartbeat = not entries
                 log_level = logging.DEBUG if is_heartbeat else logging.INFO
                 logging.log(log_level, 
-                           f"Node {self.node_id}: Received {'heartbeat' if is_heartbeat else 'AppendEntries'} " +
-                           f"from leader {leader_id} for term {term} " +
-                           f"(prev_idx={prev_log_index}, prev_term={prev_log_term}, " +
-                           f"entries={len(entries) if entries else 0}, leader_commit={leader_commit})")
+                        f"Node {self.node_id}: Received {'heartbeat' if is_heartbeat else 'AppendEntries'} " +
+                        f"from leader {leader_id} for term {term}")
                 
-                # --- Step 1: State validation and updates ---
-                
-                # Nodes in INITIAL state should not accept AppendEntries unless they're ready
+                # Nodes in INITIAL state can accept AppendEntries if they're ready
                 if self.state == RaftState.INITIAL:
-                    # Only accept AppendEntries if:
-                    # 1. We have proper cluster information, AND
-                    # 2. We have been synchronized (or this is a bootstrap scenario)
-                    if not self._can_accept_leader_messages():
+                    if not self._is_ready_for_cluster_participation():
                         logging.debug(f"Node {self.node_id}: Rejecting AppendEntries in INITIAL state - not ready")
-                        return self.current_term, False
+                        return self.current_term, False, None
                     
-                    # We're ready to accept leadership - transition to follower
-                    logging.info(f"Node {self.node_id}: Converting from INITIAL to FOLLOWER on receiving AppendEntries from leader {leader_id}")
+                    # Ready to accept leadership - transition to follower
+                    logging.info(f"Node {self.node_id}: Converting from INITIAL to FOLLOWER on receiving AppendEntries")
                     self.become_follower(term)
-
+                
                 # If term < currentTerm, reject
                 if term < self.current_term:
                     logging.info(f"Node {self.node_id}: Rejecting AppendEntries with term {term} < current term {self.current_term}")
-                    return self.current_term, False
+                    return self.current_term, False, None
                 
                 # If term > currentTerm, convert to follower
                 if term > self.current_term:
                     logging.info(f"Node {self.node_id}: Converting to follower due to higher term from leader {leader_id}")
                     self.become_follower(term)
+                
+                # Track current leader for client redirects
+                if hasattr(self, 'current_leader_id') and self.current_leader_id != leader_id:
+                    self.current_leader_id = leader_id
+                    logging.debug(f"Node {self.node_id}: Updated current leader to {leader_id}")
+                elif not hasattr(self, 'current_leader_id'):
+                    self.current_leader_id = leader_id
+                    logging.debug(f"Node {self.node_id}: Set current leader to {leader_id}")
                 
                 # This is a valid AppendEntries from current leader, reset election timeout
                 self.update_heartbeat()
@@ -708,30 +735,45 @@ class RaftNode:
                 
                 # --- Step 2: Log consistency check ---
                 
-                # Convert prev_log_index (absolute) to array index considering first_log_index
-                array_idx = prev_log_index - self.first_log_index
-
-                # Check if our log has the entry at prev_log_index with term prev_log_term
-                # Special case: prev_log_index = 0 means we're starting from the beginning
-                if prev_log_index == 0:
-                    log_ok = True
-                    reason = "starting from beginning of log"
-                elif array_idx >= len(self.log) or array_idx < 0:
-                    log_ok = False
-                    reason = f"prev_log_index ({prev_log_index}) outside log range (first_log_index={self.first_log_index}, log length={len(self.log)})"
-                elif self.log[array_idx]['term'] != prev_log_term:
-                    log_ok = False
-                    reason = f"term mismatch at prev_log_index: expected {prev_log_term}, found {self.log[array_idx]['term']}"
+                # Check if prev_log_index is in our snapshot
+                if prev_log_index > 0 and prev_log_index <= self.last_snapshot_index:
+                    # Check if the term matches our snapshot
+                    if prev_log_index == self.last_snapshot_index and prev_log_term == self.last_snapshot_term:
+                        log_ok = True
+                        reason = "prev_log_index matches snapshot"
+                    else:
+                        log_ok = False
+                        reason = f"prev_log_index ({prev_log_index}) in snapshot but term mismatch"
                 else:
-                    log_ok = True
-                    reason = "log consistency check passed"
+                    # Standard log consistency check
+                    array_idx = prev_log_index - self.first_log_index
+                    
+                    if prev_log_index == 0:
+                        log_ok = True
+                        reason = "starting from beginning of log"
+                    elif array_idx >= len(self.log) or array_idx < 0:
+                        log_ok = False
+                        reason = f"prev_log_index ({prev_log_index}) outside log range"
+                        # Provide hint for leader to retry - suggest where our log actually starts
+                        hint = max(self.first_log_index - 1, self.last_snapshot_index) if len(self.log) > 0 else self.last_snapshot_index
+                        logging.info(f"Node {self.node_id}: Log consistency check failed: {reason}, suggesting retry from index {hint}")
+                        return self.current_term, False, hint
+                    elif self.log[array_idx]['term'] != prev_log_term:
+                        log_ok = False
+                        reason = f"term mismatch at prev_log_index {prev_log_index}: expected term {prev_log_term}, got {self.log[array_idx]['term']}"
+                        # Provide hint to help leader find the right index
+                        hint = max(prev_log_index - 1, self.first_log_index - 1, self.last_snapshot_index)
+                        logging.info(f"Node {self.node_id}: Log consistency check failed: {reason}, suggesting retry from index {hint}")
+                        return self.current_term, False, hint
+                    else:
+                        log_ok = True
+                        reason = "log consistency check passed"
                 
                 logging.log(logging.INFO if not log_ok else logging.DEBUG, 
-                           f"Node {self.node_id}: Log consistency check: {log_ok}, {reason}")
+                        f"Node {self.node_id}: Log consistency check: {log_ok}, {reason}")
                 
                 if not log_ok:
-                    # For future log compaction support, we might return nextIndex hint here
-                    return self.current_term, False
+                    return self.current_term, False, None
                 
                 # --- Step 3: Process entries ---
                 
@@ -777,18 +819,20 @@ class RaftNode:
                 # Update commit index if leader's commit index is higher
                 if leader_commit > self.commit_index:
                     old_commit_index = self.commit_index
-                    self.commit_index = min(leader_commit, len(self.log))
+                    # Fix: Use proper index calculation for commit index
+                    max_log_index = self.first_log_index + len(self.log) - 1 if len(self.log) > 0 else self.last_snapshot_index
+                    self.commit_index = min(leader_commit, max_log_index)
                     
                     if self.commit_index > old_commit_index:
                         logging.info(f"Node {self.node_id}: Updated commit index from {old_commit_index} to {self.commit_index}")
                         self.apply_committed_entries()
                 
-                return self.current_term, True
+                return self.current_term, True, None
                 
             except Exception as e:
                 logging.error(f"Node {self.node_id}: Error processing AppendEntries: {e}", exc_info=True)
                 # On error, it's safer to reject the append
-                return self.current_term, False
+                return self.current_term, False, None
     
     def compact_log(self, up_to_index=None):
         """
@@ -929,319 +973,56 @@ class RaftNode:
             
     def apply_log_entry(self, entry):
         """
-        Apply a log entry to the state machine.
-        
-        Args:
-            entry (dict): Log entry to apply
-        """
-        # Implement specific command execution here
-        command = entry.get('command', {})
-        command_type = command.get('type')
-        
-        if command_type == 'topology':
-            # Apply full topology update
-            logging.info(f"Node {self.node_id}: Applying topology update from log entry {entry['index']}")
-            self._apply_topology_update(command)
-        elif command_type == 'topology_delta':
-            # Apply incremental topology update
-            logging.info(f"Node {self.node_id}: Applying incremental topology update from log entry {entry['index']}")
-            self._apply_topology_delta(command)
-        elif command_type == 'bandwidth':
-            # Apply full bandwidth matrix update
-            logging.info(f"Node {self.node_id}: Applying bandwidth update from log entry {entry['index']}")
-            self._apply_bandwidth_update(command)
-        elif command_type == 'bandwidth_delta':
-            # Apply incremental bandwidth update
-            logging.info(f"Node {self.node_id}: Applying bandwidth delta from log entry {entry['index']}")
-            self._apply_bandwidth_delta(command)
-        elif command_type == 'membership':
-            # Apply membership change
-            logging.info(f"Node {self.node_id}: Applying membership change from log entry {entry['index']}")
-            self._apply_membership_change(command)
-        elif command_type == 'coordinator':
-            # Apply coordinator change
-            logging.info(f"Node {self.node_id}: Applying coordinator change from log entry {entry['index']}")
-            self._apply_coordinator_change(command)
-        elif command_type == 'batched_updates':
-            # Apply batched updates            
-            logging.info(f"Node {self.node_id}: Applying batched updates from log entry {entry['index']}")
-            for update in command.get('updates', []):
-                # Create a new command entry for each update in the batch
-                self.apply_log_entry({'term': entry['term'], 'index': entry['index'], 'command': update})
-        elif command_type == 'no-op':
-            # No-op entry, just acknowledge
-            logging.debug(f"Node {self.node_id}: Processed no-op entry {entry['index']}")
-        else:
-            logging.warning(f"Node {self.node_id}: Unknown command type in log entry: {command_type}")
-    
-    def _apply_topology_update(self, command):
-        """
-        Apply a full topology update command.
-        
-        Args:
-            command (dict): The topology update command
-        """
-        data = command.get('data', {})
-        
-        # Extract topology information
-        match = data.get('match')
-        topology_matrix = data.get('topology_matrix')
-        round_num = data.get('round')
-        
-        if hasattr(self, 'topology_manager') and self.topology_manager is not None:
-            # Update the topology manager with the new topology
-            if match is not None:
-                self.topology_manager.update_match(match, round_num)
-            if topology_matrix is not None:
-                self.topology_manager.update_topology_matrix(topology_matrix, round_num)
-        else:
-            # Store the topology information for later use
-            if not hasattr(self, 'pending_topology'):
-                self.pending_topology = {}
-            self.pending_topology['match'] = match
-            self.pending_topology['topology_matrix'] = topology_matrix
-            self.pending_topology['round'] = round_num
-            
-        logging.info(f"Node {self.node_id}: Applied topology update for round {round_num}")
-    
-    def _apply_topology_delta(self, command):
-        """
-        Apply an incremental topology update command.
-        
-        Args:
-            command (dict): The topology delta command
-        """
-        base_version = command.get('base_version')
-        changes = command.get('changes', [])
-        
-        # Check if the base version is in a compacted part of the log
-        if base_version < self.last_snapshot_index:
-            logging.warning(f"Node {self.node_id}: Cannot apply topology delta with base_version {base_version} - " +
-                          f"version predates last snapshot at index {self.last_snapshot_index}")
-            
-            # Request a full topology update instead
-            if hasattr(self, 'request_topology_update') and callable(self.request_topology_update):
-                logging.info(f"Node {self.node_id}: Requesting full topology update due to compaction")
-                self.request_topology_update()
-            return
-        
-        if hasattr(self, 'topology_manager') and self.topology_manager is not None:
-            # Apply changes to the topology manager
-            try:
-                self.topology_manager.apply_match_changes(changes, base_version)
-                logging.info(f"Node {self.node_id}: Applied {len(changes)} topology changes from base version {base_version}")
-            except Exception as e:
-                logging.error(f"Node {self.node_id}: Error applying topology delta: {e}")
-                # If error occurs, it might be due to missing base version - request full update
-                if hasattr(self, 'request_topology_update') and callable(self.request_topology_update):
-                    logging.info(f"Node {self.node_id}: Requesting full topology update due to error")
-                    self.request_topology_update()
-        else:
-            # Store changes for later application
-            if not hasattr(self, 'pending_topology_changes'):                
-                self.pending_topology_changes = []
-            self.pending_topology_changes.append((base_version, changes))
-            logging.debug(f"Node {self.node_id}: Stored {len(changes)} topology changes for later application")
+        Apply a log entry to the state machine using the callback approach.
 
-    def _apply_bandwidth_update(self, command):
-        """
-        Apply a full bandwidth matrix update command.
-        
         Args:
-            command (dict): The bandwidth update command
+            entry (dict): Log entry to apply, of the form:
+                {
+                'term': …,
+                'index': …,
+                'command': {
+                    'type': …,
+                    …  # payload fields
+                }
+                }
         """
-        data = command.get('data', {})
-        
-        if hasattr(self, 'bandwidth_manager') and self.bandwidth_manager is not None:
-            # Call the bandwidth manager to apply the update
-            self.bandwidth_manager.apply_bandwidth_update(data)
-            logging.info(f"Node {self.node_id}: Applied bandwidth update via bandwidth manager")
-        else:
-            # Store the bandwidth information for later use
-            if not hasattr(self, 'pending_bandwidth'):
-                self.pending_bandwidth = []
-            self.pending_bandwidth.append(data)
-            logging.warning(f"Node {self.node_id}: No bandwidth manager available, storing update for later use")
-    
-    def _apply_bandwidth_delta(self, command):
-        """
-        Apply an incremental bandwidth update command.
-        
-        Args:
-            command (dict): The bandwidth delta command
-        """
-        base_version = command.get('base_version')
-        changes = command.get('changes', {})
-        
-        # Check if the base version is in a compacted part of the log
-        if base_version < self.last_snapshot_index:
-            logging.warning(f"Node {self.node_id}: Cannot apply bandwidth delta with base_version {base_version} - " +
-                          f"version predates last snapshot at index {self.last_snapshot_index}")
-            
-            # Request a full bandwidth update instead
-            if hasattr(self, 'request_bandwidth_update') and callable(self.request_bandwidth_update):
-                logging.info(f"Node {self.node_id}: Requesting full bandwidth update due to compaction")
-                self.request_bandwidth_update()
-            return
-        
-        if hasattr(self, 'bandwidth_manager') and self.bandwidth_manager is not None:
-            # Apply changes to the bandwidth manager
-            try:
-                self.bandwidth_manager.apply_bandwidth_changes(changes, base_version)
-                logging.info(f"Node {self.node_id}: Applied {len(changes)} bandwidth changes from base version {base_version}")
-            except Exception as e:
-                logging.error(f"Node {self.node_id}: Error applying bandwidth delta: {e}")
-                # If error occurs, it might be due to missing base version - request full update
-                if hasattr(self, 'request_bandwidth_update') and callable(self.request_bandwidth_update):
-                    logging.info(f"Node {self.node_id}: Requesting full bandwidth update due to error")
-                    self.request_bandwidth_update()
-        else:
-            # Store changes for later application
-            if not hasattr(self, 'pending_bandwidth_changes'):
-                self.pending_bandwidth_changes = []
-            self.pending_bandwidth_changes.append((base_version, changes))
-            logging.debug(f"Node {self.node_id}: Stored {len(changes)} bandwidth changes for later application")
-    
-    def _apply_membership_change(self, command):
-        """
-        Apply a membership change command with connection information.
-        
-        Args:
-            command (dict): The membership change command
-        """
-        with self.state_lock:
-            try:
-                action = command.get('action')
-                node_id = command.get('node_id')
-                node_info = command.get('node_info', {})
-                current_nodes = command.get('current_nodes')
-                current_nodes_info = command.get('current_nodes_info', {})
-                round_num = command.get('round', 0)
-                
-                old_known_nodes = set(self.known_nodes)  # Copy for change detection
-                
-                if action == 'add':
-                    # Add the node to known nodes if not already present
-                    if node_id not in self.known_nodes:
-                        self.known_nodes.add(node_id)
-                        logging.info(f"Node {self.node_id}: Added node {node_id} to known nodes at round {round_num}")
-                        
-                        # Store connection information
-                        if node_info and ('ip_address' in node_info or 'port' in node_info):
-                            if not hasattr(self, 'node_connection_info'):
-                                self.node_connection_info = {}
-                            self.node_connection_info[node_id] = node_info
-                            logging.debug(f"Node {self.node_id}: Stored connection info for node {node_id}")
-                            
-                elif action == 'remove':
-                    # Remove the node from known nodes if present
-                    if node_id in self.known_nodes:
-                        self.known_nodes.remove(node_id)
-                        logging.info(f"Node {self.node_id}: Removed node {node_id} from known nodes at round {round_num}")
-                        
-                        # Clean up connection information
-                        if hasattr(self, 'node_connection_info') and node_id in self.node_connection_info:
-                            del self.node_connection_info[node_id]
-                            logging.debug(f"Node {self.node_id}: Removed connection info for node {node_id}")
-                
-                # If current_nodes is provided, use it to update known nodes
-                if current_nodes is not None:
-                    self.known_nodes = set(current_nodes)
-                    logging.info(f"Node {self.node_id}: Updated known nodes to {current_nodes} at round {round_num}")
-                
-                # Update connection info for all nodes if provided
-                if current_nodes_info:
-                    if not hasattr(self, 'node_connection_info'):
-                        self.node_connection_info = {}
-                    self.node_connection_info.update(current_nodes_info)
-                    logging.debug(f"Node {self.node_id}: Updated connection info for {len(current_nodes_info)} nodes")
-                
-                # Only call update if there was actually a change
-                if old_known_nodes != self.known_nodes:
-                    # Update known nodes count and notify any monitoring components
-                    self.update_known_nodes(node_ids=list(self.known_nodes))
-                    
-                    if hasattr(self, 'consensus_manager') and self.consensus_manager:
-                        bridge = getattr(self.consensus_manager, 'service_discovery_bridge', None)
-                        if bridge:
-                            # Notify bridge to update communication manager
-                            if action == 'add' and node_info:
-                                bridge._notify_comm_manager_membership_change(
-                                    action='add',
-                                    node_id=node_id,
-                                    node_info=node_info
-                                )
-                            elif action == 'remove':
-                                bridge._notify_comm_manager_membership_change(
-                                    action='remove',
-                                    node_id=node_id
-                                )
-                            
-            except Exception as e:
-                logging.error(f"Node {self.node_id}: Error applying membership change: {e}", exc_info=True)
-    
-    def _apply_coordinator_change(self, command):
-        """
-        Apply a coordinator change command.
-        
-        Args:
-            command (dict): The coordinator change command containing:
-                - coordinator_id: ID of the new coordinator
-                - previous_coordinator_id: ID of the previous coordinator (optional)
-                - round: Training round number (optional)
-                - reason: Reason for coordinator change (optional)
-        """
-        with self.state_lock:
-            try:
-                coordinator_id = command.get('coordinator_id')
-                previous_coordinator_id = command.get('previous_coordinator_id')
-                round_num = command.get('round', 0)
-                reason = command.get('reason', 'unspecified')
-                
-                if coordinator_id is None:
-                    logging.error(f"Node {self.node_id}: Received coordinator change with null coordinator_id")
-                    return
-                
-                # Track if coordinator actually changed
-                coordinator_changed = False
-                old_coordinator = None
-                
-                # Update the coordinator information
-                if hasattr(self, 'current_coordinator_id'):
-                    old_coordinator = self.current_coordinator_id
-                    if self.current_coordinator_id != coordinator_id:
-                        self.previous_coordinator_id = self.current_coordinator_id
-                        self.current_coordinator_id = coordinator_id
-                        coordinator_changed = True
-                else:
-                    # First time setting coordinator
-                    self.current_coordinator_id = coordinator_id
-                    self.previous_coordinator_id = previous_coordinator_id
-                    coordinator_changed = True
-                
-                if coordinator_changed:
-                    logging.info(f"Node {self.node_id}: Updated coordinator from {old_coordinator} to {coordinator_id} at round {round_num} (reason: {reason})")
-                    
-                    # Notify training components of coordinator change if available
-                    if hasattr(self, 'consensus_manager') and self.consensus_manager is not None:
-                        try:
-                            # Notify consensus manager of coordinator change
-                            self.consensus_manager.on_coordinator_change(
-                                new_coordinator=coordinator_id,
-                                old_coordinator=old_coordinator,
-                                round_num=round_num,
-                                reason=reason
-                            )
-                            logging.debug(f"Node {self.node_id}: Notified consensus manager of coordinator change")
-                            
-                            # If this node is the new coordinator, it should initiate training
-                            if coordinator_id == self.node_id:
-                                logging.info(f"Node {self.node_id}: I am the new coordinator for round {round_num}")
-                                self.consensus_manager.on_become_coordinator(round_num)
-                        except Exception as e:
-                            logging.error(f"Node {self.node_id}: Error notifying of coordinator change: {e}", exc_info=True)
-            except Exception as e:
-                logging.error(f"Node {self.node_id}: Error applying coordinator change: {e}", exc_info=True)
+        try:
+            # Extract the payload where we actually put 'type', 'callback', etc.
+            payload = entry.get('command', {})
+            entry_type = payload.get('type', 'command')
+            idx = entry.get('index', 'unknown')
+
+            if entry_type == 'no-op':
+                logging.debug(f"Node {self.node_id}: Applied no-op entry at index {idx}")
+                return
+
+            if entry_type == 'read-barrier':
+                callback = payload.get('callback')
+                if callable(callback):
+                    callback()
+                logging.debug(f"Node {self.node_id}: Applied read barrier at index {idx}")
+                return
+
+            if entry_type == 'membership':
+                action = payload.get('action', 'unknown')
+                node_id = payload.get('node_id', 'unknown')
+                logging.info(f"Node {self.node_id}: Applied membership change: {action} node {node_id}")
+                # fall through to on_commit so external components can update cluster state
+
+            # Delegate everything else (including membership) to on_commit
+            if callable(self.on_commit):
+                self.on_commit(entry)
+            else:
+                logging.warning(
+                    f"Node {self.node_id}: No on_commit handler set for log entry at index {idx}"
+                )
+
+        except Exception as e:
+            logging.error(
+                f"Node {self.node_id}: Error applying log entry at index {entry.get('index')}: {e}",
+                exc_info=True
+            )
+
     
     def add_log_entry(self, command):
         """
@@ -1310,11 +1091,7 @@ class RaftNode:
             except Exception as e:
                 logging.error(f"Node {self.node_id}: Error getting last log info: {e}", exc_info=True)
                 # Return safe defaults in case of error
-                if len(self.log) > 0:
-                    return len(self.log), self.log[-1]['term']
-                else:
-                    return self.last_snapshot_index, self.last_snapshot_term
-        return last_log_index, last_log_term
+                return self.last_snapshot_index, self.last_snapshot_term
 
     def get_term_at_index(self, index):
         """Get the term of the log entry at the given absolute index."""
@@ -1530,108 +1307,6 @@ class RaftNode:
             logging.error(f"Leader {self.node_id}: Error creating membership log entry: {e}")
             return {}
     
-    def _apply_membership_change(self, command):
-        """
-        Apply a membership change command with proper state management.
-        
-        Args:
-            command (dict): The membership change command
-        """
-        with self.state_lock:
-            try:
-                action = command.get('action')
-                node_id = command.get('node_id')
-                node_info = command.get('node_info', {})
-                current_nodes = command.get('current_nodes', [])
-                current_nodes_info = command.get('current_nodes_info', {})
-                round_num = command.get('round', 0)
-                
-                old_known_nodes = set(self.known_nodes)
-                
-                if action == 'add':
-                    # Add the node to known nodes
-                    if node_id not in self.known_nodes:
-                        self.known_nodes.add(node_id)
-                        logging.info(f"Node {self.node_id}: Added node {node_id} to known nodes at round {round_num}")
-                    
-                    # Store connection information
-                    if node_info:
-                        if not hasattr(self, 'node_connection_info'):
-                            self.node_connection_info = {}
-                        self.node_connection_info[node_id] = node_info
-                        logging.debug(f"Node {self.node_id}: Stored connection info for node {node_id}")
-                    
-                    # Move from pending to active connection info if leader
-                    if (self.state == RaftState.LEADER and 
-                        hasattr(self, 'pending_node_connection_info') and 
-                        node_id in self.pending_node_connection_info):
-                        if not hasattr(self, 'node_connection_info'):
-                            self.node_connection_info = {}
-                        self.node_connection_info[node_id] = self.pending_node_connection_info[node_id]
-                        del self.pending_node_connection_info[node_id]
-                        
-                elif action == 'remove':
-                    # Remove the node from known nodes
-                    if node_id in self.known_nodes:
-                        self.known_nodes.remove(node_id)
-                        logging.info(f"Node {self.node_id}: Removed node {node_id} from known nodes at round {round_num}")
-                    
-                    # Clean up connection information
-                    if hasattr(self, 'node_connection_info') and node_id in self.node_connection_info:
-                        del self.node_connection_info[node_id]
-                        logging.debug(f"Node {self.node_id}: Removed connection info for node {node_id}")
-                    
-                    # Clean up leader state for removed node
-                    if self.state == RaftState.LEADER:
-                        if node_id in self.next_index:
-                            del self.next_index[node_id]
-                        if node_id in self.match_index:
-                            del self.match_index[node_id]
-                
-                # Update from current_nodes if provided (for consistency)
-                if current_nodes:
-                    self.known_nodes = set(current_nodes)
-                
-                # Update connection info for all nodes if provided
-                if current_nodes_info:
-                    if not hasattr(self, 'node_connection_info'):
-                        self.node_connection_info = {}
-                    self.node_connection_info.update(current_nodes_info)
-                
-                # Update cluster state if membership changed
-                if old_known_nodes != self.known_nodes:
-                    self.update_known_nodes(node_ids=list(self.known_nodes))
-                    
-                    # Notify other components of membership change
-                    self._notify_membership_change(action, node_id, round_num)
-                
-            except Exception as e:
-                logging.error(f"Node {self.node_id}: Error applying membership change: {e}", exc_info=True)
-    
-    def _notify_membership_change(self, action, node_id, round_num):
-        """
-        Notify other components of membership changes.
-        
-        Args:
-            action (str): 'add' or 'remove'
-            node_id (int): Node that was added/removed
-            round_num (int): Training round number
-        """
-        try:
-            # Notify consensus manager
-            if hasattr(self, 'consensus_manager') and self.consensus_manager is not None:
-                self.consensus_manager.on_membership_change(self.known_nodes, round_num)
-            
-            # Notify communication manager
-            if hasattr(self, 'comm_manager') and self.comm_manager is not None:
-                if action == 'add' and hasattr(self, 'node_connection_info') and node_id in self.node_connection_info:
-                    self.comm_manager.establish_connection(node_id, self.node_connection_info[node_id])
-                elif action == 'remove':
-                    self.comm_manager.close_connection(node_id)
-            
-        except Exception as e:
-            logging.error(f"Node {self.node_id}: Error notifying membership change: {e}")
-    
     def update_commit_index(self):
         """
         Update commit index based on match_index (leaders only).
@@ -1716,43 +1391,8 @@ class RaftNode:
         """Get the current timestamp."""
         return time.time()
         
-    def request_topology_update(self):
-        """
-        Request a full topology update from the leader.
-        
-        This method is called when an incremental update cannot be applied,
-        typically due to log compaction removing the base version.
-        """
-        if not hasattr(self, 'consensus_manager') or self.consensus_manager is None:
-            logging.warning(f"Node {self.node_id}: Cannot request topology update - no consensus manager available")
-            return
-            
-        try:
-            logging.info(f"Node {self.node_id}: Requesting full topology update from leader")
-            # The actual implementation depends on the consensus manager interface
-            # This could involve sending a message to the leader or triggering an update protocol
-            self.consensus_manager.request_full_topology_update()
-        except Exception as e:
-            logging.error(f"Node {self.node_id}: Error requesting topology update: {e}")
-            
-    def request_bandwidth_update(self):
-        """
-        Request a full bandwidth update from the leader.
-        
-        This method is called when an incremental update cannot be applied,
-        typically due to log compaction removing the base version.
-        """
-        if not hasattr(self, 'consensus_manager') or self.consensus_manager is None:
-            logging.warning(f"Node {self.node_id}: Cannot request bandwidth update - no consensus manager available")
-            return
-            
-        try:
-            logging.info(f"Node {self.node_id}: Requesting full bandwidth update from leader")
-            # The actual implementation depends on the consensus manager interface
-            # This could involve sending a message to the leader or triggering an update protocol
-            self.consensus_manager.request_full_bandwidth_update()
-        except Exception as e:
-            logging.error(f"Node {self.node_id}: Error requesting bandwidth update: {e}")
+    # These methods have been removed as they are application-specific.
+    # The application layer should handle topology and bandwidth updates directly.
     
     def receive_prevote_request(self, candidate_id, term, last_log_index, last_log_term):
         """
@@ -1880,270 +1520,6 @@ class RaftNode:
                 'total_nodes': self.total_nodes
             }
 
-    def bootstrap_detection(self, discovered_nodes):
-        """
-        Handle bootstrap detection from service discovery.
-        
-        This method is called when service discovery provides initial cluster information.
-        It determines whether this node should transition from INITIAL to FOLLOWER or LEADER.
-        
-        Args:
-            discovered_nodes (set): Set of discovered node IDs
-            
-        Returns:
-            bool: True if state transition occurred, False otherwise
-        """
-        with self.state_lock:
-            try:
-                # Only process bootstrap detection if we're in INITIAL state
-                if self.state != RaftState.INITIAL:
-                    logging.debug(f"Node {self.node_id}: Ignoring bootstrap detection - not in INITIAL state")
-                    return False
-                
-                if not discovered_nodes:
-                    logging.debug(f"Node {self.node_id}: No nodes discovered for bootstrap")
-                    return False
-                
-                # Update known nodes based on discovery
-                old_known_nodes = set(self.known_nodes)
-                self.known_nodes.update(discovered_nodes)
-                
-                # Only add ourselves if we're not already in the known nodes
-                if self.node_id not in self.known_nodes:
-                    self.known_nodes.add(self.node_id)
-                
-                # Update node count and majority threshold
-                self.total_nodes = len(self.known_nodes)
-                self.majority = self.total_nodes // 2 + 1
-                
-                logging.info(f"Node {self.node_id}: Bootstrap detection - known nodes: {sorted(self.known_nodes)}, "
-                           f"total: {self.total_nodes}, majority: {self.majority}")
-                
-                # Determine state transition based on cluster composition
-                if len(self.known_nodes) == 1 and self.node_id in self.known_nodes:
-                    # Single node cluster - become leader immediately
-                    logging.info(f"Node {self.node_id}: Single node cluster detected - transitioning to LEADER")
-                    
-                    # Initialize as leader directly (bootstrap case)
-                    self.current_term = 1
-                    self.voted_for = self.node_id
-                    self.state = RaftState.LEADER  # Direct transition for bootstrap
-                    
-                    # Initialize leader state (no followers for single node)
-                    self.next_index = {}
-                    self.match_index = {}
-                    
-                    # Reset election state
-                    self.votes_received = set()
-                    
-                    # Add no-op entry for bootstrap (now that we're leader)
-                    no_op_entry = {
-                        'type': 'no-op',
-                        'timestamp': self.get_current_timestamp()
-                    }
-                    # Direct append since we're the only node
-                    entry = {
-                        'term': self.current_term,
-                        'command': no_op_entry,
-                        'index': 1
-                    }
-                    self.log.append(entry)
-                    
-                    # Notify state change
-                    if self.on_state_change:
-                        self.on_state_change(RaftState.LEADER)
-                    
-                    logging.info(f"Node {self.node_id}: Became bootstrap LEADER for term {self.current_term}")
-                    return True
-                    
-                elif len(self.known_nodes) > 1:
-                    # Multi-node cluster - become follower and wait for leader
-                    logging.info(f"Node {self.node_id}: Multi-node cluster detected - transitioning to FOLLOWER")
-                    self.state = RaftState.FOLLOWER
-                    self.reset_election_timeout()
-                    self.update_heartbeat()
-                    
-                    if self.on_state_change:
-                        self.on_state_change(RaftState.FOLLOWER)
-                    
-                    # If we're joining an existing cluster, request state synchronization
-                    if old_known_nodes != self.known_nodes:
-                        self.request_state_sync()
-                    
-                    return True
-                
-                return False
-                
-            except Exception as e:
-                logging.error(f"Node {self.node_id}: Error in bootstrap detection: {e}")
-                return False
-
-    # def request_state_sync(self):
-    #     """
-    #     Request state synchronization from the cluster leader.
-        
-    #     This method is called when a node joins an existing cluster and needs
-    #     to synchronize its state with the current cluster state.
-        
-    #     Returns:
-    #         bool: True if state sync request was sent, False otherwise
-    #     """
-    #     with self.state_lock:
-    #         try:
-    #             # Only request state sync if we're in FOLLOWER state
-    #             if self.state not in (RaftState.FOLLOWER, RaftState.INITIAL):
-    #                 logging.debug(f"Node {self.node_id}: Cannot request state sync - not in FOLLOWER or INITIAL state")
-    #                 return False
-                
-    #             # Send state sync request via consensus manager if available
-    #             if hasattr(self, 'consensus_manager') and self.consensus_manager is not None:
-    #                 logging.info(f"Node {self.node_id}: Requesting state synchronization from cluster")
-                    
-    #                 # Create state sync request message
-    #                 state_sync_request = {
-    #                     'type': 'state_sync_request',
-    #                     'node_id': self.node_id,
-    #                     'current_term': self.current_term,
-    #                     'timestamp': self.get_current_timestamp()
-    #                 }
-                    
-    #                 # Send to consensus manager for broadcasting
-    #                 self.consensus_manager.broadcast_state_sync_request(state_sync_request)
-    #                 return True
-    #             else:
-    #                 logging.warning(f"Node {self.node_id}: No consensus manager available for state sync request")
-    #                 return False
-                    
-    #         except Exception as e:
-    #             logging.error(f"Node {self.node_id}: Error requesting state sync: {e}")
-    #             return False
-
-    # def handle_state_sync_response(self, response):
-    #     """
-    #     Handle state synchronization response from the leader.
-        
-    #     Args:
-    #         response (dict): State synchronization response containing cluster state
-            
-    #     Returns:
-    #         bool: True if state was successfully synchronized, False otherwise
-    #     """
-    #     with self.state_lock:
-    #         try:
-    #             # Validate response
-    #             if not isinstance(response, dict):
-    #                 logging.error(f"Node {self.node_id}: Invalid state sync response format")
-    #                 return False
-                
-    #             leader_id = response.get('leader_id')
-    #             response_term = response.get('term', 0)
-    #             known_nodes = response.get('known_nodes', [])
-    #             commit_index = response.get('commit_index', 0)
-    #             log_entries = response.get('log_entries', [])
-                
-    #             logging.info(f"Node {self.node_id}: Received state sync response from leader {leader_id}, "
-    #                        f"term: {response_term}, known_nodes: {known_nodes}, commit_index: {commit_index}")
-                
-    #             # Update term if necessary
-    #             if response_term > self.current_term:
-    #                 self.current_term = response_term
-    #                 self.voted_for = None
-                
-    #             # Update known nodes
-    #             if known_nodes:
-    #                 old_known_nodes = set(self.known_nodes)
-    #                 self.known_nodes = set(known_nodes)
-                    
-    #                 if old_known_nodes != self.known_nodes:
-    #                     self.update_known_nodes(node_ids=list(self.known_nodes))
-    #                     logging.info(f"Node {self.node_id}: Updated known nodes from state sync: {sorted(self.known_nodes)}")
-                
-    #             # Update log entries if provided
-    #             if log_entries:
-    #                 # For simplicity, we'll append the entries (in production, this would be more sophisticated)
-    #                 for entry in log_entries:
-    #                     if entry not in self.log:
-    #                         self.log.append(entry)
-                    
-    #                 logging.info(f"Node {self.node_id}: Updated log from state sync, new length: {len(self.log)}")
-                
-    #             # Update commit index
-    #             if commit_index > self.commit_index:
-    #                 self.commit_index = commit_index
-                    
-    #                 # Apply committed entries
-    #                 while self.last_applied < self.commit_index:
-    #                     self.last_applied += 1
-    #                     if self.last_applied <= len(self.log):
-    #                         entry = self.log[self.last_applied - 1]
-    #                         self.apply_log_entry(entry)
-                
-    #             # Mark state synchronization as completed
-    #             self.set_state_sync_completed(True)
-                
-    #             # Try to transition to FOLLOWER if we're still in INITIAL state
-    #             if self.state == RaftState.INITIAL:
-    #                 self.transition_to_follower_from_initial()
-                
-    #             logging.info(f"Node {self.node_id}: State synchronization completed successfully")
-    #             return True
-                
-    #         except Exception as e:
-    #             logging.error(f"Node {self.node_id}: Error handling state sync response: {e}")
-    #             return False
-
-    def transition_to_follower_from_initial(self):
-        """
-        Transition from INITIAL state to FOLLOWER state.
-        
-        This method handles the specific transition from INITIAL to FOLLOWER
-        when a node has received enough information to participate in the cluster.
-        
-        Requirements for transition:
-        1. Log is replicated (synchronized with leader)
-        2. Model parameters have been received from leader successfully
-        3. Basic cluster information is available
-        
-        Returns:
-            bool: True if transition was successful, False otherwise
-        """
-        with self.state_lock:
-            try:
-                if self.state != RaftState.INITIAL:
-                    logging.debug(f"Node {self.node_id}: Not in INITIAL state for transition to FOLLOWER")
-                    return False
-                
-                # Requirement 1: Ensure we have enough cluster information
-                if not hasattr(self, 'known_nodes') or len(self.known_nodes) == 0:
-                    logging.warning(f"Node {self.node_id}: Cannot transition to FOLLOWER - no known nodes")
-                    return False
-                
-                # Requirement 2: Check if log is properly replicated
-                if not self._is_log_synchronized():
-                    logging.warning(f"Node {self.node_id}: Cannot transition to FOLLOWER - log not synchronized")
-                    return False
-                
-                # Requirement 3: Check if model parameters have been received
-                if not self._has_model_parameters():
-                    logging.warning(f"Node {self.node_id}: Cannot transition to FOLLOWER - model parameters not received")
-                    return False
-                
-                # All requirements met - transition to FOLLOWER
-                self.state = RaftState.FOLLOWER
-                self.reset_election_timeout()
-                self.update_heartbeat()
-                
-                # Notify state change
-                if self.on_state_change:
-                    self.on_state_change(RaftState.FOLLOWER)
-                
-                logging.info(f"Node {self.node_id}: Transitioned from INITIAL to FOLLOWER (log synchronized, model parameters received)")
-                return True
-                
-            except Exception as e:
-                logging.error(f"Node {self.node_id}: Error transitioning from INITIAL to FOLLOWER: {e}")
-                return False
-
     def can_participate_in_elections(self):
         """
         Check if this node can participate in elections.
@@ -2204,203 +1580,6 @@ class RaftNode:
         """
         return time.time()
 
-    # Enhanced method to end the class
-    def _is_log_synchronized(self):
-        """
-        Check if the log is properly synchronized with the leader.
-        
-        For a node joining an existing cluster, this means:
-        1. The log has been replicated from the leader
-        2. The commit index is up-to-date
-        3. All committed entries have been applied
-        
-        Returns:
-            bool: True if log is synchronized, False otherwise
-        """
-        with self.state_lock:
-            try:
-                # For new nodes, we need to have received some log entries
-                # and have our commit index properly set
-                
-                # Check if we have received state synchronization
-                if not hasattr(self, 'state_sync_completed') or not self.state_sync_completed:
-                    logging.debug(f"Node {self.node_id}: State sync not completed")
-                    return False
-                
-                # Check if we have a reasonable commit index
-                if self.commit_index < 0:
-                    logging.debug(f"Node {self.node_id}: Invalid commit index: {self.commit_index}")
-                    return False
-                
-                # Check if last_applied is caught up with commit_index
-                if self.last_applied < self.commit_index:
-                    logging.debug(f"Node {self.node_id}: Last applied ({self.last_applied}) behind commit index ({self.commit_index})")
-                    return False
-                
-                # For joining nodes, we should have received at least the current membership
-                if len(self.log) == 0 and self.commit_index > 0:
-                    logging.debug(f"Node {self.node_id}: Empty log but commit index is {self.commit_index}")
-                    return False
-                
-                logging.debug(f"Node {self.node_id}: Log synchronization check passed")
-                return True
-                
-            except Exception as e:
-                logging.error(f"Node {self.node_id}: Error checking log synchronization: {e}")
-                return False
-
-    def _has_model_parameters(self):
-        """
-        Check if model parameters have been received from the leader.
-        
-        For federated learning, a node joining the cluster needs to have:
-        1. Received the current model state from the leader
-        2. Model parameters are valid and ready for training
-        3. Model version is synchronized with the cluster
-        
-        Returns:
-            bool: True if model parameters are available, False otherwise
-        """
-        with self.state_lock:
-            try:
-                # Check if we have received model parameters
-                if not hasattr(self, 'model_params_received') or not self.model_params_received:
-                    logging.debug(f"Node {self.node_id}: Model parameters not received")
-                    return False
-                
-                # Check if model parameters are valid
-                if not hasattr(self, 'current_model_version') or self.current_model_version is None:
-                    logging.debug(f"Node {self.node_id}: No current model version")
-                    return False
-                
-                # Check if we have the actual model state
-                if not hasattr(self, 'model_state') or self.model_state is None:
-                    logging.debug(f"Node {self.node_id}: No model state available")
-                    return False
-                
-                # Verify model state is not empty
-                if isinstance(self.model_state, dict) and len(self.model_state) == 0:
-                    logging.debug(f"Node {self.node_id}: Model state is empty")
-                    return False
-                
-                logging.debug(f"Node {self.node_id}: Model parameters check passed - version: {self.current_model_version}")
-                return True
-                
-            except Exception as e:
-                logging.error(f"Node {self.node_id}: Error checking model parameters: {e}")
-                return False
-
-    def set_state_sync_completed(self, completed=True):
-        """
-        Mark state synchronization as completed.
-        
-        Args:
-            completed (bool): Whether state sync is completed
-        """
-        with self.state_lock:
-            self.state_sync_completed = completed
-            logging.debug(f"Node {self.node_id}: State sync completed set to {completed}")
-
-    def set_model_parameters(self, model_state, model_version):
-        """
-        Set the model parameters received from the leader.
-        
-        Args:
-            model_state (dict): The model state parameters
-            model_version (int): The model version/round number
-        """
-        with self.state_lock:
-            self.model_state = model_state
-            self.current_model_version = model_version
-            self.model_params_received = True
-            logging.info(f"Node {self.node_id}: Received model parameters for version {model_version}")
-            
-            # Check if we can now transition to FOLLOWER (only if log is also synchronized)
-            if self.state == RaftState.INITIAL and self._is_log_synchronized():
-                self.transition_to_follower_from_initial()
-
-    def initialize_from_discovery(self, discovered_nodes, node_info_map=None):
-        """
-        Initialize the RAFT node based on service discovery information.
-        
-        This method is called by the service discovery bridge to provide
-        initial cluster information and trigger appropriate state transitions.
-        
-        Args:
-            discovered_nodes (set): Set of discovered node IDs
-            node_info_map (dict): Optional mapping of node IDs to connection info
-            
-        Returns:
-            bool: True if initialization was successful, False otherwise
-        """
-        with self.state_lock:
-            try:
-                # Only initialize if we're in INITIAL state
-                if self.state != RaftState.INITIAL:
-                    logging.debug(f"Node {self.node_id}: Not in INITIAL state for discovery initialization")
-                    return False
-                
-                logging.info(f"Node {self.node_id}: Initializing from service discovery - discovered nodes: {sorted(discovered_nodes)}")
-                
-                # Store node connection information if provided
-                if node_info_map:
-                    if not hasattr(self, 'node_connection_info'):
-                        self.node_connection_info = {}
-                    self.node_connection_info.update(node_info_map)
-                    logging.debug(f"Node {self.node_id}: Stored connection info for {len(node_info_map)} nodes")
-                
-                # Use the bootstrap detection method to handle state transitions
-                return self.bootstrap_detection(discovered_nodes)
-                
-            except Exception as e:
-                logging.error(f"Node {self.node_id}: Error initializing from discovery: {e}")
-                return False
-
-    def _can_accept_leader_messages(self):
-        """
-        Check if a node in INITIAL state can accept leader messages.
-        
-        A node can accept leader messages if:
-        1. It has cluster information (knows about other nodes), OR
-        2. It's in bootstrap mode and ready to accept leadership, OR
-        3. It has been properly synchronized through service discovery
-        
-        Returns:
-            bool: True if node can accept leader messages, False otherwise
-        """
-        with self.state_lock:
-            try:
-                # Bootstrap nodes can always accept leadership
-                if hasattr(self, 'is_bootstrap_node') and self.is_bootstrap_node:
-                    logging.debug(f"Node {self.node_id}: Bootstrap node can accept leader messages")
-                    return True
-                
-                # Nodes that have been discovered through service discovery can accept
-                if hasattr(self, 'discovered_through_service_discovery') and self.discovered_through_service_discovery:
-                    logging.debug(f"Node {self.node_id}: Node discovered through service discovery can accept leader messages")
-                    return True
-                
-                # Nodes with cluster information can accept
-                if len(self.known_nodes) > 0:
-                    logging.debug(f"Node {self.node_id}: Node with cluster info can accept leader messages")
-                    return True
-                
-                logging.debug(f"Node {self.node_id}: Node not ready to accept leader messages")
-                return False
-                
-            except Exception as e:
-                logging.error(f"Node {self.node_id}: Error checking if can accept leader messages: {e}")
-                return False
-
-    def mark_discovered_through_service_discovery(self):
-        """
-        Mark this node as having been discovered through service discovery.
-        This allows it to accept leader messages even without full cluster info.
-        """
-        with self.state_lock:
-            self.discovered_through_service_discovery = True
-            logging.debug(f"Node {self.node_id}: Marked as discovered through service discovery")
-    
     def _proceed_to_election_from_prevote(self):
         """
         Proceed to actual election after getting majority prevotes.
@@ -2427,10 +1606,10 @@ class RaftNode:
             self.voted_for = self.node_id
             self.state = RaftState.CANDIDATE
             
-            # Reset votes for actual election
-            self.votes_received = {self.node_id}  # Vote for ourselves
+            # Reset votes for actual election - vote for ourselves
+            self.votes_received = {self.node_id}
             
-            # Clear prevote state
+            # Clear prevote state AFTER setting up candidate state
             self.prevote_requested = False
             self.prevotes_received.clear()
             self.prevote_term = 0
@@ -2447,18 +1626,15 @@ class RaftNode:
                 logging.info(f"Node {self.node_id}: Single-node cluster detected, becoming leader immediately")
                 return self.become_leader()
             
-            # For multi-node cluster, proceed with election
-            # Send vote requests to other nodes
+            # For multi-node cluster, send vote requests
             last_log_index, last_log_term = self.get_last_log_info()
-            
-            logging.info(f"Node {self.node_id}: Starting election for term {self.current_term} " +
-                        f"(previous term: {old_term}, known nodes: {len(self.known_nodes)})")
             
             # Start election timeout for this election
             self.reset_election_timeout()
             
-            if hasattr(self, 'consensus_manager') and self.consensus_manager is not None:
-                self.consensus_manager.broadcast_vote_request(
+            # Send vote requests to other nodes
+            if callable(self.on_send_vote):
+                self.on_send_vote(
                     candidate_id=self.node_id,
                     term=self.current_term,
                     last_log_index=last_log_index,
@@ -2466,7 +1642,7 @@ class RaftNode:
                 )
             
             return True
-            
+      
         except Exception as e:
             logging.error(f"Node {self.node_id}: Error proceeding to election from prevote: {e}")
             # Reset to FOLLOWER state on error
@@ -2475,3 +1651,150 @@ class RaftNode:
             self.prevotes_received.clear()
             self.prevote_term = 0
             return False
+
+    def install_snapshot(self, leader_id, term, last_included_index, last_included_term, snapshot_data):
+        """
+        Install a snapshot from the leader.
+        
+        This method handles the InstallSnapshot RPC according to the RAFT paper.
+        
+        Args:
+            leader_id (int): ID of the leader sending the snapshot
+            term (int): Leader's current term
+            last_included_index (int): Index of last entry in snapshot
+            last_included_term (int): Term of last entry in snapshot
+            snapshot_data (bytes): Snapshot data
+            
+        Returns:
+            tuple: (current_term, success)
+        """
+        with self.state_lock:
+            try:
+                logging.info(f"Node {self.node_id}: Received snapshot from leader {leader_id} " +
+                            f"for term {term} (last_included: {last_included_index})")
+                
+                # If term < currentTerm, reject
+                if term < self.current_term:
+                    logging.info(f"Node {self.node_id}: Rejecting snapshot with term {term} < current term {self.current_term}")
+                    return self.current_term, False
+                
+                # If term > currentTerm, convert to follower
+                if term > self.current_term:
+                    logging.info(f"Node {self.node_id}: Converting to follower due to higher term from leader {leader_id}")
+                    self.become_follower(term)
+                
+                # Update heartbeat to prevent election timeout
+                self.update_heartbeat()
+                
+                # If we already have this snapshot or a more recent one, ignore
+                if last_included_index <= self.last_snapshot_index:
+                    logging.debug(f"Node {self.node_id}: Snapshot already installed or more recent")
+                    return self.current_term, True
+                
+                # Save snapshot metadata
+                self.last_snapshot_index = last_included_index
+                self.last_snapshot_term = last_included_term
+                
+                # Discard log entries covered by snapshot
+                # Keep entries after the snapshot if they exist
+                if len(self.log) > 0:
+                    # Find entries that come after the snapshot
+                    snapshot_end_array_idx = last_included_index - self.first_log_index + 1
+                    if snapshot_end_array_idx < len(self.log):
+                        # Keep entries after the snapshot
+                        self.log = self.log[snapshot_end_array_idx:]
+                        self.first_log_index = last_included_index + 1
+                    else:
+                        # Snapshot covers all our log entries
+                        self.log = []
+                        self.first_log_index = last_included_index + 1
+                else:
+                    # No log entries, just update first_log_index
+                    self.first_log_index = last_included_index + 1
+                
+                # Update commit and apply indices
+                if last_included_index > self.commit_index:
+                    self.commit_index = last_included_index
+                if last_included_index > self.last_applied:
+                    self.last_applied = last_included_index
+                
+                # Apply snapshot to state machine via callback
+                if hasattr(self, 'on_install_snapshot') and callable(self.on_install_snapshot):
+                    self.on_install_snapshot(snapshot_data, last_included_index, last_included_term)
+                
+                logging.info(f"Node {self.node_id}: Installed snapshot up to index {last_included_index}")
+                
+                return self.current_term, True
+                
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error installing snapshot: {e}", exc_info=True)
+                return self.current_term, False
+            
+    def _is_ready_for_cluster_participation(self):
+        """
+        Check if this node is ready to participate in the cluster.
+        
+        Returns:
+            bool: True if ready, False otherwise
+        """
+        with self.state_lock:
+            try:
+                # Must have cluster information
+                if not hasattr(self, 'known_nodes') or len(self.known_nodes) == 0:
+                    logging.debug(f"Node {self.node_id}: Not ready - no known nodes")
+                    return False
+                
+                # Bootstrap nodes are always ready
+                if hasattr(self, 'is_bootstrap_node') and self.is_bootstrap_node:
+                    logging.debug(f"Node {self.node_id}: Ready - bootstrap node")
+                    return True
+                
+                # Check if discovered through service discovery
+                if hasattr(self, 'discovered_through_service_discovery') and self.discovered_through_service_discovery:
+                    logging.debug(f"Node {self.node_id}: Ready - discovered through service discovery")
+                    return True
+                
+                # For regular nodes, check if we have sufficient state
+                # (This is where FL-specific checks would go in the application layer)
+                return True
+                
+            except Exception as e:
+                logging.error(f"Node {self.node_id}: Error checking cluster readiness: {e}")
+                return False
+    
+    def read_index_barrier(self, callback=None):
+        """
+        Implement read-index barrier for linearizable reads.
+        
+        This method ensures that reads see all writes that were committed before
+        the read was initiated, according to the RAFT paper section 8.
+        
+        Args:
+            callback: Optional callback to invoke when barrier is committed
+            
+        Returns:
+            int: Log index of the barrier entry, or -1 if not leader
+        """
+        with self.state_lock:
+            try:
+                if self.state != RaftState.LEADER:
+                    logging.debug(f"Node {self.node_id}: Cannot create read barrier - not leader")
+                    return -1
+                
+                # Create a read barrier entry
+                barrier_entry = {
+                    'type': 'read-barrier',
+                    'timestamp': self.get_current_timestamp(),
+                    'callback': callback  # Store callback for when this gets committed
+                }
+                
+                log_index = self.add_log_entry(barrier_entry)
+                
+                if log_index != -1:
+                    logging.debug(f"Leader {self.node_id}: Created read barrier at index {log_index}")
+                
+                return log_index
+                
+            except Exception as e:
+                logging.error(f"Leader {self.node_id}: Error creating read barrier: {e}")
+                return -1
