@@ -967,11 +967,13 @@ class RaftServiceDiscoveryBridge:
             if hasattr(self.worker_manager, 'send_install_snapshot'):
                 logging.debug(f"Bridge: Using worker_manager.send_install_snapshot for node {node_id}")
                 self.worker_manager.send_install_snapshot(
-                    node_id=node_id,
+                    receiver_id=node_id,
                     term=raft_node.current_term,
                     last_included_index=last_log_index,
                     last_included_term=last_log_term,
-                    data=snapshot_data
+                    offset=0,  # Start from beginning of snapshot
+                    data=snapshot_data,
+                    done=True  # Single snapshot message
                 )
                 
                 # Reset next_index for this node to start from the snapshot
