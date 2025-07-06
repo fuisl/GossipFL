@@ -164,13 +164,23 @@ class RaftServiceDiscoveryBridge:
                 filtered = {}
                 envelope_keys = {
                     RaftMessage.ARG_TYPE, 
-                    RaftMessage.ARG_SENDER, 
+                    # RaftMessage.ARG_SENDER,
                     RaftMessage.ARG_RECEIVER,
                     'message_source'
                 }
+                
+                # Special parameter name mapping for consensus methods
+                param_mapping = {
+                    'sender': 'follower_id',  # Map sender to follower_id for append_response
+                    RaftMessage.MSG_ARG_KEY_SENDER: 'follower_id'  # Also handle the constant
+                }
+                
                 for key, value in params.items():
                     if key not in envelope_keys:
-                        filtered[key] = value
+                        # Apply parameter name mapping if needed
+                        mapped_key = param_mapping.get(key, key)
+                        filtered[mapped_key] = value
+                
                 return filtered
             
             # Register handlers for each RAFT message type
@@ -186,7 +196,12 @@ class RaftServiceDiscoveryBridge:
                 RaftMessage.MSG_TYPE_APPEND_ENTRIES: 
                     lambda p: self.consensus.handle_append_entries(**_filter_params(p)),
                 RaftMessage.MSG_TYPE_APPEND_RESPONSE: 
-                    lambda p: self.consensus.handle_append_response(**_filter_params(p)),
+                    lambda p: self.consensus.handle_append_response(
+                        follower_id=p.get('sender', p.get(RaftMessage.MSG_ARG_KEY_SENDER)),
+                        term=p.get(RaftMessage.ARG_TERM),
+                        success=p.get(RaftMessage.ARG_SUCCESS),
+                        match_index=p.get(RaftMessage.ARG_MATCH_INDEX)
+                    ),
                 RaftMessage.MSG_TYPE_INSTALL_SNAPSHOT: 
                     lambda p: self.consensus.handle_install_snapshot(**_filter_params(p))
             }
@@ -808,6 +823,8 @@ class RaftServiceDiscoveryBridge:
             logging.warning(f"Bridge: No method available to update registry for node {node_id}")
             
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logging.error(f"Bridge: Failed to register node {node_id}: {e}")
 
     def _notify_comm_manager_membership_change(self, action: str, node_id: int, node_info: Dict[str, Any] = None):

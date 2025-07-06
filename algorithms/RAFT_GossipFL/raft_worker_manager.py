@@ -311,6 +311,12 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                         
             except Exception as e:
                 logging.error(f"Node {self.node_id}: Error handling membership change: {e}", exc_info=True)
+
+    def update_topology_consensus(self):
+        """
+        Update topology with RAFT consensus.
+        """
+        pass
     
     def on_coordinator_change(self, new_coordinator, old_coordinator=None, round_num=0, reason='unspecified'):
         """
@@ -1168,6 +1174,7 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                         )
                         
         except Exception as e:
+            traceback.print_exc()
             logging.error(f"Node {self.node_id}: Error handling membership change: {e}", exc_info=True)
     
     def _handle_coordinator_change(self, command):
@@ -1256,13 +1263,19 @@ class RaftWorkerManager(DecentralizedWorkerManager):
             if node_id != self.node_id:
                 self.send_vote_request(node_id, term, last_log_index, last_log_term)
 
-    def broadcast_append_entries(self, entries=None, is_heartbeat=False):
+    def broadcast_append_entries(self, node_id, term, leader_id, prev_log_index, prev_log_term, entries, commit_index):
         """
-        Broadcast append entries to all followers (for leaders).
+        Send append entries to a specific follower (for leaders).
+        This method is called as the on_send_append callback from RAFT node.
         
         Args:
-            entries (list): List of entries to append (None for heartbeat)
-            is_heartbeat (bool): Whether this is a heartbeat message
+            node_id (int): ID of the target node
+            term (int): Current term
+            leader_id (int): ID of the leader (should be self.node_id)
+            prev_log_index (int): Index of log entry immediately preceding new ones
+            prev_log_term (int): Term of prev_log_index entry
+            entries (list): List of log entries to append (empty for heartbeat)
+            commit_index (int): Leader's commit index
         """
         if not hasattr(self.raft_consensus, 'raft_node') or self.raft_consensus.raft_node is None:
             return
@@ -1270,26 +1283,16 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         raft_node = self.raft_consensus.raft_node
         if raft_node.state != RaftState.LEADER:
             return
-            
-        # Send append entries to all followers
-        for node_id in raft_node.known_nodes:
-            if node_id != self.node_id:
-                # Get the appropriate log entries for this follower
-                next_index = raft_node.next_index.get(node_id, 1)
-                prev_log_index = next_index - 1
-                prev_log_term = raft_node.get_term_at_index(prev_log_index) if prev_log_index > 0 else 0
-                
-                # Use provided entries or empty list for heartbeat
-                send_entries = entries if entries is not None else []
-                
-                self.send_append_entries(
-                    node_id, 
-                    raft_node.current_term, 
-                    prev_log_index, 
-                    prev_log_term, 
-                    send_entries, 
-                    raft_node.commit_index
-                )
+        
+        # Send append entries to the specific follower
+        self.send_append_entries(
+            node_id, 
+            term, 
+            prev_log_index, 
+            prev_log_term, 
+            entries, 
+            commit_index
+        )
     
     def _register_raft_callbacks(self):
         """

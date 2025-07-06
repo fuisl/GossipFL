@@ -999,6 +999,7 @@ class RaftNode:
 
             # Delegate everything else (including membership) to on_commit
             if callable(self.on_commit):
+                logging.debug(f"Node {self.node_id}: Applying log entry at index {idx} with type {entry_type}")
                 self.on_commit(entry)
             else:
                 logging.warning(

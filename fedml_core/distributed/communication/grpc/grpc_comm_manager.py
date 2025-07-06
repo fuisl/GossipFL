@@ -665,9 +665,26 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
             node_info: NodeInfo object containing node details
         """
         with config_lock:
-            self.node_registry[node_info.node_id] = node_info
+            logging.debug(f"Node info: {node_info}")
+            if isinstance(node_info, dict):
+                # Convert dict to NodeInfo object
+                node_info_obj = NodeInfo(
+                    node_id=node_info['node_id'],
+                    ip_address=node_info['ip_address'],
+                    port=int(node_info.get('port', node_info.get('port', 9000))),
+                    capabilities=node_info.get('capabilities', ['grpc', 'fedml']),
+                    metadata=node_info.get('metadata', {})
+                )
+            elif isinstance(node_info, NodeInfo):
+                node_info_obj = node_info
+            else:
+                logging.error(f"Invalid node_info type: {type(node_info)}")
+                return
+
+            # Add to node registry
+            self.node_registry[node_info_obj.node_id] = node_info_obj
             self._rebuild_ip_config()
-            logging.info(f"Node {node_info.node_id} added to registry")
+            logging.info(f"Node {node_info_obj.node_id} added to registry")
     
     def _add_self_to_registry(self, capabilities: List[str], metadata: Dict):
         """Add this node to the local registry."""
