@@ -1591,7 +1591,7 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
                 logging.info(f"Received failure notification from node {sender_id} about node {failed_node_id}: {reason}")
                 
                 # As leader, we can propose the membership change
-                success = self.comm_manager.service_discovery_bridge.propose_membership_change(
+                success = self.service_discovery_bridge.propose_membership_change(
                     action="remove",
                     node_id=failed_node_id,
                     reason=f"Reported by node {sender_id}: {reason}"
@@ -1694,3 +1694,39 @@ class DynamicGRPCCommManager(BaseCommunicationManager):
             if self.bridge_registered and self.service_discovery_bridge:
                 # Check if the bridge has access to RAFT node
                 if (hasattr(self.service_discovery_bridge, 'raft_consensus') and 
+                    self.service_discovery_bridge.raft_consensus and
+                    hasattr(self.service_discovery_bridge.raft_consensus, 'raft_node')):
+                    
+                    raft_node = self.service_discovery_bridge.raft_consensus.raft_node
+                    if hasattr(raft_node, 'update_known_nodes'):
+                        logging.info(f"Updating RAFT known_nodes after membership change: {current_node_ids}")
+                        raft_node.update_known_nodes(current_node_ids)
+                        return
+                        
+            # Fallback: try to notify through observers that might be RAFT-related
+            for observer in self._observers:
+                # Check if observer has RAFT-related methods
+                if hasattr(observer, 'handle_membership_change'):
+                    try:
+                        observer.handle_membership_change(current_node_ids)
+                        logging.debug(f"Notified observer about membership change")
+                    except Exception as e:
+                        logging.warning(f"Observer failed to handle membership change: {e}")
+                        
+                # Check if observer has access to RAFT node (e.g., worker manager)
+                elif hasattr(observer, 'raft_consensus'):
+                    try:
+                        raft_consensus = observer.raft_consensus
+                        if (hasattr(raft_consensus, 'raft_node') and 
+                            hasattr(raft_consensus.raft_node, 'update_known_nodes')):
+                            logging.info(f"Updating RAFT known_nodes via observer after membership change: {current_node_ids}")
+                            raft_consensus.raft_node.update_known_nodes(current_node_ids)
+                            return
+                    except Exception as e:
+                        logging.warning(f"Failed to update RAFT known_nodes via observer: {e}")
+                        
+            logging.debug(f"No RAFT system found to notify about membership change: {current_node_ids}")
+                        
+        except Exception as e:
+            logging.error(f"Error notifying RAFT about membership change: {e}")
+            
