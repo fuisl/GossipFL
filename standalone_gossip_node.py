@@ -145,8 +145,29 @@ class SimpleModelTrainer:
             gamma=0.9
         )
         
-        # Create param groups for compatibility with SAPS
-        self.param_groups = self.optimizer.param_groups
+        # Create param groups for compatibility with SAPS - add required fields
+        self.param_groups = []
+        for i, param_group in enumerate(self.optimizer.param_groups):
+            # Calculate parameter size and number of elements for this group
+            total_params = 0
+            total_elements = 0
+            
+            for param in param_group['params']:
+                if param.requires_grad:
+                    param_elements = param.numel()
+                    total_elements += param_elements
+                    total_params += param_elements * param.element_size()  # Size in bytes
+            
+            # Create enhanced param group with required fields
+            enhanced_group = {
+                **param_group,  # Copy existing fields
+                'param_size': total_params,  # Total size in bytes
+                'nelement': total_elements,  # Total number of elements
+                'group_id': i,  # Group identifier
+            }
+            self.param_groups.append(enhanced_group)
+        
+        # Create param names for compatibility
         self.param_names = list(enumerate([f"param_group_{i}" for i in range(len(self.param_groups))]))
         
     def epoch_init(self):
@@ -173,7 +194,7 @@ class SimpleModelTrainer:
         """Update learning rate."""
         self.lr_scheduler.step()
 
-    def train_one_step(self, train_batch_data, device, args, tracker=None, metrics=None):
+    def train_one_step(self, train_batch_data, device, args, tracker=None, metrics=None, epoch=None, iteration=None):
         """Train one step."""
         self.model.to(device)
         self.model.train()
@@ -190,7 +211,7 @@ class SimpleModelTrainer:
         if tracker is not None and metrics is not None:
             metric_stat = metrics.evaluate(loss, output, labels)
             tracker.update_metrics(metric_stat, n_samples=labels.size(0))
-
+    
         return loss, output, labels
 
     def test(self, test_data, device, args, tracker=None, metrics=None):
@@ -325,7 +346,16 @@ class RaftFederatedLearningNode:
         self.topology_manager = SAPSTopologyManager(self.args)
         
         # Generate initial topology before creating worker
-        self.topology_manager.generate_topology(0)  # Initialize with round 0
+        # Handle the case where SAPS matching might fail with single node
+        try:
+            self.topology_manager.generate_topology(0)  # Initialize with round 0
+        except (TypeError, AttributeError) as e:
+            self.logger.warning(f"SAPS topology generation failed: {e}, creating fallback topology")
+            # Create a simple fallback topology for single node
+            import numpy as np
+            self.topology_manager.topology = np.zeros([self.topology_manager.n, self.topology_manager.n])
+            for i in range(self.topology_manager.n):
+                self.topology_manager.topology[i][i] = 1.0  # Self-connection
         
         # Create timer and metrics (with fallbacks)
         if UTILS_AVAILABLE:
@@ -406,6 +436,36 @@ class RaftFederatedLearningNode:
                 raft_consensus=self.raft_consensus,
                 bandwidth_manager=None
             )
+            
+            # Fix the is_coordinator property issue
+            if hasattr(self.worker_manager, 'is_coordinator'):
+                # Check if it's a property without a setter
+                prop = getattr(type(self.worker_manager), 'is_coordinator', None)
+                if isinstance(prop, property) and prop.fset is None:
+                    self.logger.info("Fixing is_coordinator property without setter...")
+                    
+                    # Store the original getter
+                    original_getter = prop.fget
+                    
+                    # Create a private attribute to store the value (initialize with None)
+                    self.worker_manager._is_coordinator_value = None
+                    
+                    # Create new getter that uses the private attribute if set, otherwise original
+                    def new_getter(self_ref):
+                        if hasattr(self_ref, '_is_coordinator_value') and self_ref._is_coordinator_value is not None:
+                            return self_ref._is_coordinator_value
+                        return original_getter(self_ref) if original_getter else None
+                    
+                    # Create setter that sets the private attribute
+                    def new_setter(self_ref, value):
+                        self_ref._is_coordinator_value = value
+                        self.logger.debug(f"is_coordinator set to {value}")
+                    
+                    # Replace the property with one that has both getter and setter
+                    setattr(type(self.worker_manager), 'is_coordinator', 
+                           property(new_getter, new_setter))
+                    
+                    self.logger.info("is_coordinator property fixed with setter")
             
             # Complete circular references
             self.raft_consensus.worker_manager = self.worker_manager
@@ -618,9 +678,10 @@ def create_args_from_command_line():
     parser.add_argument('--momentum', type=float, default=0.9, help='Momentum')
     parser.add_argument('--nesterov', action='store_true', help='Nesterov momentum')
     
-    # Scheduler configuration (missing attributes that might be needed)
+    # Scheduler configuration
     parser.add_argument('--client-index', type=int, default=0, help='Client index')
     parser.add_argument('--lr-scheduler', default='cosine', help='Learning rate scheduler')
+    parser.add_argument('--sched', default='no', help='Learning rate schedule type')  # ADD THIS LINE
     parser.add_argument('--lr-decay-rate', type=float, default=0.998, help='LR decay rate')
     parser.add_argument('--lr-decay-epoch', type=int, default=1, help='LR decay epoch')
     parser.add_argument('--lr-patience', type=int, default=10, help='LR patience')

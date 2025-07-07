@@ -41,3 +41,35 @@ class SAPSTopologyManager(SymmetricTopologyManager):
                 if i != j and self.topology[i][j] > 0:
                     neighbors.add(j)
         return neighbors
+
+    def get_topology(self):
+        """Get the current topology matrix."""
+        if hasattr(self, 'topology'):
+            return self.topology
+        return None
+    
+    def update_nodes(self, new_nodes):
+        """Update the topology manager with new set of nodes."""
+        logging.info(f"Updating topology manager with nodes: {new_nodes}")
+        
+        # Update the number of nodes
+        old_n = self.n
+        self.n = len(new_nodes)
+        
+        # If the number of nodes changed, regenerate topology
+        if old_n != self.n:
+            logging.info(f"Node count changed from {old_n} to {self.n}, regenerating topology")
+            # Regenerate bandwidth for new node count
+            # Note: This is a simplified approach - in practice you might want to preserve existing bandwidth info
+            try:
+                # Try to regenerate the topology with current round (assume round 0 if not tracking)
+                current_round = getattr(self, '_current_round', 0)
+                self.generate_topology(current_round)
+            except Exception as e:
+                logging.warning(f"Failed to regenerate topology: {e}")
+                # Create fallback topology
+                self.topology = np.zeros([self.n, self.n])
+                for i in range(self.n):
+                    self.topology[i][i] = 1.0  # Self-connection
+        else:
+            logging.info("Node count unchanged, keeping existing topology")
