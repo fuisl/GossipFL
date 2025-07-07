@@ -28,7 +28,16 @@ class SAPSTopologyManager(SymmetricTopologyManager):
         for i in range(self.n):
             self.topology[i][i] = 1/2
             self.topology[i][match[i]] = 1/2
-
-
-
-
+    
+    def get_neighbor_list(self):
+        """Get list of neighbor nodes for the current topology."""
+        if not hasattr(self, 'topology') or self.topology is None:
+            return set()
+        
+        # Return all nodes that have connections in the topology
+        neighbors = set()
+        for i in range(self.n):
+            for j in range(self.n):
+                if i != j and self.topology[i][j] > 0:
+                    neighbors.add(j)
+        return neighbors
