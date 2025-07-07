@@ -355,8 +355,7 @@ class RaftFederatedLearningNode:
         )
         
         self.logger.info("Federated learning components initialized")
-        
-    
+
     def _setup_communication_and_raft(self):
         """Setup communication manager and RAFT components following standalone_raft_node.py pattern."""
         try:
@@ -426,7 +425,7 @@ class RaftFederatedLearningNode:
         except Exception as e:
             self.logger.error(f"Error setting up communication and RAFT components: {e}")
             raise
-    
+
     def start(self):
         """Start the federated learning node following standalone_raft_node.py pattern."""
         try:
