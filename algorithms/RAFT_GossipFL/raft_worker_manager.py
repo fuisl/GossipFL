@@ -91,11 +91,41 @@ class RaftWorkerManager(DecentralizedWorkerManager):
         # Used to trigger next training round - should be integrated with round_start_authorized
         self.round_start_event = threading.Event()  # Used to trigger next training round
         
-        # # Override SAPS_FL coordinator detection
-        # self._override_saps_coordinator_logic()
+        self.use_raft_coordination = True
+        self._setup_raft_coordination_hooks()
         
         logging.info(f"RaftWorkerManager initialized for node {node_id} with service discovery bridge")
     
+    def _setup_raft_coordination_hooks(self):
+        """Setup hooks to intercept SAPS coordination with RAFT."""
+        # Store original SAPS methods we want to override
+        self._original_notify_clients = super().notify_clients
+        self._original_run_coordinator = getattr(super(), 'run_coordinator', None)
+        
+        # Override coordinator detection logic
+        self._override_saps_coordinator_logic()
+
+    def _override_saps_coordinator_logic(self):
+        """Override SAPS coordinator logic to use RAFT leader."""
+        # In SAPS, coordinator is typically rank 0
+        # In RAFT, coordinator is the current leader
+        
+        # Override any hardcoded coordinator checks
+        original_is_coordinator = getattr(self, '_is_coordinator_original', None)
+        if original_is_coordinator is None:
+            # Store original logic if it exists
+            self._is_coordinator_original = getattr(self, 'is_coordinator', False)
+        
+        # Property to dynamically determine coordinator status
+        @property
+        def raft_coordinator_status(self):
+            if self.use_raft_coordination and self.raft_consensus:
+                return self.raft_consensus.get_leader_id() == self.node_id
+            return self._is_coordinator_original
+        
+        # Replace is_coordinator with our dynamic property
+        type(self).is_coordinator = raft_coordinator_status
+
     def get_sender_id(self):
         """Override to use node_id instead of MPI rank for gRPC communication."""
         return self.node_id
@@ -385,129 +415,275 @@ class RaftWorkerManager(DecentralizedWorkerManager):
                 logging.error(f"Node {self.node_id}: Error becoming coordinator: {e}", exc_info=True)
     
     def run_sync(self):
-        """Run the training process synchronously with RAFT consensus."""
+        """Enhanced run_sync that respects RAFT coordination."""
         with raise_MPI_error():
-            # For the first iteration, wait for RAFT to establish leadership and initial topology
-            self.wait_for_initial_consensus()
+            # Wait for RAFT to establish initial consensus and topology
+            logging.info(f"Node {self.node_id}: Waiting for RAFT coordination to be ready")
             
-            # Get topology through RAFT
+            # Wait for initial RAFT setup
+            max_wait = 30  # seconds
+            start_time = time.time()
+            while (time.time() - start_time) < max_wait:
+                if (self.consensus_established_event.is_set() and 
+                    self.topology_manager.get_topology() is not None):
+                    logging.info(f"Node {self.node_id}: RAFT coordination ready")
+                    break
+                time.sleep(0.1)
+            else:
+                logging.warning(f"Node {self.node_id}: Proceeding without full RAFT setup")
+            
+            # Now run the enhanced training loop
+            self._run_raft_coordinated_training()
+
+    def _run_raft_coordinated_training(self):
+        """Run training with RAFT coordination but SAPS FL logic."""
+        # Get initial topology through RAFT
+        if self.use_raft_coordination:
+            self._wait_for_raft_topology()
+        else:
+            # Fallback to SAPS topology generation
             self.topology_manager.generate_topology(t=self.global_round_idx)
+        
+        self.worker.refresh_gossip_info()
+        self.refresh_gossip_info()
+        self.worker.init_neighbor_hat_params()
+        
+        for epoch in range(self.epochs):
+            self.epoch = epoch
+            
+            # Update worker's dataset and data loader
+            with raise_error_without_process():
+                if hasattr(self.worker.train_local, 'sampler') and hasattr(self.worker.train_local.sampler, 'set_epoch'):
+                    self.worker.train_local.sampler.set_epoch(epoch)
+            
+            self.epoch_init()
+            
+            for iteration in range(self.worker.num_iterations):
+                self.iteration = iteration
+                
+                # RAFT coordination: wait for round authorization
+                if self.use_raft_coordination:
+                    logging.debug(f"Node {self.node_id}: Waiting for RAFT round authorization")
+                    authorized = self.round_start_authorized.wait(timeout=60.0)
+                    if not authorized:
+                        logging.warning(f"Node {self.node_id}: Timeout waiting for round authorization")
+                        continue
+                else:
+                    # SAPS fallback: use original start_epoch_event
+                    if hasattr(self, 'start_epoch_event'):
+                        self.start_epoch_event.wait()
+                
+                logging.debug(f"Node {self.node_id}: Starting training iteration {iteration}")
+                
+                # Core SAPS training logic (unchanged!)
+                self._execute_saps_training_iteration()
+                
+                # RAFT coordination: clear events and update topology
+                if self.use_raft_coordination:
+                    self.round_start_authorized.clear()
+                    self._wait_for_raft_topology_update()
+                
+                # Report progress (enhanced with RAFT)
+                self.test_and_send_to_coordinator(iteration, epoch)
+    
+    def _execute_saps_training_iteration(self):
+        """Execute one SAPS training iteration (core FL logic unchanged)."""
+        # This is the core SAPS logic that we preserve exactly
+        from utils.data_utils import get_data
+        from utils.tensor_buffer import TensorBuffer
+        
+        # Get model params
+        params, _ = get_data(
+            self.worker.param_groups, self.worker.param_names, is_get_grad=False
+        )
+        flatten_params = TensorBuffer(params)
+
+        # Compress (SAPS logic)
+        sync_buffer = {
+            "original_shapes": self.worker.shapes,
+            "flatten_params": flatten_params,
+        }
+        self.compressor.compress(sync_buffer)
+        self.selected_shapes = sync_buffer["selected_shapes"]
+
+        # Send to neighbors (SAPS logic with RAFT topology)
+        for neighbor_idx in self.topology_manager.get_out_neighbor_idx_list(self.node_id):
+            self._send_compressed_params_to_neighbor(neighbor_idx, sync_buffer)
+        
+        # Wait for all neighbors (SAPS logic)
+        self.sync_receive_all_event.wait()
+        
+        # Aggregate (SAPS logic)
+        self.worker.aggregate(self.compressor, self.selected_shapes, self.gossip_info)
+
+        # Apply gradient (SAPS logic)
+        self.neighbor_transfer_lock.acquire()
+        try:
+            self.compressor.uncompress_direct(
+                sync_buffer, self.worker.neighbor_hat_params["memory"],
+                self.selected_shapes, self.worker.shapes)
+            sync_buffer["flatten_params"].unpack(params)
+        finally:
+            if self.neighbor_transfer_lock.locked():
+                self.neighbor_transfer_lock.release()
+
+        # Local training step (SAPS logic)
+        if not self._should_simulate_failure():
+            self.lr_schedule(self.epoch, self.iteration, self.global_round_idx,
+                            self.worker.num_iterations, self.args.warmup_epochs)
+            loss, output, target = self.worker.train_one_step(
+                self.epoch, self.iteration, self.train_tracker, self.metrics)
+
+        # Clear for next iteration
+        self.sync_receive_all_event.clear()
+
+    def _send_compressed_params_to_neighbor(self, neighbor_idx, sync_buffer):
+        """Send compressed parameters using SAPS logic."""
+        if self.compression in ["randomk", "topk"]:
+            self.send_sparse_params_to_neighbors(neighbor_idx, 
+                sync_buffer["flatten_selected_values"].buffer.cpu(),
+                sync_buffer["flatten_selected_indices"].buffer.cpu(),
+                self.worker.get_dataset_len())
+        elif self.compression == "quantize":
+            self.send_quant_params_to_neighbors(neighbor_idx,
+                sync_buffer["flatten_quantized_values"].buffer.cpu(),
+                self.worker.get_dataset_len())
+        elif self.compression == "sign":
+            self.send_sign_params_to_neighbors(neighbor_idx,
+                sync_buffer["flatten_sign_values"].buffer.cpu(),
+                self.worker.get_dataset_len())
+        else:
+            self.send_result_to_neighbors(neighbor_idx,
+                sync_buffer["flatten_params"].buffer.cpu(),
+                self.worker.get_dataset_len())
+            
+    def _should_simulate_failure(self):
+        """Check if we should simulate a communication failure (SAPS logic)."""
+        import numpy as np
+        return (self.args.Failure_chance is not None and 
+                np.random.rand(1) < self.args.Failure_chance)
+    
+    def _wait_for_raft_topology(self):
+        """Wait for initial topology from RAFT."""
+        max_wait = 30  # seconds
+        start_time = time.time()
+        while (time.time() - start_time) < max_wait:
+            if self.topology_manager.get_topology() is not None:
+                logging.debug(f"Node {self.node_id}: RAFT topology available")
+                return True
+            time.sleep(0.1)
+        logging.warning(f"Node {self.node_id}: Timeout waiting for RAFT topology")
+        return False
+    
+    def _wait_for_raft_topology_update(self):
+        """Wait for topology update through RAFT."""
+        if not self.use_raft_coordination:
+            return
+        
+        logging.debug(f"Node {self.node_id}: Waiting for RAFT topology update")
+        topology_updated = self.topology_ready_event.wait(timeout=30.0)
+        if topology_updated:
+            self.topology_ready_event.clear()
+            
+            # Update topology through RAFT-committed data
+            # The topology manager should already be updated by RAFT callbacks
             self.worker.refresh_gossip_info()
             self.refresh_gossip_info()
-            
-            # Reset the neighbor_hat_params for storing new values
             self.worker.init_neighbor_hat_params()
+        else:
+            logging.warning(f"Node {self.node_id}: Timeout waiting for topology update")
+
+    def test_and_send_to_coordinator(self, iteration, epoch):
+        """Enhanced coordinator reporting with RAFT leader detection."""
+        # Original SAPS logic for testing and metrics
+        super().test_and_send_to_coordinator(iteration, epoch)
+        
+        # Additional RAFT-specific reporting
+        if self.use_raft_coordination and self.is_coordinator:
+            # As RAFT leader, we might want to propose topology updates
+            self._propose_topology_update_if_needed()
+
+    def _propose_topology_update_if_needed(self):
+        """Propose topology update through RAFT if needed."""
+        # Check if we need to update topology (e.g., membership changed)
+        if (hasattr(self.raft_consensus, 'raft_node') and 
+            self.raft_consensus.raft_node and
+            hasattr(self, '_last_known_nodes')):
             
-            for epoch in range(self.epochs):
-                self.epoch = epoch
+            current_nodes = self.raft_consensus.raft_node.known_nodes
+            if current_nodes != getattr(self, '_last_known_nodes', set()):
+                logging.info(f"Node {self.node_id}: Membership changed, proposing topology update")
                 
-                # Update worker's dataset and data loader
-                with raise_error_without_process():
-                    # Fix: Check if sampler has set_epoch method before calling
-                    if hasattr(self.worker.train_local.sampler, 'set_epoch'):
-                        self.worker.train_local.sampler.set_epoch(epoch)
+                # Generate new topology
+                self.topology_manager.generate_topology(t=self.global_round_idx)
                 
-                self.epoch_init()
-                
-                for iteration in range(self.worker.num_iterations):
-                    self.iteration = iteration
-                    logging.debug("Waiting for RAFT authorization to start round")
-                    
-                    # Wait for RAFT consensus to authorize the round start
-                    self.round_start_authorized.wait()
-                    logging.debug("RAFT authorized round start, beginning iteration")
-                    
-                    # Get model params
-                    from utils.data_utils import get_data
-                    from utils.tensor_buffer import TensorBuffer
-                    params, _ = get_data(
-                        self.worker.param_groups, self.worker.param_names, is_get_grad=False
-                    )
-                    flatten_params = TensorBuffer(params)
-
-                    # compress
-                    sync_buffer = {
-                        "original_shapes": self.worker.shapes,
-                        "flatten_params": flatten_params,
+                # Propose through RAFT
+                topology_entry = {
+                    'type': 'topology_update',
+                    'data': {
+                        'topology_matrix': self.topology_manager.topology.tolist(),
+                        'round': self.global_round_idx,
+                        'timestamp': time.time()
                     }
-                    self.compressor.compress(sync_buffer)
-                    self.selected_shapes = sync_buffer["selected_shapes"]
+                }
+                
+                success = self.raft_consensus.raft_node.add_log_entry(topology_entry)
+                if success:
+                    logging.info(f"Node {self.node_id}: Successfully proposed topology update")
+                
+                self._last_known_nodes = current_nodes.copy()
 
-                    # begin to send model
-                    logging.debug("Begin send and receive")
-                    logging.debug(self.topology_manager.topology)
-                    for neighbor_idx in self.topology_manager.get_out_neighbor_idx_list(self.node_id):
-                        if self.compression in ["randomk", "topk"]:
-                            self.send_sparse_params_to_neighbors(neighbor_idx, 
-                                sync_buffer["flatten_selected_values"].buffer.cpu(),
-                                sync_buffer["flatten_selected_indices"].buffer.cpu(),
-                                self.worker.get_dataset_len())
-                        elif self.compression == "quantize":
-                            self.send_quant_params_to_neighbors(neighbor_idx,
-                                sync_buffer["flatten_quantized_values"].buffer.cpu(),
-                                self.worker.get_dataset_len())
-                        elif self.compression == "sign":
-                            self.send_sign_params_to_neighbors(neighbor_idx,
-                                sync_buffer["flatten_sign_values"].buffer.cpu(),
-                                self.worker.get_dataset_len())
-                        else:
-                            # For no compression, send the full parameters
-                            self.send_result_to_neighbors(neighbor_idx,
-                                sync_buffer["flatten_params"].buffer.cpu(),
-                                self.worker.get_dataset_len())
-                    
-                    # wait for receiving all
-                    self.sync_receive_all_event.wait()
-                    self.worker.aggregate(self.compressor, self.selected_shapes, self.gossip_info)
-
-                    # Get weighted hat params and apply the local gradient.
-                    self.neighbor_transfer_lock.acquire()
-
-                    # add the sparsed part
-                    self.compressor.uncompress_direct(
-                        sync_buffer, self.worker.neighbor_hat_params["memory"],
-                        self.selected_shapes, self.worker.shapes)
-                    sync_buffer["flatten_params"].unpack(params)
-
-                    if self.neighbor_transfer_lock.locked():
-                        self.neighbor_transfer_lock.release()
-
-                    # Handle communication failures
-                    import numpy as np
-                    if self.args.Failure_chance is not None and np.random.rand(1) < self.args.Failure_chance:
-                        logging.info("Communication Failure happens on worker: {}, Failure_chance: {}".format(
-                            self.node_id, self.args.Failure_chance))
-                    else:
-                        self.lr_schedule(self.epoch, self.iteration, self.global_round_idx,
-                                        self.worker.num_iterations, self.args.warmup_epochs)
-                        # update x_half to x_{t+1} by SGD
-                        loss, output, target \
-                            = self.worker.train_one_step(self.epoch, self.iteration,
-                                                            self.train_tracker, self.metrics)
-
-                    # Clear events for next iteration
-                    self.round_start_authorized.clear()
-                    self.sync_receive_all_event.clear()
-
-                    """
-                        Before send msg to coordinator,
-                        wait for latest RAFT-committed topology.
-                    """
-                    # Wait for the latest topology to be ready through RAFT consensus
-                    logging.debug(f"Node {self.node_id}: Waiting for latest RAFT-committed topology")
-                    self.topology_ready_event.wait()
-                    self.topology_ready_event.clear()  # Reset for next iteration
-                    
-                    # Now update topology through RAFT-committed data
-                    self.topology_manager.generate_topology(t=self.global_round_idx)
-                    self.worker.refresh_gossip_info()
-                    self.refresh_gossip_info()
-                    # reset the neighbor_hat_params for storing new values
-                    self.worker.init_neighbor_hat_params()
-
-                    # Report to coordinator using the RAFT leader
-                    self.test_and_send_to_coordinator(iteration, epoch)
+    def notify_clients(self):
+        """Enhanced client notification with RAFT coordination."""
+        if not self.is_coordinator:
+            return
+        
+        logging.info(f"Node {self.node_id}: Notifying clients as RAFT leader")
+        
+        # Set round authorization event
+        self.round_start_authorized.set()
+        
+        # Call original SAPS notification if it exists
+        if hasattr(self, '_original_notify_clients'):
+            try:
+                self._original_notify_clients()
+            except Exception as e:
+                logging.warning(f"Error in original notify_clients: {e}")
+        
+        # Additional RAFT-specific notifications
+        if self.use_raft_coordination:
+            # Propose coordinator announcement through RAFT
+            coordinator_entry = {
+                'type': 'coordinator_announcement',
+                'data': {
+                    'coordinator_id': self.node_id,
+                    'round': getattr(self, 'global_round_idx', 0),
+                    'timestamp': time.time()
+                }
+            }
+            
+            if hasattr(self.raft_consensus, 'raft_node') and self.raft_consensus.raft_node:
+                self.raft_consensus.raft_node.add_log_entry(coordinator_entry)
     
+    def finish(self):
+        """Enhanced cleanup with RAFT shutdown."""
+        logging.info(f"Node {self.node_id}: Starting enhanced shutdown")
+        
+        # Stop RAFT coordination first
+        if self.use_raft_coordination:
+            self.use_raft_coordination = False
+            
+            # Signal all waiting events to unblock threads
+            if hasattr(self, 'round_start_authorized'):
+                self.round_start_authorized.set()
+            if hasattr(self, 'topology_ready_event'):
+                self.topology_ready_event.set()
+        
+        # Call parent cleanup
+        super().finish()
+        
+        logging.info(f"Node {self.node_id}: Enhanced shutdown complete")
+
     def wait_for_initial_consensus(self):
         """
         Wait for initial RAFT consensus to be established.
