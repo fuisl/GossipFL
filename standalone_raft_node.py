@@ -34,7 +34,6 @@ import signal
 import socket
 import traceback
 from typing import Dict, List, Optional, Any
-from unittest.mock import Mock, MagicMock
 from dataclasses import dataclass
 
 # Add the project root to path
@@ -44,7 +43,11 @@ from algorithms.RAFT_GossipFL.raft_worker_manager import RaftWorkerManager
 from algorithms.RAFT_GossipFL.raft_consensus import RaftConsensus
 from algorithms.RAFT_GossipFL.raft_node import RaftNode, RaftState
 from algorithms.RAFT_GossipFL.service_discovery_bridge import RaftServiceDiscoveryBridge
+from algorithms.RAFT_GossipFL.raft_topology_manager import RaftTopologyManager
+from algorithms.RAFT_GossipFL.raft_bandwidth_manager import RaftBandwidthManager
 from fedml_core.distributed.communication.grpc.grpc_comm_manager import DynamicGRPCCommManager
+from utils.timer import Timer
+from utils.metrics import Metrics
 
 
 @dataclass
@@ -78,6 +81,9 @@ class MockArgs:
     # Additional fields that might be needed
     warmup_epochs: int = 0
     Failure_chance: Optional[float] = None
+    # SAPS topology manager requirements
+    B_thres: float = 1.0  # Bandwidth threshold
+    T_thres: float = 1.0  # Time threshold
 
 
 class MockTrainer:
@@ -124,106 +130,52 @@ class MockTrainer:
         logging.info(f"Node {self.node_id}: Updated model parameters")
 
 
-class MockTopologyManager:
-    """Mock topology manager."""
+
+
+
+
+
+
+
+
+
+class StandaloneTestWorker:
+    """Minimal worker implementation for standalone testing."""
     
     def __init__(self, node_id: int):
         self.node_id = node_id
-        self.neighbors = set()
-        # Initialize topology with the current node to avoid KeyError
-        self.topology = {node_id: []}
+        self.worker_index = node_id
+        self.num_iterations = 10
+        self.param_groups = []
+        self.param_names = []
+        self.shapes = {}
+        self.neighbor_hat_params = {"memory": {}}
+        self.local_sample_number = 1000
         
-    def get_topology(self) -> Dict[int, List[int]]:
-        """Get current topology."""
-        return self.topology
-    
-    def get_neighbor_list(self) -> set:
-        """Get neighbor list."""
-        return self.neighbors
-    
-    def update_nodes(self, new_nodes: set):
-        """Update topology with new node set."""
-        self.neighbors = new_nodes - {self.node_id}  # Exclude self from neighbors
-        # Create a simple star topology with all nodes connected
-        self.topology = {node_id: list(new_nodes - {node_id}) for node_id in new_nodes}
-        logging.info(f"Node {self.node_id}: Updated topology with {len(self.neighbors)} neighbors from {len(new_nodes)} nodes")
-    
-    def update_topology(self, new_topology: Dict[int, List[int]]):
-        """Update topology."""
-        self.topology = new_topology
-        self.neighbors = set(new_topology.get(self.node_id, []))
-        logging.info(f"Node {self.node_id}: Updated topology with {len(self.neighbors)} neighbors")
-    
-    def generate_topology(self, t: int = 0):
-        """Generate topology for a given round."""
-        # For testing, just maintain the existing topology
+    def refresh_gossip_info(self):
+        """Refresh gossip information."""
         pass
-    
-    def get_out_neighbor_idx_list(self, node_id: int) -> List[int]:
-        """Get list of outgoing neighbors for a node."""
-        return self.topology.get(node_id, [])
-
-
-class MockBandwidthManager:
-    """Mock bandwidth manager."""
-    
-    def __init__(self, node_id: int):
-        self.node_id = node_id
-        self.bandwidth_data = {}
         
-    def get_bandwidth(self) -> Optional[Dict[int, float]]:
-        """Get bandwidth measurements."""
-        return self.bandwidth_data
-    
-    def update_bandwidth(self, measurements: Dict[int, float]):
-        """Update bandwidth measurements."""
-        self.bandwidth_data = measurements
-        logging.info(f"Node {self.node_id}: Updated bandwidth measurements")
-    
-    def apply_bandwidth_update(self, update_data: Dict[str, Any]):
-        """Apply bandwidth update from state snapshot."""
-        if 'matrix' in update_data:
-            # Convert matrix to dict format
-            matrix = update_data['matrix']
-            self.bandwidth_data = {i: float(val) for i, val in enumerate(matrix) if val > 0}
-
-
-class MockTimer:
-    """Mock timer for performance measurement."""
-    
-    def __init__(self):
-        self.start_time = time.time()
-        self.timers = {}
+    def init_neighbor_hat_params(self):
+        """Initialize neighbor parameters."""
+        pass
         
-    def start_timer(self, name: str):
-        """Start a timer."""
-        self.timers[name] = time.time()
+    def get_dataset_len(self) -> int:
+        """Get dataset length."""
+        return 1000
         
-    def end_timer(self, name: str) -> float:
-        """End a timer and return duration."""
-        if name in self.timers:
-            duration = time.time() - self.timers[name]
-            del self.timers[name]
-            return duration
-        return 0.0
-
-
-class MockMetrics:
-    """Mock metrics collector."""
-    
-    def __init__(self, node_id: int):
-        self.node_id = node_id
-        self.metrics = {}
-        # Add metric_names attribute expected by RuntimeTracker
-        self.metric_names = ['accuracy', 'loss', 'samples', 'round']
+    def aggregate(self):
+        """Aggregate parameters."""
+        pass
         
-    def record_metric(self, name: str, value: Any):
-        """Record a metric."""
-        self.metrics[name] = value
+    def train_one_step(self, epoch=None, iteration=None, tracker=None, metrics=None):
+        """Perform one training step."""
+        # Mock training result: (loss, output, target)
+        return (0.5, None, None)
         
-    def get_metrics(self) -> Dict[str, Any]:
-        """Get all metrics."""
-        return self.metrics
+    def set_coordinator(self, coordinator_id: int):
+        """Set the coordinator."""
+        pass
 
 
 class StandaloneRaftNode:
@@ -256,27 +208,18 @@ class StandaloneRaftNode:
             use_service_discovery=True
         )
         self.trainer = MockTrainer(self.node_id)
-        self.topology_manager = MockTopologyManager(self.node_id)
-        self.bandwidth_manager = MockBandwidthManager(self.node_id)
-        self.timer = MockTimer()
-        self.metrics = MockMetrics(self.node_id)
         
-        # Create mock worker
-        self.worker = Mock()
-        self.worker.node_id = self.node_id
-        self.worker.num_iterations = 10  # Mock number of iterations per epoch
-        self.worker.param_groups = []  # Mock parameter groups
-        self.worker.param_names = []   # Mock parameter names
-        self.worker.shapes = {}        # Mock parameter shapes
-        self.worker.neighbor_hat_params = {"memory": {}}  # Mock neighbor parameters
+        # Set a default client number for topology manager (will be updated dynamically)
+        if args.client_num_in_total is None:
+            args.client_num_in_total = 3  # Default for testing
         
-        # Mock methods that might be called
-        self.worker.refresh_gossip_info = Mock()
-        self.worker.init_neighbor_hat_params = Mock()
-        self.worker.get_dataset_len = Mock(return_value=1000)
-        self.worker.aggregate = Mock()
-        self.worker.train_one_step = Mock(return_value=(0.5, None, None))  # (loss, output, target)
-        self.worker.set_coordinator = Mock()
+        self.topology_manager = RaftTopologyManager(args, None)  # raft_consensus set later
+        self.bandwidth_manager = RaftBandwidthManager(args, None)  # raft_consensus set later
+        self.timer = Timer()
+        self.metrics = Metrics(task="classification")
+        
+        # Create worker
+        self.worker = StandaloneTestWorker(self.node_id)
         
         # Create RAFT components
         self.raft_node = RaftNode(self.node_id, args)
@@ -309,6 +252,10 @@ class StandaloneRaftNode:
         
         # Now set the worker manager in the consensus
         self.raft_consensus.worker_manager = self.worker_manager
+        
+        # Set raft_consensus references in managers
+        self.topology_manager.raft_consensus = self.raft_consensus
+        self.bandwidth_manager.raft_consensus = self.raft_consensus
         
         # Register the service discovery bridge with the communication manager
         if hasattr(self.worker_manager, 'service_discovery_bridge'):
