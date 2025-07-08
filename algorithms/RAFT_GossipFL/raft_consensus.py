@@ -549,11 +549,11 @@ class RaftConsensus:
     ):
         """Process an InstallSnapshot RPC from the leader."""
         try:
-            self.raft_node.install_snapshot_chunk(
+            self.raft_node.install_snapshot(
                 last_incl_idx, last_incl_term, offset, data, done
             )
             # Acknowledge snapshot reception using existing snapshot message
-            self.worker_manager.send_state_snapshot(
+            self.worker_manager.send_append_response(
                 leader_id,
                 self.raft_node.current_term,
                 [],

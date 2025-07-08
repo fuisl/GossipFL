@@ -84,12 +84,12 @@ class RaftNode:
         self.state_lock = threading.RLock()
         
         # Election timeout (randomized to prevent split votes)
-        self.min_election_timeout = getattr(self.args, 'min_election_timeout', 10000) / 1000  # BUG: This should be configurable
-        self.max_election_timeout = getattr(self.args, 'max_election_timeout', 20000) / 1000  # BUG: This should be configurable
+        self.min_election_timeout = 10  # BUG: This should be configurable
+        self.max_election_timeout = 20  # BUG: This should be configurable
         self.reset_election_timeout()
         
         # Heartbeat interval (for leaders)
-        self.heartbeat_interval = getattr(self.args, 'heartbeat_interval', 2000) / 1000  # BUG: This should be configurable
+        self.heartbeat_interval = 2  # BUG: This should be configurable
 
         # Callbacks for external interactions (to be set by the manager)
         self.on_state_change = None

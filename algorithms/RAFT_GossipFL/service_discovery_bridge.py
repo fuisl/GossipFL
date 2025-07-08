@@ -217,7 +217,9 @@ class RaftServiceDiscoveryBridge:
                     term=params.get(RaftMessage.ARG_TERM),
                     last_incl_idx=params.get(RaftMessage.ARG_LAST_INCLUDED_INDEX),
                     last_incl_term=params.get(RaftMessage.ARG_LAST_INCLUDED_TERM),
-                    data=params.get(RaftMessage.ARG_DATA)
+                    offset=params.get(RaftMessage.ARG_OFFSET, 0),  # Add missing offset parameter
+                    data=params.get(RaftMessage.ARG_DATA),
+                    done=params.get(RaftMessage.ARG_DONE, True)    # Add missing done parameter
                 )
             
             def handle_join_request(params):
