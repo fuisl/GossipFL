@@ -74,6 +74,7 @@ myself_*
 
 plots/*
 
+datasets/*
 
 # checkpoint
 *.pth

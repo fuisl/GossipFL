@@ -10,3 +10,9 @@ RUN useradd -m dev && \
 # Passwordless sudo privilege
     echo "dev ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/dev && \
     chmod 0440 /etc/sudoers.d/dev
+
+# uncomment when deploying outside of github codespace
+
+# switch to dev user
+# USER dev
+# RUN setup.sh

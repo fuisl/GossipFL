@@ -1,13 +1,8 @@
 import logging
 import numpy as np
 
-from algorithms.SAPS_FL.SAPS_topology_manager import SAPSTopologyManager
-
-
-class RaftTopologyManager(SAPSTopologyManager):
-    """
-    Extends the SAPSTopologyManager to use RAFT for consensus on topology.
-    
+class RaftTopologyManager():
+    """    
     This manager integrates with RAFT to ensure all nodes have a consistent
     view of the network topology. Topology changes are proposed through RAFT
     and applied once consensus is reached.
@@ -21,7 +16,6 @@ class RaftTopologyManager(SAPSTopologyManager):
             args: Configuration parameters
             raft_consensus: The RAFT consensus manager
         """
-        super().__init__(args)
         self.raft_consensus = raft_consensus
         self.latest_topology_round = -1
         self.topology_cache = {}  # Cache for topologies by round number
@@ -35,6 +29,34 @@ class RaftTopologyManager(SAPSTopologyManager):
                 self.topology[i][i] = 1.0  # Self-connections as initial fallback
         
         logging.info(f"RaftTopologyManager initialized")
+
+    # --- Reimplementing the base class ---
+    def get_in_neighbor_weights(self, node_index):
+        if node_index >= self.n:
+            return []
+        return self.topology[node_index]
+
+    def get_out_neighbor_weights(self, node_index):
+        if node_index >= self.n:
+            return []
+        return self.topology[node_index]
+
+    def get_in_neighbor_idx_list(self, node_index):
+        neighbor_in_idx_list = []
+        neighbor_weights = self.get_in_neighbor_weights(node_index)
+        for idx, neighbor_w in enumerate(neighbor_weights):
+            if neighbor_w > 0 and node_index != idx:
+                neighbor_in_idx_list.append(idx)
+        return neighbor_in_idx_list
+
+    def get_out_neighbor_idx_list(self, node_index):
+        neighbor_out_idx_list = []
+        neighbor_weights = self.get_out_neighbor_weights(node_index)
+        for idx, neighbor_w in enumerate(neighbor_weights):
+            if neighbor_w > 0 and node_index != idx:
+                neighbor_out_idx_list.append(idx)
+        return neighbor_out_idx_list
+
     
     def generate_topology(self, t):
         """
