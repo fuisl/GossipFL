@@ -3,8 +3,9 @@
 Standalone RAFT Node Runner for Manual Testing
 
 This script creates a standalone RAFT node for manual testing of the 
-RAFT consensus implementation with service discovery. It mocks the 
-federated learning components and focuses on demonstrating:
+RAFT consensus implementation with service discovery. It uses real
+implementations of RAFT components with minimal federated learning setup
+and focuses on demonstrating:
 
 1. Node bootstrapping and cluster formation
 2. Leader election and state transitions
